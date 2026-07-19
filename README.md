@@ -156,5 +156,5 @@ Each row appended to the CSV represents one trial:
 ## Authors
 
 - Ethan — programming, physical data collection
-- Haotian — statistical analysis
+- Haotian — statistical analysis, lead author
 - Supervised by Dr. Bingxian Mu, University of Prince Edward Island
