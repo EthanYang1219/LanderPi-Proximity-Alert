@@ -1,0 +1,10 @@
+{
+    "python.analysis.extraPaths": [
+        "${workspaceFolder}/.ros2_stubs/dist-packages",
+        "${workspaceFolder}/.ros2_stubs/site-packages"
+    ],
+    "python.autoComplete.extraPaths": [
+        "${workspaceFolder}/.ros2_stubs/dist-packages",
+        "${workspaceFolder}/.ros2_stubs/site-packages"
+    ]
+}

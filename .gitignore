@@ -1,0 +1,14 @@
+# Local cache of the robot's ROS 2 Python packages, pulled from the MentorPi
+# container solely so Pylance/pyright can resolve rclpy/geometry_msgs/etc.
+# imports. Not part of the actual runtime (that's inside Docker) and not
+# portable across machines -- regenerate with:
+#   docker cp MentorPi:/opt/ros/humble/local/lib/python3.10/dist-packages .ros2_stubs/dist-packages
+.ros2_stubs/
+
+__pycache__/
+*.pyc
+
+trials/
+
+# Claude Code harness state (spawned-task worktrees, etc.), not project content.
+.claude/
