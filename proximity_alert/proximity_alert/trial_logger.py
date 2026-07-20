@@ -191,19 +191,32 @@ def main(args=None):
                 surface = input(
                     "Surface material (granite/concrete/wood/metal): "
                 ).strip()
-                gt_raw = input(
-                    "Ground-truth stop distance from your tape measure (m): "
-                ).strip()
-                try:
-                    ground_truth_m = float(gt_raw)
-                except ValueError:
-                    node.get_logger().warn(
-                        f"Could not parse '{gt_raw}' as a number -- logging as 0.0"
+                # Re-prompt until a valid positive number, or let the user
+                # discard the trial. Never write a bogus ground-truth value:
+                # a single wrong row silently corrupts the slippage dataset.
+                ground_truth_m = None
+                while ground_truth_m is None:
+                    gt_raw = input(
+                        "Ground-truth stop distance in m "
+                        "(or 's' to skip/discard this trial): "
+                    ).strip()
+                    if gt_raw.lower() in ("s", "skip"):
+                        node.get_logger().warn("Trial discarded, not logged.")
+                        break
+                    try:
+                        value = float(gt_raw)
+                    except ValueError:
+                        print(f"  '{gt_raw}' is not a number -- try again.")
+                        continue
+                    if value <= 0.0:
+                        print("  Distance must be positive -- try again.")
+                        continue
+                    ground_truth_m = value
+
+                if ground_truth_m is not None:
+                    node._append_row(
+                        surface, transit_time_s, odom_distance_m, ground_truth_m
                     )
-                    ground_truth_m = 0.0
-                node._append_row(
-                    surface, transit_time_s, odom_distance_m, ground_truth_m
-                )
     except KeyboardInterrupt:
         pass
     finally:
