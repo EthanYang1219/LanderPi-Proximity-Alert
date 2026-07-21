@@ -77,8 +77,8 @@ class PathTracker(Node):
         self.declare_parameter("max_avoid_attempts", 3)
         self.declare_parameter("clear_drive_duration", 3.0)
         self.declare_parameter("disable_avoidance", False)
-        self.declare_parameter("drift_speed", 0.15) # Sideways strafe speed for the last-resort drift maneuver
-        self.declare_parameter("drift_duration", 1.0) # How long the robot drifts sideways before re-checking
+        self.declare_parameter("drift_speed", 0.25) # Sideways strafe speed for the last-resort drift maneuver
+        self.declare_parameter("drift_duration", 1.5) # How long the robot drifts sideways before re-checking
 
         self.safety_distance = self.get_parameter("safety_distance").value
         self.forward_speed = self.get_parameter("forward_speed").value
@@ -341,21 +341,37 @@ def main(args=None):
     # cleanup runs, so a final safety-stop publish in a `finally` block would
     # silently fail on SIGINT/SIGTERM. Publish the stop from our own handler
     # instead, while the context is still valid.
+    #
+    # The handler must ONLY set a flag, never call publish_stop()/shutdown()
+    # directly: a second SIGINT arriving while the first call is still
+    # running (e.g. mid-publish, or under CPU load that widens the window)
+    # re-enters the handler and calls rclpy.shutdown() a second time while
+    # spin_once() is still using the context -- confirmed on real hardware
+    # to crash the in-flight executor call with a corrupted-context error
+    # (varies: "Unable to convert call argument to Python object" or
+    # "failed to initialize wait set ... context is not valid" depending on
+    # exactly where the interruption lands). Doing the actual stop/shutdown
+    # from the main loop, only after spin_once() has returned, means a
+    # repeated signal just re-sets an already-true flag -- harmless.
     rclpy.init(args=args, signal_handler_options=SignalHandlerOptions.NO)
     node = PathTracker()
 
-    def stop_and_shutdown(signum, frame):
-        node.publish_stop()
-        rclpy.shutdown()
+    stop_requested = False
 
-    signal.signal(signal.SIGINT, stop_and_shutdown)
-    signal.signal(signal.SIGTERM, stop_and_shutdown)
+    def request_stop(signum, frame):
+        nonlocal stop_requested
+        stop_requested = True
+
+    signal.signal(signal.SIGINT, request_stop)
+    signal.signal(signal.SIGTERM, request_stop)
 
     try:
-        rclpy.spin(node)
+        while rclpy.ok() and not stop_requested:
+            rclpy.spin_once(node, timeout_sec=0.1)
     except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
+        node.publish_stop()
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
