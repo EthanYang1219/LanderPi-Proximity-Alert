@@ -138,6 +138,8 @@ Each row appended to the CSV represents one trial:
 | `forward_speed` | `0.15` | Constant forward speed, m/s |
 | `turn_speed` | `0.6` | Turn-away angular speed, rad/s |
 | `scan_arc_deg` | `180.0` | Forward arc monitored for obstacles, degrees |
+| `drift_speed` | `0.15` | Sideways strafe speed for the last-resort drift-around maneuver, m/s |
+| `drift_duration` | `1.0` | How long the robot strafes sideways before re-checking for a clear path, seconds |
 
 **`trial_logger`**
 

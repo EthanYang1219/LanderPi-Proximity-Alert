@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Drives the robot from point A to point B, stopping and turning away from obstacles seen on /scan."""
+"""Drives the robot from point A to point B, stopping, turning away from, and (as a last resort) drifting sideways around obstacles seen on /scan."""
 import math
 import signal
 import time
@@ -15,6 +15,7 @@ from sensor_msgs.msg import LaserScan
 
 DRIVE = "drive"
 AVOIDING = "avoiding"
+DRIFTING = "drifting"
 HALTED = "halted"
 
 
@@ -75,6 +76,9 @@ class PathTracker(Node):
         self.declare_parameter("heading_max_correction", 0.3)
         self.declare_parameter("max_avoid_attempts", 3)
         self.declare_parameter("clear_drive_duration", 3.0)
+        self.declare_parameter("disable_avoidance", False)
+        self.declare_parameter("drift_speed", 0.15) # Sideways strafe speed for the last-resort drift maneuver
+        self.declare_parameter("drift_duration", 1.0) # How long the robot drifts sideways before re-checking
 
         self.safety_distance = self.get_parameter("safety_distance").value
         self.forward_speed = self.get_parameter("forward_speed").value
@@ -88,6 +92,9 @@ class PathTracker(Node):
         odom_topic = self.get_parameter("odom_topic").value
         self.max_avoid_attempts = self.get_parameter("max_avoid_attempts").value
         self.clear_drive_duration = self.get_parameter("clear_drive_duration").value
+        self.disable_avoidance = self.get_parameter("disable_avoidance").value
+        self.drift_speed = self.get_parameter("drift_speed").value
+        self.drift_duration = self.get_parameter("drift_duration").value
 
         self.cmd_vel_pub = self.create_publisher(Twist, "/cmd_vel", 10)
         self.scan_sub = self.create_subscription(
@@ -105,6 +112,9 @@ class PathTracker(Node):
         self.locked_turn_direction = 0.0
         self.consecutive_avoid_count = 0
         self.drive_since = self.get_clock().now()
+        self.drift_start_time = None
+        self.locked_drift_direction = 0.0
+        self.has_drifted_this_encounter = False
 
         self.current_yaw = None
         self.target_heading = None
@@ -120,7 +130,8 @@ class PathTracker(Node):
 
         self.get_logger().info(
             f"path_tracker started: safety_distance={self.safety_distance}m "
-            f"forward_speed={self.forward_speed}m/s scan_arc_deg={self.scan_arc_deg}deg"
+            f"forward_speed={self.forward_speed}m/s scan_arc_deg={self.scan_arc_deg}deg "
+            f"drift_speed={self.drift_speed}m/s drift_duration={self.drift_duration}s"
         )
 
     def publish_stop(self):
@@ -200,13 +211,37 @@ class PathTracker(Node):
                 # consecutive episodes alternating -0.6/+0.6 with no net
                 # progress. Give up and halt instead of oscillating forever.
                 self.consecutive_avoid_count += 1
-                if self.consecutive_avoid_count > self.max_avoid_attempts:
-                    self.get_logger().warn(
-                        f"{self.consecutive_avoid_count} avoidance attempts in a "
-                        "row without a clear drive -- likely too wide/complex to "
-                        "route around. Halting instead of oscillating."
+                if self.disable_avoidance:
+                    # LiDAR-vs-actual-distance data collection run: go
+                    # straight and stop at the box, no turn-away maneuver.
+                    self.get_logger().info(
+                        f"Obstacle at {self.min_range:.2f}m, halting "
+                        "(avoidance disabled for this run)."
                     )
                     self.state = HALTED
+                elif self.consecutive_avoid_count > self.max_avoid_attempts:
+                    if self.has_drifted_this_encounter:
+                        self.get_logger().warn(
+                            f"{self.consecutive_avoid_count} avoidance attempts "
+                            "in a row, drift-around already tried -- likely too "
+                            "wide/complex to route around. Halting instead of "
+                            "oscillating."
+                        )
+                        self.state = HALTED
+                    else:
+                        self.get_logger().warn(
+                            f"{self.consecutive_avoid_count} avoidance attempts "
+                            "in a row without a clear drive -- turning isn't "
+                            "working, trying a sideways drift instead of "
+                            "oscillating."
+                        )
+                        self.state = DRIFTING
+                        self.has_drifted_this_encounter = True
+                        self.drift_start_time = self.get_clock().now()
+                        # Same lock-in-now reasoning as locked_turn_direction
+                        # below: freeze the direction at state-entry so a
+                        # mid-drift scan update can't flip it.
+                        self.locked_drift_direction = self.turn_away_direction
                 else:
                     self.get_logger().info(f"Obstacle at {self.min_range:.2f}m, stopping")
                     self.state = AVOIDING
@@ -230,6 +265,7 @@ class PathTracker(Node):
                     # Sustained clean driving -> the obstacle is actually
                     # behind us, not just a lull between oscillation attempts.
                     self.consecutive_avoid_count = 0
+                    self.has_drifted_this_encounter = False
                 cmd.linear.x = self.forward_speed
                 if self.current_yaw is not None:
                     if self.target_heading is None:
@@ -259,6 +295,20 @@ class PathTracker(Node):
                 # endpoint obstacle) -> hold a stop, but keep re-checking in
                 # HALTED below rather than freezing permanently.
                 self.get_logger().info("Still blocked after turn-away, halting")
+                self.state = HALTED
+            else:
+                self.state = DRIVE
+                self.drive_since = self.get_clock().now()
+
+        elif self.state == DRIFTING:
+            elapsed = (self.get_clock().now() - self.drift_start_time).nanoseconds / 1e9
+            if elapsed < self.drift_duration:
+                # Pure lateral translation -- unlike angular.z, this doesn't
+                # hit the mecanum driver's equal-wheel-speed rotation bug, so
+                # no reverse-component workaround is needed here.
+                cmd.linear.y = self.drift_speed * self.locked_drift_direction
+            elif self.min_range is not None and self.min_range <= self.safety_distance:
+                self.get_logger().info("Still blocked after drift, halting")
                 self.state = HALTED
             else:
                 self.state = DRIVE
