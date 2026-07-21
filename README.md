@@ -9,6 +9,7 @@ The system drives a mobile robot from a fixed point A to point B, reactively sto
 - [Project overview](#project-overview)
 - [Hardware and software stack](#hardware-and-software-stack)
 - [Repository structure](#repository-structure)
+- [Running it in VS Code (quick start)](#running-it-in-vs-code-quick-start)
 - [Setup](#setup)
 - [Usage](#usage)
 - [Data collected](#data-collected)
@@ -36,7 +37,7 @@ Raw per-trial data is written to CSV so it can be handed off directly for statis
 | Chassis | Hiwonder LanderPi, Mecanum wheels |
 | Main compute | Raspberry Pi 5 (ROS 2 controller) |
 | Low-level control | STM32 microcontroller (motor commands) |
-| LiDAR | MS200 TOF LiDAR |
+| LiDAR | LD19 (the running driver node identifies as `LD19`/`LDLiDAR_LD19`; worth double-checking against this unit's actual spec sheet if "MS200" is documented elsewhere) |
 | Odometry | Wheel encoders |
 | Alert (planned) | Onboard buzzer, I2C |
 | OS | Ubuntu 22.04 LTS |
@@ -49,51 +50,58 @@ The buzzer is intentionally not wired into the current nodes — it is a separat
 
 ```
 .
-├── path_tracker.py     # Drives A -> B, reactive LiDAR obstacle avoidance
-├── trial_logger.py      # Logs transit time, odometry distance, ground truth per trial
-├── trials/               # Suggested output location for per-surface CSV logs (not committed)
+├── proximity_alert/            # The ROS 2 package (ament_python)
+│   ├── package.xml
+│   ├── setup.py / setup.cfg
+│   └── proximity_alert/
+│       ├── path_tracker.py     # Drives A -> B, reactive LiDAR obstacle avoidance
+│       └── trial_logger.py     # Logs transit time, odometry distance, ground truth per trial
+├── trials/                     # Suggested output location for per-surface CSV logs (not committed)
 └── README.md
 ```
 
 `path_tracker.py` and `trial_logger.py` are independent ROS 2 nodes. `trial_logger.py` does not modify or depend on the internals of `path_tracker.py` — it only observes `/odom`, so either node can be developed, tested, or replaced without breaking the other.
 
-## Setup
+## Running it in VS Code (quick start)
 
-1. **Docker + ROS 2 Humble.** Build or pull the project's Docker image with ROS 2 Humble installed, and confirm it can reach the LanderPi's ROS 2 stack (`/scan`, `/odom`, `/cmd_vel` topics should be visible via `ros2 topic list`).
-2. **Copy the nodes into your package.** Place `path_tracker.py` and `trial_logger.py` into your ROS 2 package's Python module directory (wherever your other nodes already live), and register them as executables in `setup.py`:
+The robot's ROS 2 stack already runs in a Docker container named `MentorPi` on the Pi — you don't need to install ROS yourself. Do this from a VS Code integrated terminal (open the repo folder via the Remote-SSH extension if you're connecting from another machine, or directly if VS Code is running on the Pi itself):
 
-   ```python
-   entry_points={
-       "console_scripts": [
-           "path_tracker = <your_package>.path_tracker:main",
-           "trial_logger = <your_package>.trial_logger:main",
-       ],
-   },
-   ```
-
-3. **Build.**
+1. **Copy the package into the container:**
 
    ```bash
-   cd ~/ros2_ws
-   colcon build --packages-select <your_package>
-   source install/setup.bash
+   docker cp proximity_alert MentorPi:/home/ubuntu/ros2_ws/src/proximity_alert
    ```
+
+2. **Build it** (must run under `bash`, not `zsh` — colcon's environment hooks need it):
+
+   ```bash
+   docker exec MentorPi bash -lc "source /opt/ros/humble/setup.bash && cd /home/ubuntu/ros2_ws && colcon build --packages-select proximity_alert"
+   ```
+
+3. **Run each node in its own terminal**, as the `ubuntu` user via `zsh` (this loads `need_compile` and other env vars some of the robot's own launch files expect):
+
+   ```bash
+   # Terminal A — drive the robot
+   docker exec -it -u ubuntu MentorPi zsh -lc "source ~/.zshrc && source ~/ros2_ws/install/setup.bash && ros2 run proximity_alert path_tracker --ros-args -p safety_distance:=0.30 -r scan:=/scan_raw"
+   ```
+
+   ```bash
+   # Terminal B — log the trial
+   docker exec -it -u ubuntu MentorPi zsh -lc "source ~/.zshrc && source ~/ros2_ws/install/setup.bash && ros2 run proximity_alert trial_logger --ros-args -p csv_path:=/home/ubuntu/shared/trials/granite.csv"
+   ```
+
+   Pointing `csv_path` at `/home/ubuntu/shared/...` writes the CSV into the container's shared folder, which is bind-mounted to `~/docker/tmp` on the Pi — so your trial data survives even if the container restarts.
+
+After step 2, repeat only step 3 for future runs — you only need to rebuild when you change `path_tracker.py`/`trial_logger.py` (repeat steps 1–2 each time).
+
+## Setup
+
+1. **Docker + ROS 2 Humble.** The project's Docker container (`MentorPi`, image `ros:humble`) is already running on the robot's Pi — confirm it can see the LanderPi's ROS 2 stack with `docker exec MentorPi bash -lc "source /opt/ros/humble/setup.bash && ros2 topic list"` (`/scan_raw`, `/odom`, `/cmd_vel` should be visible).
+2. **Copy the package in** and **build** it — see [Running it in VS Code](#running-it-in-vs-code-quick-start) above for the exact commands.
 
 ## Usage
 
-Run each node in its own terminal (or SSH session).
-
-**Terminal 1 — drive the robot:**
-
-```bash
-ros2 run <your_package> path_tracker --ros-args -p safety_distance:=0.30
-```
-
-**Terminal 2 — log the trial:**
-
-```bash
-ros2 run <your_package> trial_logger --ros-args -p csv_path:=trials/granite.csv
-```
+Run each node in its own terminal (or SSH session) — see [Running it in VS Code](#running-it-in-vs-code-quick-start) for the exact commands.
 
 Then, for each trial:
 
@@ -117,6 +125,8 @@ Each row appended to the CSV represents one trial:
 | `ground_truth_distance_m` | Straight-line distance from start to stop, per tape measure |
 | `slippage_error_m` | `odom_distance_m - ground_truth_distance_m` |
 | `slippage_pct` | Slippage error as a percentage of ground-truth distance |
+| `avoidance_events` | Count of obstacle-avoidance maneuvers `path_tracker` triggered during the trial (detected via reverse `/cmd_vel` commands, which only occur in its `AVOIDING` state). **Non-zero means this was not a clean A→B run** and should be filtered out or analyzed separately from clean-run slippage stats. |
+| `notes` | Freeform text entered at logging time for anything unusual observed (e.g. "motors fought each other on the turn", "oscillated near desk", "false stop") |
 
 ## Parameters
 
@@ -128,6 +138,8 @@ Each row appended to the CSV represents one trial:
 | `forward_speed` | `0.15` | Constant forward speed, m/s |
 | `turn_speed` | `0.6` | Turn-away angular speed, rad/s |
 | `scan_arc_deg` | `180.0` | Forward arc monitored for obstacles, degrees |
+| `drift_speed` | `0.15` | Sideways strafe speed for the last-resort drift-around maneuver, m/s |
+| `drift_duration` | `1.0` | How long the robot strafes sideways before re-checking for a clear path, seconds |
 
 **`trial_logger`**
 
@@ -150,8 +162,9 @@ Each row appended to the CSV represents one trial:
 ## Troubleshooting
 
 - **`trial_logger` never detects a trial end.** Check that `path_tracker`'s obstacle stop is actually driving `linear.x` to zero (watch `ros2 topic echo /cmd_vel`) and that `/odom` twist values are reasonably close to zero when stationary — noisy odometry may need a higher `stop_velocity_threshold`.
-- **Robot doesn't stop in time / stops too early.** Adjust `safety_distance` on `path_tracker`; the LiDAR's `range_min`/`range_max` limits from the MS200 driver also bound how close/far it can reliably see.
-- **No `/scan` or `/odom` data.** Confirm the LanderPi's sensor drivers are running inside the Docker container and `ros2 topic list` shows both topics before starting either node.
+- **Robot doesn't stop in time / stops too early.** Adjust `safety_distance` on `path_tracker`; the LiDAR's `range_min`/`range_max` limits also bound how close/far it can reliably see.
+- **No `/scan_raw` or `/odom` data.** Confirm the LanderPi's sensor drivers are running inside the `MentorPi` container (`docker exec MentorPi bash -lc "source /opt/ros/humble/setup.bash && ros2 node list"` should show `LD19`, `ekf_filter_node`, etc.) before starting either node. If the list comes back empty, the driver stack itself has died and needs restarting — see `~/robot_pi/tool/bringup.sh` on the Pi.
+- **`path_tracker` holds still and logs "No fresh scan within scan_timeout."** This is the scan-freshness watchdog working as intended — the LiDAR isn't currently publishing. Check `ros2 topic hz /scan_raw`; this LD19 has been observed to intermittently stop publishing mid-session.
 
 ## Authors
 
