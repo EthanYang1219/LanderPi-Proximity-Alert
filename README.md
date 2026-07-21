@@ -23,10 +23,15 @@ The system drives a mobile robot from a fixed point A to point B, reactively sto
 This project measures how surface material affects a mobile robot's real-world driving performance versus its own internal estimate of that performance. Concretely, for each surface the robot is driven along a fixed marked track from point A to point B, and the following are compared:
 
 - **Transit time** — how long the run took
-- **Odometry-estimated distance** — how far the robot's wheel encoders think it traveled
+- **Odometry-estimated distance** — the robot's own dead-reckoned estimate of how far it traveled (see the important caveat on what this actually measures, below)
 - **Ground-truth distance** — how far it actually traveled, read by hand off a marked/taped track
 
 The gap between odometry and ground truth quantifies wheel slippage, which is expected to vary by surface (granite and metal are expected to slip more than wood or concrete, for example). A LiDAR-based safety stop is layered on top so the robot avoids collisions with obstacles placed along or at the end of the track, independent of the distance measurement itself.
+
+**Important limitation: this robot has no wheel-encoder feedback.** `/odom` (and the `odom_distance_m` column below) comes from `odom_publisher_node.py` in the vendor driver stack, which dead-reckons position by integrating the *commanded* velocity (`/cmd_vel`) over time — there is no wheel-encoder tick reading anywhere in the drive stack (confirmed by searching the full `driver/` tree). This means `odom_distance_m` measures "how far the commanded motion, integrated open-loop, thinks it went," not "how far the wheels actually turned." Two consequences for interpreting trial data:
+
+1. On a clean, single-pass, straight-line run (`disable_avoidance:=true`, no obstacle-avoidance turns), `odom_distance_m` should closely track `forward_speed × transit_time_s` regardless of surface — so a gap against `ground_truth_distance_m` is a reasonable (if indirect) proxy for real slippage, since the *commanded* motion is known and constant.
+2. On any run where obstacle-avoidance actually triggered (reverse/turn maneuvers), `odom_distance_m` is unreliable as a slippage signal: heading (`pose_yaw`) is *also* integrated open-loop from commanded `angular_z`, so it inherits error from the known mecanum-rotation quirk (see `path_tracker.py`'s `AVOIDING` state comments) on every turn, compounding across attempts. A large mismatch between `odom_distance_m` and `ground_truth_distance_m` on such a run reflects accumulated dead-reckoning drift through multiple maneuvers, not real-world wheel slip — see `avoidance_events` in [Data collected](#data-collected) below, and exclude any trial where it's non-zero from slippage analysis.
 
 Raw per-trial data is written to CSV so it can be handed off directly for statistical analysis.
 
@@ -121,7 +126,7 @@ Each row appended to the CSV represents one trial:
 | `surface` | Surface material entered at the prompt |
 | `trial_num` | Auto-incrementing trial counter for that CSV file |
 | `transit_time_s` | Seconds from start-of-motion to confirmed stop |
-| `odom_distance_m` | Straight-line distance from start to stop, per wheel odometry |
+| `odom_distance_m` | Straight-line distance from start to stop, per the robot's dead-reckoned `/odom` estimate. **Not real wheel-encoder feedback** — see the caveat in [Project overview](#project-overview); only trust this as a slippage signal on `avoidance_events == 0` trials |
 | `ground_truth_distance_m` | Straight-line distance from start to stop, per tape measure |
 | `slippage_error_m` | `odom_distance_m - ground_truth_distance_m` |
 | `slippage_pct` | Slippage error as a percentage of ground-truth distance |
