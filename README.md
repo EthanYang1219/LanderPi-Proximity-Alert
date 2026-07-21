@@ -125,6 +125,8 @@ Each row appended to the CSV represents one trial:
 | `ground_truth_distance_m` | Straight-line distance from start to stop, per tape measure |
 | `slippage_error_m` | `odom_distance_m - ground_truth_distance_m` |
 | `slippage_pct` | Slippage error as a percentage of ground-truth distance |
+| `avoidance_events` | Count of obstacle-avoidance maneuvers `path_tracker` triggered during the trial (detected via reverse `/cmd_vel` commands, which only occur in its `AVOIDING` state). **Non-zero means this was not a clean A→B run** and should be filtered out or analyzed separately from clean-run slippage stats. |
+| `notes` | Freeform text entered at logging time for anything unusual observed (e.g. "motors fought each other on the turn", "oscillated near desk", "false stop") |
 
 ## Parameters
 
