@@ -63,6 +63,7 @@ import rclpy
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
+from std_msgs.msg import Float32
 
 
 class TrialLogger(Node):
@@ -87,6 +88,12 @@ class TrialLogger(Node):
         self.cmd_vel_sub = self.create_subscription(
             Twist, "/cmd_vel", self.cmd_vel_callback, 10
         )
+        self.range_sub = self.create_subscription(
+            Float32, "/forward_min_range", self.range_callback, 10
+        )
+        # Latest forward-arc LiDAR range from path_tracker; captured at the
+        # moment a trial finalizes to record the actual stop distance.
+        self.last_min_range = None
 
         # State machine: "idle" -> "moving" -> trial finalized -> "idle"
         self.state = "idle"
@@ -133,6 +140,7 @@ class TrialLogger(Node):
                         "slippage_error_m",
                         "slippage_pct",
                         "avoidance_events",
+                        "lidar_stop_range_m",
                         "notes",
                     ]
                 )
@@ -150,11 +158,19 @@ class TrialLogger(Node):
         odom_distance_m,
         ground_truth_m,
         avoidance_events,
+        lidar_stop_range_m,
         notes,
     ):
         self.trial_num += 1
         error = odom_distance_m - ground_truth_m
         slippage_pct = (error / ground_truth_m * 100.0) if ground_truth_m else 0.0
+        # inf (nothing in the forward arc at stop) has no meaningful distance;
+        # log it blank rather than the literal "inf".
+        range_str = (
+            f"{lidar_stop_range_m:.4f}"
+            if lidar_stop_range_m is not None and math.isfinite(lidar_stop_range_m)
+            else ""
+        )
         with open(self.csv_path, "a", newline="") as f:
             writer = csv.writer(f)
             writer.writerow(
@@ -168,6 +184,7 @@ class TrialLogger(Node):
                     f"{error:.4f}",
                     f"{slippage_pct:.2f}",
                     avoidance_events,
+                    range_str,
                     notes,
                 ]
             )
@@ -190,6 +207,9 @@ class TrialLogger(Node):
         if is_reversing and not self.was_reversing:
             self.avoidance_events += 1
         self.was_reversing = is_reversing
+
+    def range_callback(self, msg: Float32):
+        self.last_min_range = msg.data
 
     def odom_callback(self, msg: Odometry):
         pos = msg.pose.pose.position
@@ -223,6 +243,7 @@ class TrialLogger(Node):
                         transit_time_s,
                         odom_distance_m,
                         self.avoidance_events,
+                        self.last_min_range,
                     )
                     self.state = "idle"
                     avoid_note = (
@@ -247,7 +268,12 @@ def main(args=None):
         while rclpy.ok():
             rclpy.spin_once(node, timeout_sec=0.1)
             if node.pending_trial is not None:
-                transit_time_s, odom_distance_m, avoidance_events = node.pending_trial
+                (
+                    transit_time_s,
+                    odom_distance_m,
+                    avoidance_events,
+                    lidar_stop_range_m,
+                ) = node.pending_trial
                 node.pending_trial = None
                 avoid_note = (
                     f", avoidance_events={avoidance_events} (NOT a clean run)"
@@ -294,6 +320,7 @@ def main(args=None):
                         odom_distance_m,
                         ground_truth_m,
                         avoidance_events,
+                        lidar_stop_range_m,
                         notes,
                     )
     except KeyboardInterrupt:
