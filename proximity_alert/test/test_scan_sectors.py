@@ -3,13 +3,20 @@ from types import SimpleNamespace
 from proximity_alert.scan_utils import reduce_to_sectors
 
 
-def _scan(pairs, range_min=0.05, range_max=8.0):
-    # pairs: list of (angle_rad, range_m); builds a scan with matching arrays.
-    pairs = sorted(pairs, key=lambda p: p[0])
-    angles = [a for a, _ in pairs]
-    ranges = [r for _, r in pairs]
-    inc = (angles[1] - angles[0]) if len(angles) > 1 else 0.1
-    return SimpleNamespace(angle_min=angles[0], angle_increment=inc,
+def _scan(pairs, range_min=0.05, range_max=8.0, inc_deg=1.0):
+    # Build a uniform-increment scan over [-pi, pi) like a real LiDAR: each
+    # listed (angle_rad, range_m) is placed in its nearest uniform bin; empty
+    # bins are inf (excluded by the range guard). This keeps the beams evenly
+    # spaced so angle = angle_min + i*increment reconstructs each angle exactly.
+    inc = math.radians(inc_deg)
+    n = int(round(2 * math.pi / inc))
+    angle_min = -math.pi
+    ranges = [float("inf")] * n
+    for a, r in pairs:
+        rel = math.atan2(math.sin(a), math.cos(a))
+        idx = int(round((rel - angle_min) / inc)) % n
+        ranges[idx] = r
+    return SimpleNamespace(angle_min=angle_min, angle_increment=inc,
                            range_min=range_min, range_max=range_max, ranges=ranges)
 
 

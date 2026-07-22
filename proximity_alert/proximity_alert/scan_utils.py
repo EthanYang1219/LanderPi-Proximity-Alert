@@ -79,3 +79,33 @@ def reduce_to_sectors(msg, front_arc_deg, front_subsector_deg,
             if _in_window(rel, math.pi, half_rear):
                 out["rear"] = min(out["rear"], r)
     return out
+
+
+def size_obstacle(msg, front_arc_deg, obstacle_detect_range):
+    half_front = math.radians(front_arc_deg) / 2.0
+    near = []  # (rel, r)
+    left_open = 0.0
+    right_open = 0.0
+    left_n = right_n = 0
+    for i, r in enumerate(msg.ranges):
+        if msg.range_min <= r <= msg.range_max and math.isfinite(r):
+            angle = msg.angle_min + i * msg.angle_increment
+            rel = math.atan2(math.sin(angle), math.cos(angle))
+            if -half_front <= rel <= half_front:
+                if r <= obstacle_detect_range:
+                    near.append((rel, r))
+                else:
+                    if rel > 0:
+                        left_open += r; left_n += 1
+                    elif rel < 0:
+                        right_open += r; right_n += 1
+    if not near:
+        return None
+    rels = [a for a, _ in near]
+    ys = [r * math.sin(a) for a, r in near]
+    span_deg = math.degrees(max(rels) - min(rels))
+    left_avg = left_open / left_n if left_n else 0.0
+    right_avg = right_open / right_n if right_n else 0.0
+    preferred_side = 1.0 if left_avg >= right_avg else -1.0
+    return {"span_deg": span_deg, "y_lo": min(ys), "y_hi": max(ys),
+            "preferred_side": preferred_side}
