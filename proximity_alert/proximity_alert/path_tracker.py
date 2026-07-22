@@ -1,8 +1,18 @@
 #!/usr/bin/env python3
-"""Drives the robot from point A to point B, stopping, turning away from, and (as a last resort) drifting sideways around obstacles seen on /scan."""
+"""Drives the robot from A to B, holding the goal heading and running the
+refined obstacle-avoidance state machine (AvoidanceController): strafe-first,
+then turn-and-drive, then one bounded recovery, then halt.
+
+This node is a thin ROS wrapper -- it reduces each LaserScan into sector
+clearances, sizes the obstacle, finds an escape gap, and feeds those to the
+pure AvoidanceController every control tick. It publishes the commanded Twist,
+the live forward-arc range (/forward_min_range) for trial_logger, and a
+structured JSON decision record (/avoidance_decision) for decision_logger.
+"""
 import math
 import signal
 import time
+from dataclasses import fields as dc_fields
 
 import rclpy
 from rclpy.executors import ExternalShutdownException
@@ -12,18 +22,13 @@ from rclpy.signals import SignalHandlerOptions
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import LaserScan
-from std_msgs.msg import Float32
+from std_msgs.msg import Float32, String
 
-from proximity_alert.scan_utils import min_range_in_forward_arc
-
-DRIVE = "drive"
-AVOIDING = "avoiding"
-DRIFTING = "drifting"
-HALTED = "halted"
+from proximity_alert.scan_utils import reduce_to_sectors, size_obstacle, select_gap
+from proximity_alert.avoidance import AvoidanceController, AvoidanceConfig
 
 
 def normalize_angle(angle):
-    """Wrap an angle to [-pi, pi]."""
     return math.atan2(math.sin(angle), math.cos(angle))
 
 
@@ -33,74 +38,32 @@ def yaw_from_quaternion(q):
     )
 
 
-class HeadingPID:
-    """PID on heading error (rad) -> corrective angular.z (rad/s)."""
-
-    def __init__(self, kp, ki, kd, output_limit):
-        self.kp = kp
-        self.ki = ki
-        self.kd = kd
-        self.output_limit = output_limit
-        self.reset()
-
-    def reset(self):
-        self.integral = 0.0
-        self.prev_error = None
-
-    def update(self, error, dt):
-        self.integral += error * dt
-        # Anti-windup: keep the integral term from growing past what could
-        # alone saturate the output.
-        max_integral = self.output_limit / self.ki if self.ki else float("inf")
-        self.integral = max(-max_integral, min(max_integral, self.integral))
-        derivative = 0.0 if self.prev_error is None else (error - self.prev_error) / dt
-        self.prev_error = error
-        output = self.kp * error + self.ki * self.integral + self.kd * derivative
-        return max(-self.output_limit, min(self.output_limit, output))
-
-
 class PathTracker(Node):
     def __init__(self):
         super().__init__("path_tracker")
 
-        self.declare_parameter("safety_distance", 0.30) # The maximum allowed distance from the obstacle to the robot in meters (0.3 meters)
-        self.declare_parameter("forward_speed", 0.50) # How fast the robot moves forwards
-        self.declare_parameter("turn_speed", 0.6) 
-        self.declare_parameter("scan_arc_deg", 180.0)
-        self.declare_parameter("avoid_turn_duration", 1.0) # How long the robot avoids the obstacle by turning
-        self.declare_parameter("control_rate_hz", 10.0)
-        self.declare_parameter("scan_topic", "/scan_raw")
-        self.declare_parameter("scan_timeout", 0.5)
-        self.declare_parameter("avoid_reverse_speed", 0.1)
-        self.declare_parameter("odom_topic", "/odom")
-        self.declare_parameter("heading_kp", 1.0)
-        self.declare_parameter("heading_ki", 0.0)
-        self.declare_parameter("heading_kd", 0.1)
-        self.declare_parameter("heading_max_correction", 0.3)
-        self.declare_parameter("max_avoid_attempts", 3)
-        self.declare_parameter("clear_drive_duration", 3.0)
-        self.declare_parameter("disable_avoidance", False)
-        self.declare_parameter("drift_speed", 0.25) # Sideways strafe speed for the last-resort drift maneuver
-        self.declare_parameter("drift_duration", 1.5) # How long the robot drifts sideways before re-checking
+        # Every AvoidanceConfig field is a ROS parameter (defaults from the
+        # dataclass), so the whole behavior is tunable from the launch/CLI.
+        defaults = AvoidanceConfig()
+        for f in dc_fields(AvoidanceConfig):
+            self.declare_parameter(f.name, getattr(defaults, f.name))
+        self.config = AvoidanceConfig(**{
+            f.name: self.get_parameter(f.name).value for f in dc_fields(AvoidanceConfig)
+        })
 
-        self.safety_distance = self.get_parameter("safety_distance").value
-        self.forward_speed = self.get_parameter("forward_speed").value
-        self.turn_speed = self.get_parameter("turn_speed").value
-        self.scan_arc_deg = self.get_parameter("scan_arc_deg").value
-        self.avoid_turn_duration = self.get_parameter("avoid_turn_duration").value
-        control_rate_hz = self.get_parameter("control_rate_hz").value
+        # Node-level (non-controller) parameters.
+        self.declare_parameter("scan_topic", "/scan_raw")
+        self.declare_parameter("odom_topic", "/odom")
+        self.declare_parameter("scan_timeout", 0.5)
         scan_topic = self.get_parameter("scan_topic").value
-        self.scan_timeout = self.get_parameter("scan_timeout").value
-        self.avoid_reverse_speed = self.get_parameter("avoid_reverse_speed").value
         odom_topic = self.get_parameter("odom_topic").value
-        self.max_avoid_attempts = self.get_parameter("max_avoid_attempts").value
-        self.clear_drive_duration = self.get_parameter("clear_drive_duration").value
-        self.disable_avoidance = self.get_parameter("disable_avoidance").value
-        self.drift_speed = self.get_parameter("drift_speed").value
-        self.drift_duration = self.get_parameter("drift_duration").value
+        self.scan_timeout = self.get_parameter("scan_timeout").value
+
+        self.controller = AvoidanceController(self.config)
 
         self.cmd_vel_pub = self.create_publisher(Twist, "/cmd_vel", 10)
         self.range_pub = self.create_publisher(Float32, "/forward_min_range", 10)
+        self.decision_pub = self.create_publisher(String, "/avoidance_decision", 50)
         self.scan_sub = self.create_subscription(
             LaserScan, scan_topic, self.scan_callback, qos_profile_sensor_data
         )
@@ -108,245 +71,106 @@ class PathTracker(Node):
             Odometry, odom_topic, self.odom_callback, 10
         )
 
-        self.min_range = None
+        self._sectors = None
+        self._obstacle = None
+        self._gap = None
         self.last_scan_time = None
-        self.turn_away_direction = 0.0
-        self.state = DRIVE
-        self.avoid_start_time = None
-        self.locked_turn_direction = 0.0
-        self.consecutive_avoid_count = 0
-        self.drive_since = self.get_clock().now()
-        self.drift_start_time = None
-        self.locked_drift_direction = 0.0
-        self.has_drifted_this_encounter = False
-
         self.current_yaw = None
-        self.target_heading = None
-        self.heading_pid = HeadingPID(
-            kp=self.get_parameter("heading_kp").value,
-            ki=self.get_parameter("heading_ki").value,
-            kd=self.get_parameter("heading_kd").value,
-            output_limit=self.get_parameter("heading_max_correction").value,
-        )
-        self.control_dt = 1.0 / control_rate_hz
+        self.goal_heading_abs = None
+        self._goal_set = False
 
+        self.control_dt = 1.0 / self.config.control_rate_hz
         self.control_timer = self.create_timer(self.control_dt, self.control_loop)
 
         self.get_logger().info(
-            f"path_tracker started: safety_distance={self.safety_distance}m "
-            f"forward_speed={self.forward_speed}m/s scan_arc_deg={self.scan_arc_deg}deg "
-            f"drift_speed={self.drift_speed}m/s drift_duration={self.drift_duration}s"
+            f"path_tracker started: safety_distance={self.config.safety_distance}m "
+            f"forward_speed={self.config.forward_speed}m/s "
+            f"strafe_speed={self.config.strafe_speed}m/s "
+            f"disable_avoidance={self.config.disable_avoidance}"
         )
 
     def publish_stop(self):
         """Command a hard stop, delivered reliably.
 
-        The motor controller (STM32) holds the last commanded velocity with no
-        watchdog auto-stop, so a single zero Twist published as the process
-        exits can be dropped before it reaches the wire, leaving the robot
-        driving. Publish zero several times with a brief pause and spin between
-        sends so at least one is delivered before shutdown.
+        The STM32 holds the last commanded velocity with no watchdog, so a
+        single zero Twist published as the process exits can be dropped before
+        it reaches the wire. Publish zero several times with a brief pause so at
+        least one is delivered. Called from the signal handler while spin is
+        suspended -- must NOT spin re-entrantly.
         """
-        # Called from the signal handler while rclpy.spin() is suspended on the
-        # stack, so must NOT spin re-entrantly. Publishing is asynchronous; the
-        # short sleeps let the DDS layer flush each message before the process
-        # exits.
         stop = Twist()
         for _ in range(5):
             self.cmd_vel_pub.publish(stop)
             time.sleep(0.03)
 
     def scan_callback(self, msg: LaserScan):
-        closest, closest_angle = min_range_in_forward_arc(msg, self.scan_arc_deg)
+        cfg = self.config
+        sectors = reduce_to_sectors(msg, cfg.front_arc_deg, cfg.front_subsector_deg,
+                                    cfg.side_window_deg, cfg.rear_window_deg)
+        obstacle = size_obstacle(msg, cfg.front_arc_deg, cfg.obstacle_detect_range)
+        # Gap bearings are relative to the robot's current heading; pass the
+        # goal as a relative bearing so the recovery gap tie-break prefers the
+        # opening closest to the goal direction.
+        goal_rel = 0.0
+        if self._goal_set and self.current_yaw is not None:
+            goal_rel = normalize_angle(self.goal_heading_abs - self.current_yaw)
+        gap = select_gap(msg, cfg.min_gap_clearance, cfg.min_gap_width_deg, goal_rel)
 
-        self.min_range = closest
+        self._sectors, self._obstacle, self._gap = sectors, obstacle, gap
         self.last_scan_time = self.get_clock().now()
-        # Obstacle left of center (positive angle) -> turn right (negative), and vice versa.
-        self.turn_away_direction = -1.0 if closest_angle >= 0 else 1.0
 
-        # Live forward-arc range for trial_logger to record the LiDAR stop
-        # distance; inf means nothing valid in the arc this scan.
         range_msg = Float32()
-        range_msg.data = closest if closest is not None else float("inf")
+        range_msg.data = sectors["front"] if math.isfinite(sectors["front"]) else float("inf")
         self.range_pub.publish(range_msg)
 
     def odom_callback(self, msg: Odometry):
         self.current_yaw = yaw_from_quaternion(msg.pose.pose.orientation)
+        if not self._goal_set:
+            self.goal_heading_abs = self.current_yaw
+            self.controller.set_goal_heading(self.current_yaw)
+            self._goal_set = True
 
     def scan_is_stale(self):
-        """True if we have no scan yet, or the last one is older than scan_timeout.
-
-        Guards against driving forward on stale data if the LiDAR stops
-        publishing mid-run (observed to happen with this LD19), and against
-        lurching forward at startup before the first scan arrives.
-        """
         if self.last_scan_time is None:
             return True
         age = (self.get_clock().now() - self.last_scan_time).nanoseconds / 1e9
         return age > self.scan_timeout
 
     def control_loop(self):
+        if self.scan_is_stale() or self._sectors is None:
+            # No fresh obstacle data -> hold still rather than drive blind.
+            self.get_logger().warn(
+                "No fresh scan within scan_timeout; holding.",
+                throttle_duration_sec=1.0,
+            )
+            self.cmd_vel_pub.publish(Twist())
+            return
+
+        now = self.get_clock().now().nanoseconds / 1e9
+        yaw = self.current_yaw if self.current_yaw is not None else 0.0
+        out = self.controller.step(self._sectors, self._obstacle, self._gap, yaw, now)
+
         cmd = Twist()
-
-        if self.state == DRIVE:
-            if self.scan_is_stale():
-                # No fresh obstacle data -> hold still rather than drive blind.
-                self.get_logger().warn(
-                    "No fresh scan within scan_timeout; holding.",
-                    throttle_duration_sec=1.0,
-                )
-                # cmd stays zeroed for this tick
-            elif self.min_range is not None and self.min_range <= self.safety_distance:
-                # Track repeated avoidance attempts without an intervening
-                # clean drive. A wide/complex obstacle (e.g. a desk and chair
-                # spanning most of the forward arc) can make each turn "fix"
-                # being blocked on one side only by revealing the obstacle on
-                # the other side -- confirmed by direct log evidence: 13
-                # consecutive episodes alternating -0.6/+0.6 with no net
-                # progress. Give up and halt instead of oscillating forever.
-                self.consecutive_avoid_count += 1
-                if self.disable_avoidance:
-                    # LiDAR-vs-actual-distance data collection run: go
-                    # straight and stop at the box, no turn-away maneuver.
-                    self.get_logger().info(
-                        f"Obstacle at {self.min_range:.2f}m, halting "
-                        "(avoidance disabled for this run)."
-                    )
-                    self.state = HALTED
-                elif self.consecutive_avoid_count > self.max_avoid_attempts:
-                    if self.has_drifted_this_encounter:
-                        self.get_logger().warn(
-                            f"{self.consecutive_avoid_count} avoidance attempts "
-                            "in a row, drift-around already tried -- likely too "
-                            "wide/complex to route around. Halting instead of "
-                            "oscillating."
-                        )
-                        self.state = HALTED
-                    else:
-                        self.get_logger().warn(
-                            f"{self.consecutive_avoid_count} avoidance attempts "
-                            "in a row without a clear drive -- turning isn't "
-                            "working, trying a sideways drift instead of "
-                            "oscillating."
-                        )
-                        self.state = DRIFTING
-                        self.has_drifted_this_encounter = True
-                        self.drift_start_time = self.get_clock().now()
-                        # Same lock-in-now reasoning as locked_turn_direction
-                        # below: freeze the direction at state-entry so a
-                        # mid-drift scan update can't flip it.
-                        self.locked_drift_direction = self.turn_away_direction
-                else:
-                    self.get_logger().info(f"Obstacle at {self.min_range:.2f}m, stopping")
-                    self.state = AVOIDING
-                    self.avoid_start_time = self.get_clock().now()
-                    # Lock the turn direction in now. turn_away_direction is
-                    # recomputed on every incoming scan regardless of state,
-                    # so reading it live during the turn (below) let the
-                    # obstacle's shifting apparent angle flip the commanded
-                    # direction mid-maneuver, cancelling the turn to ~0 net
-                    # rotation.
-                    self.locked_turn_direction = self.turn_away_direction
-                    # Clear the heading target: once we resume DRIVE after
-                    # this turn, "straight" means whatever new direction
-                    # we're then facing, not the pre-turn heading.
-                    self.target_heading = None
-                    self.heading_pid.reset()
-                # cmd stays zeroed for this tick
-            else:
-                drive_elapsed = (self.get_clock().now() - self.drive_since).nanoseconds / 1e9
-                if drive_elapsed >= self.clear_drive_duration:
-                    # Sustained clean driving -> the obstacle is actually
-                    # behind us, not just a lull between oscillation attempts.
-                    self.consecutive_avoid_count = 0
-                    self.has_drifted_this_encounter = False
-                cmd.linear.x = self.forward_speed
-                if self.current_yaw is not None:
-                    if self.target_heading is None:
-                        # Capture the heading to hold the moment straight
-                        # driving (re)starts.
-                        self.target_heading = self.current_yaw
-                    error = normalize_angle(self.target_heading - self.current_yaw)
-                    cmd.angular.z = self.heading_pid.update(error, self.control_dt)
-                # else: no odom yet -- drive straight open-loop until it arrives.
-
-        elif self.state == AVOIDING:
-            elapsed = (self.get_clock().now() - self.avoid_start_time).nanoseconds / 1e9
-            if elapsed < self.avoid_turn_duration:
-                # The robot's own mecanum driver (controller/mecanum.py, not
-                # part of this package) computes all four wheel speeds equal
-                # for a pure angular-only command -- confirmed by reading
-                # /ros_robot_controller/set_motor directly, all 4 IDs got the
-                # identical rps for angular.z alone. That can't produce a
-                # clean in-place rotation. Adding a small reverse component
-                # breaks the degenerate case (and backs further from the
-                # obstacle instead of creeping toward it) without touching
-                # the vendor driver.
-                cmd.linear.x = -self.avoid_reverse_speed
-                cmd.angular.z = self.turn_speed * self.locked_turn_direction
-            elif self.min_range is not None and self.min_range <= self.safety_distance:
-                # Still blocked after one turn-away attempt (e.g. a fixed
-                # endpoint obstacle) -> hold a stop, but keep re-checking in
-                # HALTED below rather than freezing permanently.
-                self.get_logger().info("Still blocked after turn-away, halting")
-                self.state = HALTED
-            else:
-                self.state = DRIVE
-                self.drive_since = self.get_clock().now()
-
-        elif self.state == DRIFTING:
-            elapsed = (self.get_clock().now() - self.drift_start_time).nanoseconds / 1e9
-            if elapsed < self.drift_duration:
-                # Pure lateral translation -- unlike angular.z, this doesn't
-                # hit the mecanum driver's equal-wheel-speed rotation bug, so
-                # no reverse-component workaround is needed here.
-                cmd.linear.y = self.drift_speed * self.locked_drift_direction
-            elif self.min_range is not None and self.min_range <= self.safety_distance:
-                self.get_logger().info("Still blocked after drift, halting")
-                self.state = HALTED
-            else:
-                self.state = DRIVE
-                self.drive_since = self.get_clock().now()
-
-        elif self.state == HALTED:
-            # Re-check each tick rather than freezing forever: at the real
-            # experiment's endpoint the obstacle never clears, so this stays
-            # halted exactly as before. But it recovers if the obstacle is
-            # moved away (floor testing) or was a transient false trigger.
-            if not self.scan_is_stale() and (
-                self.min_range is None or self.min_range > self.safety_distance
-            ):
-                self.get_logger().info("Obstacle cleared, resuming drive.")
-                self.state = DRIVE
-                self.drive_since = self.get_clock().now()
-                # Deliberately NOT resetting consecutive_avoid_count here:
-                # this recovery can fire within ~0.3s of halting (seen on
-                # real hardware), too fast to trust as a genuine clear. Only
-                # clear_drive_duration of sustained clean driving (checked in
-                # the DRIVE branch) resets the give-up counter, regardless of
-                # which path led back to DRIVE.
-            # else: cmd stays zeroed for this tick
-
+        cmd.linear.x = float(out.linear_x)
+        cmd.linear.y = float(out.linear_y)
+        cmd.angular.z = float(out.angular_z)
         self.cmd_vel_pub.publish(cmd)
+
+        if out.decision is not None:
+            self.decision_pub.publish(String(data=out.decision.to_json()))
 
 
 def main(args=None):
     # rclpy's default signal handling tears down the context before our own
     # cleanup runs, so a final safety-stop publish in a `finally` block would
-    # silently fail on SIGINT/SIGTERM. Publish the stop from our own handler
-    # instead, while the context is still valid.
-    #
-    # The handler must ONLY set a flag, never call publish_stop()/shutdown()
-    # directly: a second SIGINT arriving while the first call is still
-    # running (e.g. mid-publish, or under CPU load that widens the window)
-    # re-enters the handler and calls rclpy.shutdown() a second time while
-    # spin_once() is still using the context -- confirmed on real hardware
-    # to crash the in-flight executor call with a corrupted-context error
-    # (varies: "Unable to convert call argument to Python object" or
-    # "failed to initialize wait set ... context is not valid" depending on
-    # exactly where the interruption lands). Doing the actual stop/shutdown
-    # from the main loop, only after spin_once() has returned, means a
-    # repeated signal just re-sets an already-true flag -- harmless.
+    # silently fail on SIGINT/SIGTERM. The handler must ONLY set a flag, never
+    # call publish_stop()/shutdown() directly: a second SIGINT arriving while
+    # the first call is still running re-enters the handler and calls
+    # rclpy.shutdown() a second time while spin_once() is still using the
+    # context -- confirmed on real hardware to crash the in-flight executor
+    # call. Doing the actual stop/shutdown from the main loop, only after
+    # spin_once() has returned, means a repeated signal just re-sets an
+    # already-true flag -- harmless.
     rclpy.init(args=args, signal_handler_options=SignalHandlerOptions.NO)
     node = PathTracker()
 
