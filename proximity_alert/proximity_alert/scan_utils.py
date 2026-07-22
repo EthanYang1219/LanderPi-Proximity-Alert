@@ -109,3 +109,60 @@ def size_obstacle(msg, front_arc_deg, obstacle_detect_range):
     preferred_side = 1.0 if left_avg >= right_avg else -1.0
     return {"span_deg": span_deg, "y_lo": min(ys), "y_hi": max(ys),
             "preferred_side": preferred_side}
+
+
+def select_gap(msg, min_gap_clearance, min_gap_width_deg, goal_heading):
+    beams = []  # (rel, r)
+    for i, r in enumerate(msg.ranges):
+        if msg.range_min <= r <= msg.range_max and math.isfinite(r):
+            angle = msg.angle_min + i * msg.angle_increment
+            rel = math.atan2(math.sin(angle), math.cos(angle))
+            beams.append((rel, r))
+    if not beams:
+        return None
+    beams.sort(key=lambda b: b[0])
+    n = len(beams)
+    clear = [r >= min_gap_clearance for _, r in beams]
+
+    # maximal contiguous clear runs as (start_idx, end_idx) inclusive
+    runs = []
+    i = 0
+    while i < n:
+        if clear[i]:
+            j = i
+            while j + 1 < n and clear[j + 1]:
+                j += 1
+            runs.append((i, j))
+            i = j + 1
+        else:
+            i += 1
+    if not runs:
+        return None
+
+    candidates = []  # (width_rad, bearing_rad)
+    # Wrap-merge: if the first AND last beams are clear, the last run and the
+    # first run are ONE circular run straddling +/-pi (e.g. a gap behind the
+    # robot). Combine them so it isn't split into two rejected slivers.
+    if len(runs) >= 2 and clear[0] and clear[-1]:
+        ls, _le = runs[-1]
+        _fs, fe = runs[0]
+        start_ang, end_ang = beams[ls][0], beams[fe][0]
+        width = (end_ang - start_ang) + 2 * math.pi
+        bearing = math.atan2(math.sin(start_ang + width / 2),
+                             math.cos(start_ang + width / 2))
+        candidates.append((width, bearing))
+        runs = runs[1:-1]  # consumed into the wrapped run
+
+    for s, e in runs:
+        candidates.append((beams[e][0] - beams[s][0],
+                           (beams[s][0] + beams[e][0]) / 2.0))
+
+    min_width = math.radians(min_gap_width_deg)
+    best = None  # ((width, -|bearing-goal|), bearing)
+    for width, bearing in candidates:
+        if width >= min_width:
+            key = (width, -abs(math.atan2(math.sin(bearing - goal_heading),
+                                          math.cos(bearing - goal_heading))))
+            if best is None or key > best[0]:
+                best = (key, bearing)
+    return None if best is None else best[1]
