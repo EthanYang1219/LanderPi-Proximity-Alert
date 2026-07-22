@@ -23,6 +23,7 @@ setup(
         'console_scripts': [
             'path_tracker = proximity_alert.path_tracker:main',
             'trial_logger = proximity_alert.trial_logger:main',
+            'decision_logger = proximity_alert.decision_logger:main',
         ],
     },
 )
