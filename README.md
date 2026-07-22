@@ -97,7 +97,12 @@ The robot's ROS 2 stack already runs in a Docker container named `MentorPi` on t
    docker exec -it -u ubuntu MentorPi zsh -lc "source ~/.zshrc && source ~/ros2_ws/install/setup.bash && ros2 run proximity_alert trial_logger --ros-args -p csv_path:=/home/ubuntu/shared/trials/granite.csv"
    ```
 
-   Pointing `csv_path` at `/home/ubuntu/shared/...` writes the CSV into the container's shared folder, which is bind-mounted to `~/docker/tmp` on the Pi — so your trial data survives even if the container restarts.
+   ```bash
+   # Terminal C — log the avoidance decisions (separate CSV)
+   docker exec -it -u ubuntu MentorPi zsh -lc "source ~/.zshrc && source ~/ros2_ws/install/setup.bash && ros2 run proximity_alert decision_logger --ros-args -p csv_path:=/home/ubuntu/shared/trials/decision_log.csv"
+   ```
+
+   Pointing `csv_path` at `/home/ubuntu/shared/...` writes the CSV into the container's shared folder, which is bind-mounted to `~/docker/tmp` (i.e. `/home/pi/docker/tmp/trials/`) on the Pi — so both the trial log and the decision log appear in your local file manager and survive container restarts.
 
 After step 2, repeat only step 3 for future runs — you only need to rebuild when you change `path_tracker.py`/`trial_logger.py` (repeat steps 1–2 each time).
 
@@ -136,27 +141,62 @@ Each row appended to the CSV represents one trial:
 | `lidar_stop_range_m` | The actual LiDAR range to the closest obstacle in the forward arc at the moment the trial finalized (i.e. the real stop clearance), captured from `path_tracker`'s `/forward_min_range` topic. Useful for checking proximity-trigger accuracy against the `safety_distance` parameter and whether it varies by surface. Blank if nothing valid was in the arc at stop. |
 | `notes` | Freeform text entered at logging time for anything unusual observed (e.g. "motors fought each other on the turn", "oscillated near desk", "false stop") |
 
+## Refined obstacle avoidance
+
+`path_tracker` runs a deterministic 7-state machine (`AvoidanceController`, a pure module unit-tested off-hardware) governed by one invariant: **always take the maneuver that minimizes deviation from the goal heading while maintaining safety.** That ordering falls out of it — strafe (holds the bearing) → turn-and-drive (bounded deviation) → one bounded recovery → halt:
+
+- **DRIVE** — forward at `forward_speed`, PID holds the goal heading captured at A.
+- **ASSESS** — on a confirmed obstacle, a strafe-first ladder: sidestep if a bounded strafe toward a *confirmed-clear* side clears the (narrow) obstacle; else turn toward the more-open side and drive past; else escalate.
+- **STRAFE / TURN / DRIVE_PAST** — the maneuvers, each committed (run to completion) so an obstacle's jittering apparent side can't cause oscillation.
+- **RECOVER** — after repeated failures, one bounded routine: back off, pick the widest fitting gap from the current 360° scan, rotate to face it, commit once.
+- **HALT** — stop and flag; re-check each tick.
+
+The LiDAR is reduced each scan into FRONT (+ front sub-sectors), LEFT, RIGHT, and REAR clearances. Every decision is published as a JSON record on `/avoidance_decision` and logged by `decision_logger` (see [Data collected](#data-collected)). Set `disable_avoidance:=true` to halt on any obstacle with no turn/strafe (used for the clean go-and-stop distance runs).
+
 ## Parameters
 
-**`path_tracker`**
+**`path_tracker`** (every field is a ROS parameter; only the commonly-tuned ones are shown — see `AvoidanceConfig` in `proximity_alert/avoidance.py` for the full list)
 
 | Parameter | Default | Description |
 |---|---|---|
-| `safety_distance` | `0.30` | Stop threshold, meters |
-| `forward_speed` | `0.15` | Constant forward speed, m/s |
-| `turn_speed` | `0.6` | Turn-away angular speed, rad/s |
-| `scan_arc_deg` | `180.0` | Forward arc monitored for obstacles, degrees |
-| `drift_speed` | `0.15` | Sideways strafe speed for the last-resort drift-around maneuver, m/s |
-| `drift_duration` | `1.0` | How long the robot strafes sideways before re-checking for a clear path, seconds |
+| `safety_distance` | `0.30` | FRONT stop threshold, meters |
+| `forward_speed` | `0.50` | Constant forward speed, m/s |
+| `obstacle_confirm_scans` | `2` | Consecutive close scans required before a maneuver decision (debounce) |
+| `strafe_speed` / `strafe_timeout` | `0.25` / `1.5` | Lateral speed and per-strafe time cap (m/s, s) |
+| `strafe_side_clearance_min` | `0.30` | Side clearance required to strafe into it, meters |
+| `max_obstacle_span_deg` | `50.0` | Above this angular span, the obstacle is "wide" → turn, not strafe |
+| `max_cumulative_strafe` | `0.60` | Hard per-encounter lateral cap (long-wall guard), meters |
+| `turn_speed` / `turn_step_deg` / `turn_timeout` | `0.6` / `30.0` / `1.5` | Turn rate, per-turn increment, time cap (rad/s, deg, s) |
+| `max_avoid_attempts` | `3` | Failed cycles before escalating to recovery |
+| `clear_drive_duration` | `3.0` | Sustained clean-drive time that closes an encounter and resets counters, seconds |
+| `min_gap_clearance` / `min_gap_width_deg` | `0.60` / `40.0` | What counts as a usable recovery gap (robot must fit) |
+| `disable_avoidance` | `false` | Halt on any obstacle, no turn/strafe (clean go-and-stop runs) |
+
+Derived (computed, not configured): `max_strafe_distance = strafe_speed × strafe_timeout`; `corridor_half = robot_half_width + corridor_margin`; `clear_threshold = safety_distance + clear_margin`.
 
 **`trial_logger`**
 
 | Parameter | Default | Description |
 |---|---|---|
-| `csv_path` | `trial_log.csv` | Output CSV file path |
+| `csv_path` | `trial_log.csv` | Output CSV file path (point at `/home/ubuntu/shared/trials/<surface>.csv` to land on the host — see below) |
 | `move_velocity_threshold` | `0.03` | Speed above which the robot is considered moving, m/s |
 | `stop_velocity_threshold` | `0.02` | Speed below which the robot is considered stopped, m/s |
 | `stop_confirm_duration` | `1.0` | Seconds of continuous stopped-ness before a trial is finalized |
+
+**`decision_logger`**
+
+| Parameter | Default | Description |
+|---|---|---|
+| `csv_path` | `/home/ubuntu/shared/trials/decision_log.csv` | Output CSV for the avoidance decision log (host path — see below) |
+
+### Two separate CSVs, both on your computer
+
+The two logs are deliberately kept in **separate files** so the motion/slippage data and the avoidance-decision data stay clean and independently analyzable:
+
+- **Trial motion log** (`trial_logger`) — one row per A→B trial: transit time, odometry vs. ground-truth distance, slippage, `avoidance_events`, `lidar_stop_range_m`.
+- **Decision log** (`decision_logger`) — one row per avoidance *decision*, for research/debugging: `timestamp, encounter_id, state, chosen_maneuver, reason, obstacle_span_deg, front_distance_m, front_left_m, front_center_m, front_right_m, left_clearance_m, right_clearance_m, rear_clearance_m, required_clearing_m, cumulative_strafe_m, consecutive_avoid_count, recovery_triggered, outcome, maneuver_duration_s`.
+
+Both default to (or should be pointed at) `/home/ubuntu/shared/trials/` inside the container, which is bind-mounted to **`/home/pi/docker/tmp/trials/`** on the Pi — so both CSVs appear directly in your local file manager (and survive container restarts) with no `docker` digging.
 
 ## Roadmap
 
