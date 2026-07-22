@@ -16,6 +16,9 @@
 - `path_tracker`'s existing safe-shutdown must be preserved: STM32 has no motion watchdog, so `cmd_vel` must be driven to zero on stop/exit; keep the flag-based signal handler from commit `e64c4c2` (never call `publish_stop()`/`rclpy.shutdown()` from the signal handler).
 - Pure modules (`scan_utils`, `avoidance`, `decision_record`) must import **nothing** from `rclpy`/`sensor_msgs` at module load, so they unit-test on a plain host with duck-typed inputs (follow the existing `scan_utils` pattern).
 - LD19 reports angles `0..2π`; every angular computation must wrap via `atan2(sin, cos)` into `[-π, π]` (as `min_range_in_forward_arc` already does).
+- **Angle from index, not accumulation:** compute each beam's angle as `msg.angle_min + i * msg.angle_increment` (enumerate), never `angle += increment`. In float64 the accumulation drift is ~1e-12 rad (negligible vs the 0.0125 rad beam spacing) — this is correctness hygiene, not a live-error fix, but adopt it uniformly.
+- **Finite guard:** every per-beam loop must gate on `msg.range_min <= r <= msg.range_max and math.isfinite(r)`. The range check alone already excludes NaN/±Inf for this LD19 (`range_max` is a finite 25.0), so `isfinite` is defense-in-depth against a future `range_max` reconfiguration — include it anyway.
+- **Angular runs must wrap:** any logic that scans contiguous angular runs over the sorted `[-π, π]` beams (e.g. gap finding) must merge a run touching `-π` with a run touching `+π` — a gap directly behind the robot straddles the array boundary and must not be split into two rejected slivers.
 - Both CSVs must default to the host-accessible bind-mount path `/home/ubuntu/shared/trials/` (container) = `/home/pi/docker/tmp/trials/` (host).
 - The decision log is a **separate file** written by a **separate node** — never merged into `trial_logger`'s motion CSV.
 - All `docker exec` for build/test/run uses `-u ubuntu` (root breaks FastRTPS SHM delivery on this container).
@@ -120,9 +123,9 @@ def reduce_to_sectors(msg, front_arc_deg, front_subsector_deg,
            ("front", "front_left", "front_center", "front_right",
             "left", "right", "rear")}
 
-    angle = msg.angle_min
-    for r in msg.ranges:
-        if msg.range_min <= r <= msg.range_max:
+    for i, r in enumerate(msg.ranges):
+        if msg.range_min <= r <= msg.range_max and math.isfinite(r):
+            angle = msg.angle_min + i * msg.angle_increment
             rel = math.atan2(math.sin(angle), math.cos(angle))
             if -half_front <= rel <= half_front:
                 out["front"] = min(out["front"], r)
@@ -138,7 +141,6 @@ def reduce_to_sectors(msg, front_arc_deg, front_subsector_deg,
                 out["right"] = min(out["right"], r)
             if _in_window(rel, math.pi, half_rear):
                 out["rear"] = min(out["rear"], r)
-        angle += msg.angle_increment
     return out
 ```
 
@@ -221,9 +223,9 @@ def size_obstacle(msg, front_arc_deg, obstacle_detect_range):
     left_open = 0.0
     right_open = 0.0
     left_n = right_n = 0
-    angle = msg.angle_min
-    for r in msg.ranges:
-        if msg.range_min <= r <= msg.range_max:
+    for i, r in enumerate(msg.ranges):
+        if msg.range_min <= r <= msg.range_max and math.isfinite(r):
+            angle = msg.angle_min + i * msg.angle_increment
             rel = math.atan2(math.sin(angle), math.cos(angle))
             if -half_front <= rel <= half_front:
                 if r <= obstacle_detect_range:
@@ -233,7 +235,6 @@ def size_obstacle(msg, front_arc_deg, obstacle_detect_range):
                         left_open += r; left_n += 1
                     elif rel < 0:
                         right_open += r; right_n += 1
-        angle += msg.angle_increment
     if not near:
         return None
     rels = [a for a, _ in near]
@@ -311,6 +312,17 @@ def test_tiebreak_prefers_gap_closest_to_goal():
     pairs = openw(pairs, 40, 70)
     bearing = select_gap(_scan(pairs), 0.6, 25.0, math.radians(55))
     assert bearing > 0  # goal is to the right, so pick the right gap
+
+
+def test_wraps_gap_straddling_pi_behind_robot():
+    # Everything blocked except a ~40 deg window centered on 180 deg (behind).
+    # Split at the +/-180 array boundary each half is only 20 deg; without the
+    # wrap-merge, both are rejected against a 30 deg min width -> None (the bug).
+    pairs = [(math.radians(a), (5.0 if abs(a) >= 160 else 0.3))
+             for a in range(-180, 180, 5)]
+    bearing = select_gap(_scan(pairs), 0.6, 30.0, math.radians(180))
+    assert bearing is not None
+    assert abs(abs(bearing) - math.pi) < math.radians(20)  # points behind
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -324,41 +336,66 @@ Expected: FAIL — `ImportError: cannot import name 'select_gap'`.
 # append to proximity_alert/proximity_alert/scan_utils.py
 
 def select_gap(msg, min_gap_clearance, min_gap_width_deg, goal_heading):
-    beams = []  # (rel, r) sorted by rel
-    angle = msg.angle_min
-    for r in msg.ranges:
-        if msg.range_min <= r <= msg.range_max:
+    beams = []  # (rel, r)
+    for i, r in enumerate(msg.ranges):
+        if msg.range_min <= r <= msg.range_max and math.isfinite(r):
+            angle = msg.angle_min + i * msg.angle_increment
             rel = math.atan2(math.sin(angle), math.cos(angle))
             beams.append((rel, r))
-        angle += msg.angle_increment
+    if not beams:
+        return None
     beams.sort(key=lambda b: b[0])
+    n = len(beams)
+    clear = [r >= min_gap_clearance for _, r in beams]
+
+    # maximal contiguous clear runs as (start_idx, end_idx) inclusive
+    runs = []
+    i = 0
+    while i < n:
+        if clear[i]:
+            j = i
+            while j + 1 < n and clear[j + 1]:
+                j += 1
+            runs.append((i, j))
+            i = j + 1
+        else:
+            i += 1
+    if not runs:
+        return None
+
+    candidates = []  # (width_rad, bearing_rad)
+    # Wrap-merge: if the first AND last beams are clear, the last run and the
+    # first run are ONE circular run straddling +/-pi (e.g. a gap behind the
+    # robot). Combine them so it isn't split into two rejected slivers.
+    if len(runs) >= 2 and clear[0] and clear[-1]:
+        ls, _le = runs[-1]
+        _fs, fe = runs[0]
+        start_ang, end_ang = beams[ls][0], beams[fe][0]
+        width = (end_ang - start_ang) + 2 * math.pi
+        bearing = math.atan2(math.sin(start_ang + width / 2),
+                             math.cos(start_ang + width / 2))
+        candidates.append((width, bearing))
+        runs = runs[1:-1]  # consumed into the wrapped run
+
+    for s, e in runs:
+        candidates.append((beams[e][0] - beams[s][0],
+                           (beams[s][0] + beams[e][0]) / 2.0))
 
     min_width = math.radians(min_gap_width_deg)
-    best = None  # (width, bearing)
-    run_start = None
-    prev = None
-    for rel, r in beams:
-        clear = r >= min_gap_clearance
-        if clear and run_start is None:
-            run_start = rel
-        if (not clear or rel is beams[-1][0]) and run_start is not None:
-            run_end = prev if not clear else rel
-            width = run_end - run_start
-            if width >= min_width:
-                bearing = (run_start + run_end) / 2.0
-                key = (width, -abs(math.atan2(math.sin(bearing - goal_heading),
-                                              math.cos(bearing - goal_heading))))
-                if best is None or key > best[0]:
-                    best = (key, bearing)
-            run_start = None if not clear else run_start
-        prev = rel
+    best = None  # ((width, -|bearing-goal|), bearing)
+    for width, bearing in candidates:
+        if width >= min_width:
+            key = (width, -abs(math.atan2(math.sin(bearing - goal_heading),
+                                          math.cos(bearing - goal_heading))))
+            if best is None or key > best[0]:
+                best = (key, bearing)
     return None if best is None else best[1]
 ```
 
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cd proximity_alert && python3 -m pytest test/test_gap_finding.py -v`
-Expected: PASS (3 passed). If the final-run edge case fails, adjust the loop to close an open run after iteration; keep tests unchanged.
+Expected: PASS (4 passed), including the wrap-around case.
 
 - [ ] **Step 5: Commit**
 
@@ -670,7 +707,9 @@ class ControllerOutput:
     decision: object  # DecisionRecord | None
 ```
 
-Implement `AvoidanceController` with the fields: `state`, `goal_heading`, `consecutive_avoid_count`, `cumulative_strafe`, `has_recovered_this_encounter`, `_confirm_count`, `_locked_dir`, `_maneuver_start`, `encounter_id`, `_pid`. `step()` dispatches on `self.state`. In DRIVE: if obstacle present and `front <= safety_distance`, increment `_confirm_count`, command zero forward; when `_confirm_count >= obstacle_confirm_scans` call `_assess(...)`; else PID-hold `goal_heading` and drive `forward_speed`. `_assess()` implements the ladder, sets `_locked_dir`, `_maneuver_start = now`, builds and returns the `DecisionRecord`. Write the STRAFE/TURN commands (STRAFE: `linear_y = strafe_speed * _locked_dir`, PID-hold heading; TURN: `angular_z = turn_speed * _locked_dir`, blend `-avoid_reverse_speed` if `front < reverse_trigger_range and rear >= rear_clearance_min`). Return to DRIVE on `front >= clear_threshold` sustained (Task 6 adds the sustained-timer + DRIVE_PAST/RECOVER/HALT).
+Implement `AvoidanceController` with the fields: `state`, `goal_heading`, `consecutive_avoid_count`, `cumulative_strafe`, `has_recovered_this_encounter`, `_confirm_count`, `_locked_dir`, `_maneuver_start`, `encounter_id`, `_clean_drive_since` (timestamp DRIVE last (re)started clean), `_in_encounter` (bool), `_pid`.
+
+**Encounter lifecycle (explicit — a sensor blip must not merge two obstacles, nor split one).** `encounter_id` and the reset of `consecutive_avoid_count` / `cumulative_strafe` / `has_recovered_this_encounter` are BOTH gated by the same cooldown: an encounter is considered *closed* only after `now - _clean_drive_since >= clear_drive_duration` of continuous DRIVE with the front clear. Concretely: when a confirmed obstacle is detected in DRIVE, if `_in_encounter` is already True (we are within an unclosed encounter — a re-detection during cooldown) it **resumes** the current `encounter_id` and does NOT reset the counters; if `_in_encounter` is False (cooldown had elapsed, encounter closed) it **increments** `encounter_id`, sets `_in_encounter = True`, and zeroes the counters. Entering DRIVE with the front clear sets `_clean_drive_since = now`; each clean DRIVE tick checks `now - _clean_drive_since >= clear_drive_duration` and, when it passes, sets `_in_encounter = False` (encounter closed, counters reset). Any obstacle detected before that threshold keeps `_in_encounter = True` and the same `encounter_id`. `step()` dispatches on `self.state`. In DRIVE: if obstacle present and `front <= safety_distance`, increment `_confirm_count`, command zero forward; when `_confirm_count >= obstacle_confirm_scans` call `_assess(...)`; else PID-hold `goal_heading` and drive `forward_speed`. `_assess()` implements the ladder, sets `_locked_dir`, `_maneuver_start = now`, builds and returns the `DecisionRecord`. Write the STRAFE/TURN commands (STRAFE: `linear_y = strafe_speed * _locked_dir`, PID-hold heading; TURN: `angular_z = turn_speed * _locked_dir`, blend `-avoid_reverse_speed` if `front < reverse_trigger_range and rear >= rear_clearance_min`). Return to DRIVE on `front >= clear_threshold` sustained (Task 6 adds the sustained-timer + DRIVE_PAST/RECOVER/HALT).
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -736,6 +775,31 @@ def test_recover_commits_toward_gap_when_available():
     assert out.state == "RECOVER"
     # while facing away from the gap it should be rotating toward it (+ = left/CCW)
     assert out.angular_z != 0.0
+
+
+def test_blip_during_cooldown_resumes_same_encounter():
+    c = AvoidanceController(_cfg(obstacle_confirm_scans=1, clear_drive_duration=3.0))
+    c.set_goal_heading(0.0)
+    obst = {"span_deg": 10.0, "y_lo": -0.05, "y_hi": 0.05, "preferred_side": 1.0}
+    c.step(_sectors(front=0.29, fc=0.29, left=1.5), obst, None, 0.0, 0.0)  # encounter A
+    id_a = c.encounter_id
+    c.step(_sectors(front=5.0), None, None, 0.0, 0.4)                       # brief clear
+    # re-detect BEFORE clear_drive_duration elapses -> same encounter, no reset
+    out = c.step(_sectors(front=0.29, fc=0.29, left=1.5), obst, None, 0.0, 1.0)
+    assert out.decision.encounter_id == id_a
+
+
+def test_detection_after_cooldown_is_new_encounter():
+    c = AvoidanceController(_cfg(obstacle_confirm_scans=1, clear_drive_duration=1.0))
+    c.set_goal_heading(0.0)
+    obst = {"span_deg": 10.0, "y_lo": -0.05, "y_hi": 0.05, "preferred_side": 1.0}
+    c.step(_sectors(front=0.29, fc=0.29, left=1.5), obst, None, 0.0, 0.0)  # encounter A
+    id_a = c.encounter_id
+    # sustained clean driving past clear_drive_duration closes the encounter
+    for t in (0.4, 1.0, 2.0, 3.5):
+        c.step(_sectors(front=5.0), None, None, 0.0, t)
+    out = c.step(_sectors(front=0.29, fc=0.29, left=1.5), obst, None, 0.0, 4.0)
+    assert out.decision.encounter_id == id_a + 1
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -745,12 +809,12 @@ Expected: FAIL — the new tests fail (RECOVER/HALT/DRIVE_PAST paths not impleme
 
 - [ ] **Step 3: Write the implementation**
 
-Extend `step()`: commit-lock STRAFE/TURN until completion (`front >= clear_threshold` for STRAFE success, or `now - _maneuver_start >= strafe_timeout`/`turn_timeout`, or `cumulative_strafe` cap). On STRAFE non-success completion → re-`_assess`. On TURN completion → DRIVE_PAST (target = post-turn yaw; exit when `front >= clear_threshold` and inside-side window ≥ `pass_clearance` sustained `clear_confirm_time`, or `max_drive_past_distance`, or re-block → ASSESS). In `_assess`, before choosing strafe/turn, apply escalation: `consecutive_avoid_count += 1`; if `> max_avoid_attempts` and `not has_recovered_this_encounter` → RECOVER (`has_recovered_this_encounter = True`); if already recovered → HALT. RECOVER: reverse until `front >= recover_backup_clearance` (or `rear <= rear_clearance_min`), then if `gap_bearing is None` → HALT else rotate toward `gap_bearing` (PID) and once `|yaw - (start_yaw+gap_bearing)| <= heading_tol` commit forward `recover_commit_distance`; clear → DRIVE, re-block → HALT. HALT: zero output; recheck each tick, `front >= clear_threshold` sustained `clear_confirm_time` → DRIVE. Reset `consecutive_avoid_count`, `cumulative_strafe`, `has_recovered_this_encounter` only after `clear_drive_duration` of sustained DRIVE. Every completion emits a `DecisionRecord` with `outcome` in {`cleared`,`escalated`,`halted`} and `maneuver_duration_s`.
+Extend `step()`: commit-lock STRAFE/TURN until completion (`front >= clear_threshold` for STRAFE success, or `now - _maneuver_start >= strafe_timeout`/`turn_timeout`, or `cumulative_strafe` cap). On STRAFE non-success completion → re-`_assess`. On TURN completion → DRIVE_PAST (target = post-turn yaw; exit when `front >= clear_threshold` and inside-side window ≥ `pass_clearance` sustained `clear_confirm_time`, or `max_drive_past_distance`, or re-block → ASSESS). In `_assess`, before choosing strafe/turn, apply escalation: `consecutive_avoid_count += 1`; if `> max_avoid_attempts` and `not has_recovered_this_encounter` → RECOVER (`has_recovered_this_encounter = True`); if already recovered → HALT. RECOVER: reverse until `front >= recover_backup_clearance` (or `rear <= rear_clearance_min`), then if `gap_bearing is None` → HALT else rotate toward `gap_bearing` (PID) and once `|yaw - (start_yaw+gap_bearing)| <= heading_tol` commit forward `recover_commit_distance`; clear → DRIVE, re-block → HALT. HALT: zero output; recheck each tick, `front >= clear_threshold` sustained `clear_confirm_time` → DRIVE. The counter/flag resets happen via the Task 5 encounter-close mechanism (encounter closes, and `consecutive_avoid_count` / `cumulative_strafe` / `has_recovered_this_encounter` reset, only once `now - _clean_drive_since >= clear_drive_duration` of sustained clean DRIVE) — do not reset them anywhere else. Every completion emits a `DecisionRecord` with `outcome` in {`cleared`,`escalated`,`halted`} and `maneuver_duration_s`.
 
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `cd proximity_alert && python3 -m pytest test/test_avoidance_controller.py -v`
-Expected: PASS (8 passed).
+Expected: PASS (10 passed).
 
 - [ ] **Step 5: Commit**
 
@@ -949,6 +1013,12 @@ git commit -m "docs: document refined avoidance, params, and the two trial CSVs"
 **Placeholder scan:** Tasks 5, 6, and 8 describe extending `step()` in prose plus concrete anchors (signatures, field names, exact transitions, real tests) rather than a full listing, because the method is long and grows across two tasks — the tests are the executable contract. Each such step names exact fields, states, and thresholds; no "TBD/add error handling/similar-to" placeholders remain.
 
 **Type consistency:** `reduce_to_sectors` dict keys (`front/front_left/front_center/front_right/left/right/rear`) are consumed unchanged in Task 5 tests and Task 8. `size_obstacle` keys (`span_deg/y_lo/y_hi/preferred_side`) match Task 5 usage. `select_gap` returns a bearing float consumed by RECOVER (Task 6) and passed from Task 8. `DecisionRecord` field set is identical in Tasks 4, 7, and the controller records. `ControllerOutput` fields (`linear_x/linear_y/angular_z/state/decision`) match Task 8's publish code.
+
+**Review fixes incorporated (2026-07-23):**
+1. **Gap wrap-around** — `select_gap` now merges the first+last clear runs so a gap straddling ±π (behind the robot) is one gap, not two rejected slivers (Task 3, `test_wraps_gap_straddling_pi_behind_robot`).
+2. **Finite guard** — every scan loop gates on `math.isfinite(r)` in addition to `range_min/range_max` (Global Constraints; Tasks 1–3). Defense-in-depth: this LD19's finite `range_max=25.0` already drops NaN/±Inf, but this hardens against reconfiguration.
+3. **Encounter lifecycle** — `encounter_id` increment and counter resets are now both gated by the single `clear_drive_duration` cooldown, so a blip mid-cooldown resumes the same encounter and a post-cooldown detection starts a new one (Task 5 spec; Task 6 `test_blip_during_cooldown_resumes_same_encounter`, `test_detection_after_cooldown_is_new_encounter`).
+4. **Index-based angles** — all new loops use `msg.angle_min + i * msg.angle_increment` (Global Constraints; Tasks 1–3). The already-merged `scan_utils.min_range_in_forward_arc` is left unchanged (tested, and its float64 accumulation drift of ~1e-12 rad is ~11 orders of magnitude below beam spacing) — a follow-up may align it for consistency, out of scope here.
 
 ---
 
