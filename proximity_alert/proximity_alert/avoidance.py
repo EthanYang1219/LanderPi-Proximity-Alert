@@ -55,7 +55,7 @@ class AvoidanceConfig:
     strafe_speed: float = 0.25
     strafe_timeout: float = 1.5
     strafe_side_clearance_min: float = 0.30
-    max_obstacle_span_deg: float = 50.0
+    max_obstacle_width: float = 0.50
     max_cumulative_strafe: float = 0.60
     turn_speed: float = 0.6
     turn_step_deg: float = 30.0
@@ -206,7 +206,13 @@ class AvoidanceController:
             return self._enter_halt("halt: attempts_exhausted")
 
         ps = o["preferred_side"]
-        span = o["span_deg"]
+        # Gate strafing on the obstacle's PHYSICAL lateral width (metres), not
+        # its angular span. Angular span grows as the obstacle nears, so at the
+        # trigger distance (front <= safety_distance) any real object subtends a
+        # large angle -- an angular-span gate is unsatisfiable there and forces
+        # TURN every time. Physical width is distance-robust and is what "can I
+        # strafe past this vs. is it a wall" actually depends on.
+        width = o["y_hi"] - o["y_lo"]
         if ps > 0:
             required = o["y_hi"] + cfg.corridor_half
             side_clear = s["left"]
@@ -214,7 +220,7 @@ class AvoidanceController:
             required = cfg.corridor_half - o["y_lo"]
             side_clear = s["right"]
         strafe_ok = (side_clear >= cfg.strafe_side_clearance_min
-                     and span <= cfg.max_obstacle_span_deg
+                     and width <= cfg.max_obstacle_width
                      and required <= cfg.max_strafe_distance
                      and self.cumulative_strafe + cfg.max_strafe_distance <= cfg.max_cumulative_strafe)
 
@@ -231,7 +237,7 @@ class AvoidanceController:
         self._maneuver_start = self._now
         self._turn_target = self._yaw + math.radians(cfg.turn_step_deg) * self._locked_dir
         self.state = TURN
-        reason = "turn: span>max" if span > cfg.max_obstacle_span_deg else "turn: side_blocked"
+        reason = "turn: too_wide" if width > cfg.max_obstacle_width else "turn: side_blocked"
         rec = self._record(TURN, reason, 0.0, "committed")
         out = self._turn()
         out.decision = rec

@@ -133,7 +133,7 @@ concrete (§10); no qualitative terms.
 
 **Step 1 — STRAFE if all hold:**
 - (a) `preferred_side` window clearance ≥ `strafe_side_clearance_min` (side confirmed clear); **and**
-- (b) `obstacle_span_deg ≤ max_obstacle_span_deg` (it's narrow, not a wall); **and**
+- (b) `obstacle_width` (= `y_hi − y_lo`, physical lateral extent in meters) `≤ max_obstacle_width` (it's a discrete object, not a wall); **and**
 - (c) `required_clearing ≤ max_strafe_distance` (a bounded step actually clears it); **and**
 - (d) `cumulative_strafe_this_encounter + max_strafe_distance ≤ max_cumulative_strafe`
   (long-wall guard — haven't already strafed too far).
@@ -253,7 +253,7 @@ real runs. `reason` is a short enum/string naming which ladder step fired and wh
 | `robot_half_width` / `corridor_margin` | 0.11 / 0.05 m | Corridor half-width for clearing math |
 | `strafe_speed` / `strafe_timeout` | 0.25 m/s / 1.5 s | Lateral speed + bounded cap |
 | `strafe_side_clearance_min` | 0.30 m | Side clearance required to strafe into it |
-| `max_obstacle_span_deg` | 50° | Above this → wide → TURN not strafe |
+| `max_obstacle_width` | 0.50 m | Above this *physical* lateral width → wide (wall) → TURN not strafe. **Revised from `max_obstacle_span_deg` (50°) after 2026-07-22 hardware testing:** angular span grows as an obstacle nears, so at trigger range (`front ≤ safety_distance`) any real object subtends >50° and the angular gate blocked *all* strafing — the machine always fell through to TURN. Physical width (`y_hi − y_lo`) is distance-robust. |
 | `max_cumulative_strafe` | 0.60 m | Hard per-encounter lateral cap (long-wall guard) |
 | `turn_speed` / `turn_step_deg` / `turn_timeout` | 0.6 rad/s / 30° / 1.5 s | Turn rate, per-turn increment, bounded cap |
 | `reverse_trigger_range` / `avoid_reverse_speed` / `rear_clearance_min` | 0.20 / 0.10 / 0.25 m·(m/s)·m | Reverse trigger, speed, rear-safety gate |
@@ -279,7 +279,7 @@ real runs. `reason` is a short enum/string naming which ladder step fired and wh
    Documented limitation; keep obstacles with consistent cross-section at LiDAR height.
 2. **Symmetric obstacle dead-center** — LEFT/RIGHT tie → fixed default side; commit-lock
    prevents flip.
-3. **Wall / too-wide obstacle** — `max_obstacle_span_deg` + `max_cumulative_strafe` force
+3. **Wall / too-wide obstacle** — `max_obstacle_width` + `max_cumulative_strafe` force
    TURN then escalation; never strafes indefinitely.
 4. **Moving obstacle / person steps in** — reactive stop still fires; commit-lock may
    briefly commit toward a stale position but bounded completion caps exposure, then

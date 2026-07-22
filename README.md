@@ -164,7 +164,7 @@ The LiDAR is reduced each scan into FRONT (+ front sub-sectors), LEFT, RIGHT, an
 | `obstacle_confirm_scans` | `2` | Consecutive close scans required before a maneuver decision (debounce) |
 | `strafe_speed` / `strafe_timeout` | `0.25` / `1.5` | Lateral speed and per-strafe time cap (m/s, s) |
 | `strafe_side_clearance_min` | `0.30` | Side clearance required to strafe into it, meters |
-| `max_obstacle_span_deg` | `50.0` | Above this angular span, the obstacle is "wide" → turn, not strafe |
+| `max_obstacle_width` | `0.50` | Above this *physical* lateral width (meters), the obstacle is "wide" (a wall) → turn, not strafe. Keyed on physical width, not angular span: at trigger range any real object subtends a large angle, so an angular-span gate would block strafing entirely. |
 | `max_cumulative_strafe` | `0.60` | Hard per-encounter lateral cap (long-wall guard), meters |
 | `turn_speed` / `turn_step_deg` / `turn_timeout` | `0.6` / `30.0` / `1.5` | Turn rate, per-turn increment, time cap (rad/s, deg, s) |
 | `max_avoid_attempts` | `3` | Failed cycles before escalating to recovery |

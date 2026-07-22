@@ -51,11 +51,27 @@ def test_assess_chooses_turn_when_side_blocked():
 
 
 def test_assess_chooses_turn_when_obstacle_too_wide():
-    c = AvoidanceController(_cfg(obstacle_confirm_scans=1, max_obstacle_span_deg=50.0))
+    # Physically wide obstacle (1.2 m across) -> can't strafe past it, must turn.
+    c = AvoidanceController(_cfg(obstacle_confirm_scans=1, max_obstacle_width=0.50))
     c.set_goal_heading(0.0)
     obst = {"span_deg": 80.0, "y_lo": -0.6, "y_hi": 0.6, "preferred_side": 1.0}
     out = c.step(_sectors(front=0.29, fc=0.29, left=2.0), obst, None, 0.0, 0.0)
     assert out.state == "TURN"
+
+
+def test_assess_strafes_past_close_narrow_box_despite_wide_angular_span():
+    # A physically narrow box (30 cm wide) seen at 0.28 m subtends a LARGE
+    # angular span (~65 deg) simply because it is close. The strafe gate must
+    # key on physical width (y_hi - y_lo), not angular span -- otherwise every
+    # real obstacle at trigger range looks "too wide" and strafing is impossible.
+    # Regression for the all-TURN behavior observed on hardware 2026-07-22.
+    c = AvoidanceController(_cfg(obstacle_confirm_scans=1, max_obstacle_width=0.50))
+    c.set_goal_heading(0.0)
+    obst = {"span_deg": 65.0, "y_lo": -0.15, "y_hi": 0.15, "preferred_side": -1.0}
+    out = c.step(_sectors(front=0.28, fc=0.28, fr=0.28, right=1.5), obst, None, 0.0, 0.0)
+    assert out.state == "STRAFE"
+    assert out.linear_y < 0.0            # strafing right (-)
+    assert out.decision.chosen_maneuver == "STRAFE"
 
 
 def test_strafe_completes_to_drive_when_front_clears():
