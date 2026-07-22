@@ -12,6 +12,9 @@ from rclpy.signals import SignalHandlerOptions
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import LaserScan
+from std_msgs.msg import Float32
+
+from proximity_alert.scan_utils import min_range_in_forward_arc
 
 DRIVE = "drive"
 AVOIDING = "avoiding"
@@ -97,6 +100,7 @@ class PathTracker(Node):
         self.drift_duration = self.get_parameter("drift_duration").value
 
         self.cmd_vel_pub = self.create_publisher(Twist, "/cmd_vel", 10)
+        self.range_pub = self.create_publisher(Float32, "/forward_min_range", 10)
         self.scan_sub = self.create_subscription(
             LaserScan, scan_topic, self.scan_callback, qos_profile_sensor_data
         )
@@ -153,28 +157,18 @@ class PathTracker(Node):
             time.sleep(0.03)
 
     def scan_callback(self, msg: LaserScan):
-        half_arc = math.radians(self.scan_arc_deg) / 2.0
-
-        closest = None
-        closest_angle = 0.0
-        angle = msg.angle_min
-        for r in msg.ranges:
-            # This LiDAR (LD19) reports angles as 0..2pi, so "forward" (0 rad)
-            # sits at both ends of the sweep. Wrap each beam into [-pi, pi] so
-            # the forward arc is measured symmetrically around straight-ahead
-            # instead of only catching the 0..+half_arc (front-right) side.
-            rel = math.atan2(math.sin(angle), math.cos(angle))
-            if -half_arc <= rel <= half_arc:
-                if msg.range_min <= r <= msg.range_max:
-                    if closest is None or r < closest:
-                        closest = r
-                        closest_angle = rel
-            angle += msg.angle_increment
+        closest, closest_angle = min_range_in_forward_arc(msg, self.scan_arc_deg)
 
         self.min_range = closest
         self.last_scan_time = self.get_clock().now()
         # Obstacle left of center (positive angle) -> turn right (negative), and vice versa.
         self.turn_away_direction = -1.0 if closest_angle >= 0 else 1.0
+
+        # Live forward-arc range for trial_logger to record the LiDAR stop
+        # distance; inf means nothing valid in the arc this scan.
+        range_msg = Float32()
+        range_msg.data = closest if closest is not None else float("inf")
+        self.range_pub.publish(range_msg)
 
     def odom_callback(self, msg: Odometry):
         self.current_yaw = yaw_from_quaternion(msg.pose.pose.orientation)
