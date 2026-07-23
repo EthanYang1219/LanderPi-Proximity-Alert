@@ -111,7 +111,7 @@ The robot's ROS 2 stack already runs in a Docker container named `MentorPi` on t
 
    ```bash
    # Terminal A — drive the robot
-   docker exec -it -u ubuntu MentorPi zsh -lc "source ~/.zshrc && source ~/ros2_ws/install/setup.bash && ros2 run proximity_alert path_tracker --ros-args -p safety_distance:=0.30 -r scan:=/scan_raw"
+   docker exec -it -u ubuntu MentorPi zsh -lc "source ~/.zshrc && source ~/ros2_ws/install/setup.bash && ros2 run proximity_alert path_tracker --ros-args -p safety_distance:=0.20 -r scan:=/scan_raw"
    ```
 
    ```bash
