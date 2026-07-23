@@ -66,6 +66,21 @@ from rclpy.node import Node
 from std_msgs.msg import Float32
 
 
+CSV_HEADER = [
+    "timestamp",
+    "surface",
+    "trial_num",
+    "transit_time_s",
+    "odom_distance_m",
+    "ground_truth_distance_m",
+    "slippage_error_m",
+    "slippage_pct",
+    "avoidance_events",
+    "lidar_stop_range_m",
+    "notes",
+]
+
+
 class TrialLogger(Node):
     def __init__(self):
         super().__init__("trial_logger")
@@ -124,26 +139,33 @@ class TrialLogger(Node):
     # ---------- CSV helpers ----------
 
     def _ensure_csv_header(self):
-        new_file = not os.path.exists(self.csv_path)
-        if new_file:
+        if not os.path.exists(self.csv_path):
             os.makedirs(os.path.dirname(self.csv_path) or ".", exist_ok=True)
             with open(self.csv_path, "w", newline="") as f:
-                writer = csv.writer(f)
-                writer.writerow(
-                    [
-                        "timestamp",
-                        "surface",
-                        "trial_num",
-                        "transit_time_s",
-                        "odom_distance_m",
-                        "ground_truth_distance_m",
-                        "slippage_error_m",
-                        "slippage_pct",
-                        "avoidance_events",
-                        "lidar_stop_range_m",
-                        "notes",
-                    ]
-                )
+                csv.writer(f).writerow(CSV_HEADER)
+            return
+
+        with open(self.csv_path, newline="") as f:
+            rows = list(csv.reader(f))
+        if not rows or rows[0] == CSV_HEADER:
+            return
+
+        # Stale header from before a schema addition (e.g. avoidance_events,
+        # lidar_stop_range_m, notes were appended later). New columns are only
+        # ever appended at the end, so old data rows are a strict prefix of
+        # the canonical header -- right-pad them rather than fabricate values,
+        # and rewrite the file with the canonical header so every row lines
+        # up under it (a stale short header against wider new rows silently
+        # misaligns or drops columns for any strict CSV/pandas reader).
+        self.get_logger().warn(
+            f"'{self.csv_path}' has a stale CSV header "
+            f"({len(rows[0])} cols vs canonical {len(CSV_HEADER)}); migrating."
+        )
+        migrated = [row + [""] * (len(CSV_HEADER) - len(row)) for row in rows[1:]]
+        with open(self.csv_path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(CSV_HEADER)
+            writer.writerows(migrated)
 
     def _count_existing_trials(self):
         if not os.path.exists(self.csv_path):

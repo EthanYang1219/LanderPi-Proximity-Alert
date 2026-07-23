@@ -61,10 +61,25 @@ The buzzer is intentionally not wired into the current nodes — it is a separat
 │   ├── package.xml
 │   ├── setup.py / setup.cfg
 │   └── proximity_alert/
-│       ├── path_tracker.py     # Drives A -> B, reactive LiDAR obstacle avoidance
-│       └── trial_logger.py     # Logs transit time, odometry distance, ground truth per trial
-├── trials/                     # Suggested output location for per-surface CSV logs (not committed)
+│       ├── path_tracker.py           # Drives A -> B, reactive LiDAR obstacle avoidance
+│       ├── avoidance.py              # Pure, ROS-free obstacle-avoidance state machine
+│       ├── trial_logger.py           # Logs transit time, odometry distance, ground truth per trial
+│       ├── decision_logger.py        # Logs each avoidance decision to its own CSV
+│       ├── floor_test_reconcile.py   # Fills floor_test_log.csv's Time/Stop-clearance from real trial data
+│       ├── scan_trace_record.py      # Pure JSON-Lines record for one raw scan tick
+│       └── scan_trace_logger.py      # Logs every raw LiDAR scan continuously, for post-hoc miss diagnosis
+├── trials/                     # CSVs, gitignored (not committed) -- see below
+│   ├── floor_test_log.csv      # Hand-maintained PID/safety-distance tuning session report
+│   ├── granite.csv             # -> symlink to /home/pi/docker/tmp/trials/granite.csv
+│   ├── decision_log.csv        # -> symlink to /home/pi/docker/tmp/trials/decision_log.csv
+│   └── scan_trace.jsonl        # -> symlink to /home/pi/docker/tmp/trials/scan_trace.jsonl
 └── README.md
+```
+
+`trials/granite.csv`, `trials/decision_log.csv`, and `trials/scan_trace.jsonl` are symlinks into the container's bind-mounted shared folder (see [Three logs](#three-logs-all-on-your-computer) below) — they exist purely so all three logs show up directly in this repo's VS Code Explorer/file tree instead of requiring you to browse to `/home/pi/docker/tmp/trials/` separately. They live-update as the nodes write to them. If you log a new surface (e.g. `concrete.csv`), symlink it the same way:
+
+```bash
+ln -sf /home/pi/docker/tmp/trials/concrete.csv trials/concrete.csv
 ```
 
 `path_tracker.py` and `trial_logger.py` are independent ROS 2 nodes. `trial_logger.py` does not modify or depend on the internals of `path_tracker.py` — it only observes `/odom`, so either node can be developed, tested, or replaced without breaking the other.
@@ -73,16 +88,23 @@ The buzzer is intentionally not wired into the current nodes — it is a separat
 
 The robot's ROS 2 stack already runs in a Docker container named `MentorPi` on the Pi — you don't need to install ROS yourself. Do this from a VS Code integrated terminal (open the repo folder via the Remote-SSH extension if you're connecting from another machine, or directly if VS Code is running on the Pi itself):
 
-1. **Copy the package into the container:**
+1. **Copy the package into the container.** `docker cp` nests the source inside the destination if the destination already exists, silently leaving a stale duplicate that colcon keeps building instead of your edits — this bit us mid-session (see [Troubleshooting](#troubleshooting)). Always clear the destination first:
 
    ```bash
-   docker cp proximity_alert MentorPi:/home/ubuntu/ros2_ws/src/proximity_alert
+   docker exec -u ubuntu MentorPi rm -rf /home/ubuntu/ros2_ws/src/proximity_alert/proximity_alert
+   docker cp proximity_alert/proximity_alert MentorPi:/home/ubuntu/ros2_ws/src/proximity_alert/proximity_alert
    ```
 
-2. **Build it** (must run under `bash`, not `zsh` — colcon's environment hooks need it):
+2. **Build it** as the `ubuntu` user via `zsh` (not `bash` + `/opt/ros/humble/setup.bash` — that fails in this container; `~/.zshrc` is what actually sets up the workspace environment correctly):
 
    ```bash
-   docker exec MentorPi bash -lc "source /opt/ros/humble/setup.bash && cd /home/ubuntu/ros2_ws && colcon build --packages-select proximity_alert"
+   docker exec -u ubuntu MentorPi zsh -lc "source ~/.zshrc && cd ~/ros2_ws && colcon build --packages-select proximity_alert"
+   ```
+
+   If a previous build was ever run as `root` (e.g. via plain `docker exec` without `-u ubuntu`), leftover root-owned files under `build/proximity_alert` or `install/proximity_alert` will make this fail with `Permission denied`. Fix with:
+
+   ```bash
+   docker exec -u root MentorPi bash -c "chown -R ubuntu:ubuntu /home/ubuntu/ros2_ws/build/proximity_alert /home/ubuntu/ros2_ws/install/proximity_alert"
    ```
 
 3. **Run each node in its own terminal**, as the `ubuntu` user via `zsh` (this loads `need_compile` and other env vars some of the robot's own launch files expect):
@@ -97,13 +119,23 @@ The robot's ROS 2 stack already runs in a Docker container named `MentorPi` on t
    docker exec -it -u ubuntu MentorPi zsh -lc "source ~/.zshrc && source ~/ros2_ws/install/setup.bash && ros2 run proximity_alert trial_logger --ros-args -p csv_path:=/home/ubuntu/shared/trials/granite.csv"
    ```
 
-   Pointing `csv_path` at `/home/ubuntu/shared/...` writes the CSV into the container's shared folder, which is bind-mounted to `~/docker/tmp` on the Pi — so your trial data survives even if the container restarts.
+   ```bash
+   # Terminal C — log the avoidance decisions (separate CSV)
+   docker exec -it -u ubuntu MentorPi zsh -lc "source ~/.zshrc && source ~/ros2_ws/install/setup.bash && ros2 run proximity_alert decision_logger --ros-args -p csv_path:=/home/ubuntu/shared/trials/decision_log.csv"
+   ```
 
-After step 2, repeat only step 3 for future runs — you only need to rebuild when you change `path_tracker.py`/`trial_logger.py` (repeat steps 1–2 each time).
+   ```bash
+   # Terminal D — log every raw LiDAR scan (for diagnosing total detection misses)
+   docker exec -it -u ubuntu MentorPi zsh -lc "source ~/.zshrc && source ~/ros2_ws/install/setup.bash && ros2 run proximity_alert scan_trace_logger --ros-args -p csv_path:=/home/ubuntu/shared/trials/scan_trace.jsonl"
+   ```
+
+   Pointing `csv_path` at `/home/ubuntu/shared/...` writes the file into the container's shared folder, which is bind-mounted to `~/docker/tmp` (i.e. `/home/pi/docker/tmp/trials/`) on the Pi — so all three logs appear in your local file manager and survive container restarts.
+
+After step 2, repeat only step 3 for future runs — you only need to rebuild when you change `path_tracker.py`/`trial_logger.py`/`decision_logger.py`/`scan_trace_logger.py`/`scan_trace_record.py` (repeat steps 1–2 each time).
 
 ## Setup
 
-1. **Docker + ROS 2 Humble.** The project's Docker container (`MentorPi`, image `ros:humble`) is already running on the robot's Pi — confirm it can see the LanderPi's ROS 2 stack with `docker exec MentorPi bash -lc "source /opt/ros/humble/setup.bash && ros2 topic list"` (`/scan_raw`, `/odom`, `/cmd_vel` should be visible).
+1. **Docker + ROS 2 Humble.** The project's Docker container (`MentorPi`, image `ros:humble`) is already running on the robot's Pi — confirm it can see the LanderPi's ROS 2 stack with `docker exec -u ubuntu MentorPi zsh -lc "source ~/.zshrc && ros2 topic list"` (`/scan_raw`, `/odom`, `/cmd_vel` should be visible). Always include `-u ubuntu` — running as `root` silently breaks FastRTPS's shared-memory transport between nodes (discovery still matches over UDP, but zero data ever delivers), which cost an entire debugging session before it was traced to this.
 2. **Copy the package in** and **build** it — see [Running it in VS Code](#running-it-in-vs-code-quick-start) above for the exact commands.
 
 ## Usage
@@ -136,27 +168,73 @@ Each row appended to the CSV represents one trial:
 | `lidar_stop_range_m` | The actual LiDAR range to the closest obstacle in the forward arc at the moment the trial finalized (i.e. the real stop clearance), captured from `path_tracker`'s `/forward_min_range` topic. Useful for checking proximity-trigger accuracy against the `safety_distance` parameter and whether it varies by surface. Blank if nothing valid was in the arc at stop. |
 | `notes` | Freeform text entered at logging time for anything unusual observed (e.g. "motors fought each other on the turn", "oscillated near desk", "false stop") |
 
+## Refined obstacle avoidance
+
+`path_tracker` runs a deterministic 7-state machine (`AvoidanceController`, a pure module unit-tested off-hardware) governed by one invariant: **always take the maneuver that minimizes deviation from the goal heading while maintaining safety.** That ordering falls out of it — strafe (holds the bearing) → turn-and-drive (bounded deviation) → one bounded recovery → halt:
+
+- **DRIVE** — forward at `forward_speed`, PID holds the goal heading captured at A.
+- **ASSESS** — on a confirmed obstacle, a strafe-first ladder: sidestep if a bounded strafe toward a *confirmed-clear* side clears the (narrow) obstacle; else turn toward the more-open side and drive past; else escalate.
+- **STRAFE / TURN / DRIVE_PAST** — the maneuvers, each committed (run to completion) so an obstacle's jittering apparent side can't cause oscillation.
+- **RECOVER** — after repeated failures, one bounded routine: back off, pick the widest fitting gap from the current 360° scan, rotate to face it, commit once.
+- **HALT** — stop and flag; re-check each tick.
+
+The LiDAR is reduced each scan into FRONT (+ front sub-sectors), LEFT, RIGHT, and REAR clearances. Every decision is published as a JSON record on `/avoidance_decision` and logged by `decision_logger` (see [Data collected](#data-collected)). Set `disable_avoidance:=true` to halt on any obstacle with no turn/strafe (used for the clean go-and-stop distance runs).
+
 ## Parameters
 
-**`path_tracker`**
+**`path_tracker`** (every field is a ROS parameter; only the commonly-tuned ones are shown — see `AvoidanceConfig` in `proximity_alert/avoidance.py` for the full list)
 
 | Parameter | Default | Description |
 |---|---|---|
-| `safety_distance` | `0.30` | Stop threshold, meters |
-| `forward_speed` | `0.15` | Constant forward speed, m/s |
-| `turn_speed` | `0.6` | Turn-away angular speed, rad/s |
-| `scan_arc_deg` | `180.0` | Forward arc monitored for obstacles, degrees |
-| `drift_speed` | `0.15` | Sideways strafe speed for the last-resort drift-around maneuver, m/s |
-| `drift_duration` | `1.0` | How long the robot strafes sideways before re-checking for a clear path, seconds |
+| `safety_distance` | `0.30` | FRONT stop threshold, meters |
+| `forward_speed` | `0.50` | Constant forward speed, m/s |
+| `obstacle_confirm_scans` | `2` | Consecutive close scans required before a maneuver decision (debounce) |
+| `strafe_speed` / `strafe_timeout` | `0.25` / `1.5` | Lateral speed and per-strafe time cap (m/s, s) |
+| `strafe_side_clearance_min` | `0.30` | Side clearance required to strafe into it, meters |
+| `max_obstacle_width` | `0.50` | Above this *physical* lateral width (meters), the obstacle is "wide" (a wall) → turn, not strafe. Keyed on physical width, not angular span: at trigger range any real object subtends a large angle, so an angular-span gate would block strafing entirely. |
+| `max_cumulative_strafe` | `0.60` | Hard per-encounter lateral cap (long-wall guard), meters |
+| `turn_speed` / `turn_step_deg` / `turn_timeout` | `0.6` / `30.0` / `1.5` | Turn rate, per-turn increment, time cap (rad/s, deg, s) |
+| `max_avoid_attempts` | `3` | Failed cycles before escalating to recovery |
+| `clear_drive_duration` | `3.0` | Sustained clean-drive time that closes an encounter and resets counters, seconds |
+| `min_gap_clearance` / `min_gap_width_deg` | `0.60` / `40.0` | What counts as a usable recovery gap (robot must fit) |
+| `disable_avoidance` | `false` | Halt on any obstacle, no turn/strafe (clean go-and-stop runs) |
+
+Derived (computed, not configured): `max_strafe_distance = strafe_speed × strafe_timeout`; `corridor_half = robot_half_width + corridor_margin`; `clear_threshold = safety_distance + clear_margin`.
 
 **`trial_logger`**
 
 | Parameter | Default | Description |
 |---|---|---|
-| `csv_path` | `trial_log.csv` | Output CSV file path |
+| `csv_path` | `trial_log.csv` | Output CSV file path (point at `/home/ubuntu/shared/trials/<surface>.csv` to land on the host — see below) |
 | `move_velocity_threshold` | `0.03` | Speed above which the robot is considered moving, m/s |
 | `stop_velocity_threshold` | `0.02` | Speed below which the robot is considered stopped, m/s |
 | `stop_confirm_duration` | `1.0` | Seconds of continuous stopped-ness before a trial is finalized |
+
+**`decision_logger`**
+
+| Parameter | Default | Description |
+|---|---|---|
+| `csv_path` | `/home/ubuntu/shared/trials/decision_log.csv` | Output CSV for the avoidance decision log (host path — see below) |
+
+### Three logs, all on your computer
+
+The logs are deliberately kept in **separate files** so the motion/slippage data, the avoidance-decision data, and the raw scan data stay clean and independently analyzable:
+
+- **Trial motion log** (`trial_logger`) — one row per A→B trial: transit time, odometry vs. ground-truth distance, slippage, `avoidance_events`, `lidar_stop_range_m`.
+- **Decision log** (`decision_logger`) — one row per avoidance *decision*, for research/debugging: `timestamp, encounter_id, state, chosen_maneuver, reason, obstacle_span_deg, front_distance_m, front_left_m, front_center_m, front_right_m, left_clearance_m, right_clearance_m, rear_clearance_m, required_clearing_m, cumulative_strafe_m, consecutive_avoid_count, recovery_triggered, outcome, maneuver_duration_s`.
+- **Scan trace log** (`scan_trace_logger`) — one row per raw LiDAR scan tick, for diagnosing detection misses that never trigger an avoidance encounter at all (e.g. a thin chair leg outside the LiDAR's scan plane): `scan_number, stamp_sec, stamp_nanosec, angle_min, angle_increment, range_min, range_max, ranges, sectors`. JSON Lines (`.jsonl`), not CSV — `ranges` is a variable-length array that doesn't fit CSV's fixed-column shape. `stamp_sec`/`stamp_nanosec` come from the LaserScan message's own `header.stamp`, not wall-clock time, so this log stays on the same clock as `/odom` and every other ROS message for valid cross-message correlation. A process killed mid-write can only ever corrupt the last line of the file — skip a line that fails to parse rather than treating it as corruption. The node's `front_arc_deg`/`front_subsector_deg`/`side_window_deg`/`rear_window_deg` params default to match `path_tracker`'s current `AvoidanceConfig` values; if those get tuned in `avoidance.py`, update this node's defaults too or the logged `sectors` will stop reflecting what the controller actually saw. See `docs/superpowers/specs/2026-07-24-scan-trace-logger-design.md` for the full design and the post-hoc miss-diagnosis workflow.
+
+All three default to (or should be pointed at) `/home/ubuntu/shared/trials/` inside the container, which is bind-mounted to **`/home/pi/docker/tmp/trials/`** on the Pi — so all three logs appear directly in your local file manager (and survive container restarts) with no `docker` digging. This repo's `trials/` folder also symlinks straight to them (see [Repository structure](#repository-structure)) so they show up in VS Code too.
+
+### Reconciling floor_test_log.csv
+
+`floor_test_log.csv` (the hand-maintained Google-Sheet-schema report of PID/safety-distance tuning sessions) is never written by any ROS node — it's a manual transcription of Time and Stop clearance from the real trial CSV, plus the `safety_distance`/`Kp`/`Ki`/`Kd` you ran with (which aren't persisted anywhere else). That transcription step is easy to forget. Run this after a session to auto-fill whatever's derivable from the trial data, on the host (no ROS needed):
+
+```bash
+python3 -m proximity_alert.floor_test_reconcile --floor-log trials/floor_test_log.csv --trial-csv trials/granite.csv
+```
+
+It only fills Time/Stop-clearance, never fabricates Safety Distance/Speed/Kp/Ki/Kd, and refuses to guess when two session rows share the same date (nothing to disambiguate which trials belong to which row) — it reports both cases so you can fill them by hand instead of silently leaving (or corrupting) a blank.
 
 ## Roadmap
 
@@ -174,6 +252,8 @@ Each row appended to the CSV represents one trial:
 - **Robot makes contact with an obstacle that has a thin or overhanging profile (e.g. a pedestal desk, chair legs).** This is very likely the LiDAR's fixed-height blind spot, not a `safety_distance` or code issue — see the limitation note in [Project overview](#project-overview). Reposition the obstacle so it has a consistent cross-section at the LiDAR's mounted height, don't just lower `safety_distance`.
 - **No `/scan_raw` or `/odom` data.** Confirm the LanderPi's sensor drivers are running inside the `MentorPi` container (`docker exec MentorPi bash -lc "source /opt/ros/humble/setup.bash && ros2 node list"` should show `LD19`, `ekf_filter_node`, etc.) before starting either node. If the list comes back empty, the driver stack itself has died and needs restarting — see `~/robot_pi/tool/bringup.sh` on the Pi.
 - **`path_tracker` holds still and logs "No fresh scan within scan_timeout."** This is the scan-freshness watchdog working as intended — the LiDAR isn't currently publishing. Check `ros2 topic hz /scan_raw`; this LD19 has been observed to intermittently stop publishing mid-session.
+- **Edits to a `.py` file don't seem to take effect after rebuilding.** `docker cp` nests the source inside the destination directory if the destination already exists, rather than overwriting it — running the copy step twice without clearing the destination first silently produces a stale duplicate package tree that colcon keeps building from instead of your latest edit. This happened mid-session and cost real time to trace. Always `rm -rf` the destination package dir before `docker cp` (see [Running it in VS Code](#running-it-in-vs-code-quick-start)), and if in doubt, `find ~/ros2_ws/src/proximity_alert -name '<file>.py'` inside the container to check for more than one copy.
+- **Rebuild fails with `Permission denied` on files under `build/` or `install/`.** A previous build ran as `root` (e.g. a bare `docker exec` without `-u ubuntu`) and left root-owned artifacts that the `ubuntu` user can't overwrite. `chown -R ubuntu:ubuntu` those two directories (command in [Running it in VS Code](#running-it-in-vs-code-quick-start)) and rebuild.
 
 ## Authors
 
