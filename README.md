@@ -76,7 +76,7 @@ The buzzer is intentionally not wired into the current nodes — it is a separat
 └── README.md
 ```
 
-`trials/granite.csv` and `trials/decision_log.csv` are symlinks into the container's bind-mounted shared folder (see [Two separate CSVs](#two-separate-csvs-both-on-your-computer) below) — they exist purely so both logs show up directly in this repo's VS Code Explorer/file tree instead of requiring you to browse to `/home/pi/docker/tmp/trials/` separately. They live-update as the nodes write to them. If you log a new surface (e.g. `concrete.csv`), symlink it the same way:
+`trials/granite.csv` and `trials/decision_log.csv` are symlinks into the container's bind-mounted shared folder (see [Three logs](#three-logs-all-on-your-computer) below) — they exist purely so both logs show up directly in this repo's VS Code Explorer/file tree instead of requiring you to browse to `/home/pi/docker/tmp/trials/` separately. They live-update as the nodes write to them. If you log a new surface (e.g. `concrete.csv`), symlink it the same way:
 
 ```bash
 ln -sf /home/pi/docker/tmp/trials/concrete.csv trials/concrete.csv
