@@ -67,7 +67,9 @@ The buzzer is intentionally not wired into the current nodes — it is a separat
 │       ├── decision_logger.py        # Logs each avoidance decision to its own CSV
 │       ├── floor_test_reconcile.py   # Fills floor_test_log.csv's Time/Stop-clearance from real trial data
 │       ├── scan_trace_record.py      # Pure JSON-Lines record for one raw scan tick
-│       └── scan_trace_logger.py      # Logs every raw LiDAR scan continuously, for post-hoc miss diagnosis
+│       ├── scan_trace_logger.py      # Logs every raw LiDAR scan continuously, for post-hoc miss diagnosis
+│       ├── audio_trigger.py          # Pure once-per-encounter trigger logic for the obstacle audio alert
+│       └── obstacle_audio.py         # Plays a WAV clip through the USB speaker once per obstacle encounter (prototype)
 ├── trials/                     # CSVs, gitignored (not committed) -- see below
 │   ├── floor_test_log.csv      # Hand-maintained PID/safety-distance tuning session report
 │   ├── granite.csv             # -> symlink to /home/pi/docker/tmp/trials/granite.csv
@@ -129,9 +131,14 @@ The robot's ROS 2 stack already runs in a Docker container named `MentorPi` on t
    docker exec -it -u ubuntu MentorPi zsh -lc "source ~/.zshrc && source ~/ros2_ws/install/setup.bash && ros2 run proximity_alert scan_trace_logger --ros-args -p csv_path:=/home/ubuntu/shared/trials/scan_trace.jsonl"
    ```
 
+   ```bash
+   # Terminal E — play a dialogue clip when an obstacle is detected (prototype)
+   docker exec -it -u ubuntu MentorPi zsh -lc "source ~/.zshrc && source ~/ros2_ws/install/setup.bash && ros2 run proximity_alert obstacle_audio --ros-args -p wav_path:=/home/ubuntu/shared/audio/obstacle_alert.wav -p alsa_device:=plughw:2,0"
+   ```
+
    Pointing `csv_path` at `/home/ubuntu/shared/...` writes the file into the container's shared folder, which is bind-mounted to `~/docker/tmp` (i.e. `/home/pi/docker/tmp/trials/`) on the Pi — so all three logs appear in your local file manager and survive container restarts.
 
-After step 2, repeat only step 3 for future runs — you only need to rebuild when you change `path_tracker.py`/`trial_logger.py`/`decision_logger.py`/`scan_trace_logger.py`/`scan_trace_record.py` (repeat steps 1–2 each time).
+After step 2, repeat only step 3 for future runs — you only need to rebuild when you change `path_tracker.py`/`trial_logger.py`/`decision_logger.py`/`scan_trace_logger.py`/`scan_trace_record.py`/`obstacle_audio.py`/`audio_trigger.py` (repeat steps 1–2 each time).
 
 ## Setup
 
@@ -215,6 +222,20 @@ Derived (computed, not configured): `max_strafe_distance = strafe_speed × straf
 | Parameter | Default | Description |
 |---|---|---|
 | `csv_path` | `/home/ubuntu/shared/trials/decision_log.csv` | Output CSV for the avoidance decision log (host path — see below) |
+
+**`obstacle_audio`** (prototype — plays a WAV dialogue clip through the robot's USB speaker once per obstacle encounter; see [Obstacle audio alert](#obstacle-audio-alert-prototype) below)
+
+| Parameter | Default | Description |
+|---|---|---|
+| `wav_path` | `/home/ubuntu/shared/audio/obstacle_alert.wav` | WAV file to play (host path — see below) |
+| `alsa_device` | `plughw:2,0` | ALSA device string for the robot's USB speaker (confirmed via `aplay -l` inside the container) |
+| `decision_topic` | `/avoidance_decision` | Topic to listen on for obstacle-detection events (parameterized so a topic rename doesn't require editing the node) |
+
+### Obstacle audio alert (prototype)
+
+`obstacle_audio` subscribes to the existing `/avoidance_decision` topic and plays `wav_path` through the USB speaker (`aplay`, non-blocking) the first time an encounter enters a non-`DRIVE` state — once per `encounter_id`, not on every escalation step (strafe → turn → recover → halt) within it, and never during ordinary clear-path driving. It is fully independent: no changes to `path_tracker`'s control loop, no new topics.
+
+**To use your own dialogue clip:** drop a WAV file at `/home/pi/docker/tmp/audio/obstacle_alert.wav` on the Pi (create the `audio/` folder if it doesn't exist yet) — that's the host side of the same bind mount the CSV/JSONL logs already use, so it lands at `/home/ubuntu/shared/audio/obstacle_alert.wav` inside the container automatically, with no container restart needed. See `docs/superpowers/specs/2026-07-24-obstacle-audio-alert-design.md` for the full design.
 
 ### Three logs, all on your computer
 
