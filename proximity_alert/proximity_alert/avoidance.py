@@ -39,45 +39,45 @@ class HeadingPID:
 
 
 @dataclass
-class AvoidanceConfig:
-    safety_distance: float = 0.30
-    clear_margin: float = 0.10
-    clear_confirm_time: float = 0.5
-    obstacle_detect_range: float = 0.40
-    obstacle_confirm_scans: int = 2
-    front_arc_deg: float = 180.0
-    front_subsector_deg: float = 60.0
-    side_window_deg: float = 60.0
-    rear_window_deg: float = 60.0
-    robot_half_width: float = 0.11
-    corridor_margin: float = 0.05
-    forward_speed: float = 0.50
-    strafe_speed: float = 0.25
-    strafe_timeout: float = 1.5
-    strafe_side_clearance_min: float = 0.30
-    max_obstacle_width: float = 0.50
-    max_cumulative_strafe: float = 0.60
-    turn_speed: float = 0.6
-    turn_step_deg: float = 30.0
-    turn_timeout: float = 1.5
-    reverse_trigger_range: float = 0.20
-    avoid_reverse_speed: float = 0.10
-    rear_clearance_min: float = 0.25
-    pass_clearance: float = 0.35
-    max_drive_past_distance: float = 0.80
-    heading_kp: float = 1.0
-    heading_ki: float = 0.0
-    heading_kd: float = 0.1
-    heading_max_correction: float = 0.3
-    heading_tol_deg: float = 5.0
-    max_avoid_attempts: int = 3
-    clear_drive_duration: float = 3.0
-    recover_backup_clearance: float = 0.50
-    recover_commit_distance: float = 0.50
-    min_gap_clearance: float = 0.60
-    min_gap_width_deg: float = 40.0
-    control_rate_hz: float = 10.0
-    disable_avoidance: bool = False
+class AvoidanceConfig: # All measurements are in meters or m/s for the speed. All timeouts/time durations are in seconds
+    safety_distance: float = 0.20          # FRONT range that triggers a maneuver. Lower = drives closer before reacting; too low risks contact given LiDAR/stop latency
+    clear_margin: float = 0.10             # Added to safety_distance for "clear" (clear_threshold). Bigger = more hysteresis before declaring an obstacle passed, less re-trigger flicker
+    clear_confirm_time: float = 0.5        # Seconds front must stay clear before DRIVE_PAST/RECOVER/HALT call it cleared. Higher = fewer false "cleared" on a jittery reading
+    obstacle_detect_range: float = 0.40    # Range within which a FRONT beam counts toward sizing the obstacle. Bigger = obstacle width/span measured from farther out
+    obstacle_confirm_scans: int = 2        # Consecutive blocked scans required before committing to ASSESS. Higher = more debounce against a single noisy reading, slower to react
+    front_arc_deg: float = 180.0           # Total width of the forward sensing arc. Wider = sees obstacles further off-center as "front", narrower = only reacts dead ahead
+    front_subsector_deg: float = 60.0      # Width of each of the 3 front sub-sectors (left/center/right) used for logging/diagnostics
+    side_window_deg: float = 60.0          # Angular width of the LEFT/RIGHT clearance windows (centered at +/-90 deg). Wider = clearance check considers more of the flank
+    rear_window_deg: float = 60.0          # Angular width of the REAR clearance window (centered behind). Wider = more of the back considered when reversing/recovering
+    robot_half_width: float = 0.085        # Physical half-width of the chassis. Sets the required strafe/pass clearance; too small risks clipping an obstacle, too big blocks strafes that would actually fit
+    corridor_margin: float = 0.05          # Extra clearance added beyond robot_half_width (-> corridor_half). Bigger = wider safety buffer on every strafe/pass, but rejects more strafes as "too far"
+    forward_speed: float = 0.50            # Constant driving speed, m/s. Higher = faster runs but less reaction time before safety_distance is reached
+    strafe_speed: float = 0.50             # Lateral (sideways) speed during STRAFE, m/s. Higher = clears an obstacle faster but overshoots more before the next scan reacts
+    strafe_timeout: float = 1.5            # Max seconds to hold a STRAFE before giving up and re-assessing. Also sets max_strafe_distance = strafe_speed * strafe_timeout
+    strafe_side_clearance_min: float = 0.30  # Minimum LEFT/RIGHT clearance required to permit a strafe that direction. Higher = more conservative, refuses strafes into tight gaps
+    max_obstacle_width: float = 0.50       # Max physical lateral width (y_hi - y_lo) still considered "narrow enough to strafe past". Above this it's treated as a wall -> TURN instead
+    max_cumulative_strafe: float = 1.00     # Hard cap on total lateral distance strafed within one encounter (guards against creeping sideways along a long wall). Must stay above strafe_speed * strafe_timeout (max_strafe_distance, currently 0.75) or the strafe_ok cap check fails on the very first attempt and STRAFE becomes unreachable. Lower = escalates to TURN sooner, but never below max_strafe_distance
+    turn_speed: float = 0.6                # Angular speed while turning, rad/s. Higher = faster turns but more overshoot past turn_step_deg
+    turn_step_deg: float = 30.0            # Heading change commanded per TURN attempt. Bigger = clears wider obstacles in one attempt but deviates further from goal heading
+    turn_timeout: float = 1.5              # Max seconds to hold a TURN before moving on to DRIVE_PAST regardless of whether turn_step_deg was reached
+    reverse_trigger_range: float = 0.20    # (Currently unused by _turn/_recover, which key off rear_clearance_min instead) Intended FRONT range below which a reverse nudge is warranted
+    avoid_reverse_speed: float = 0.10      # Speed of the small reverse nudge during TURN/RECOVER when rear is clear. Higher = backs off faster but eats into rear_clearance_min sooner
+    rear_clearance_min: float = 0.25       # Minimum REAR clearance required to allow the reverse nudge during TURN/RECOVER. Lower = reverses even with less room behind
+    pass_clearance: float = 0.35           # Inside-flank clearance required (alongside FRONT clear) before DRIVE_PAST starts confirming it has cleared the obstacle
+    max_drive_past_distance: float = 0.80  # Max distance to drive in DRIVE_PAST before giving up and re-assessing. Higher = more patient with a wide obstacle, but risks driving further off-line
+    heading_kp: float = 1.0                # Heading-hold PID proportional gain. Higher = snappier correction toward goal/target heading, more prone to overshoot/oscillation
+    heading_ki: float = 0.0                # Heading-hold PID integral gain. Nonzero corrects small steady-state heading bias, but risks windup/overshoot if too high
+    heading_kd: float = 0.1                # Heading-hold PID derivative gain. Higher = damps oscillation from kp, but amplifies noise in the heading error
+    heading_max_correction: float = 0.3    # Clamp on the PID's angular_z output, rad/s. Lower = gentler heading correction, may not keep up with a large heading error
+    heading_tol_deg: float = 5.0           # Heading error considered "on target" (used by TURN/RECOVER completion checks). Smaller = stricter alignment before proceeding, may hunt near the tolerance edge
+    max_avoid_attempts: int = 3            # Consecutive failed STRAFE/TURN cycles before escalating to RECOVER. Lower = escalates sooner, higher = keeps retrying the normal ladder longer
+    clear_drive_duration: float = 3.0      # Seconds of sustained clean driving before an encounter is considered over and its counters (cumulative_strafe, attempt count) reset
+    recover_backup_clearance: float = 0.50 # (Currently unused by _recover, which keys off rear_clearance_min) Intended rear clearance required before backing up during recovery
+    recover_commit_distance: float = 0.50  # Max distance to drive during RECOVER's commit phase before giving up and halting. Higher = more patient attempt to power through the gap
+    min_gap_clearance: float = 0.60        # Minimum range a beam must have to count as part of a usable gap for RECOVER. Higher = only wider-open gaps are considered viable
+    min_gap_width_deg: float = 40.0        # Minimum angular width a clear run of beams must span to count as a usable gap. Bigger = only wide enough gaps are chosen, small ones ignored
+    control_rate_hz: float = 20.0          # Control loop frequency. Higher = finer-grained reaction and PID stepping, but must stay under actual scan/odom publish rate to be meaningful
+    disable_avoidance: bool = False        # If true, ASSESS always halts instead of maneuvering (used for clean go-and-stop distance/PID-tuning runs, no turn/strafe)
 
     @property
     def max_strafe_distance(self):
