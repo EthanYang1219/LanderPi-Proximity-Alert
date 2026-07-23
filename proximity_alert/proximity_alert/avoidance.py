@@ -54,10 +54,10 @@ class AvoidanceConfig: # All measurements are in meters or m/s for the speed. Al
     forward_speed: float = 0.50            # Constant driving speed, m/s. Higher = faster runs but less reaction time before safety_distance is reached
     strafe_speed: float = 0.50             # Lateral (sideways) speed during STRAFE, m/s. Higher = clears an obstacle faster but overshoots more before the next scan reacts
     strafe_timeout: float = 1.5            # Max seconds to hold a STRAFE before giving up and re-assessing. Also sets max_strafe_distance = strafe_speed * strafe_timeout
-    strafe_side_clearance_min: float = 0.30  # Minimum LEFT/RIGHT clearance required to permit a strafe that direction. Higher = more conservative, refuses strafes into tight gaps
+    strafe_side_clearance_min: float = 0.20  # Minimum LEFT/RIGHT clearance required to permit a strafe that direction. Higher = more conservative, refuses strafes into tight gaps
     max_obstacle_width: float = 0.50       # Max physical lateral width (y_hi - y_lo) still considered "narrow enough to strafe past". Above this it's treated as a wall -> TURN instead
     max_cumulative_strafe: float = 1.00     # Hard cap on total lateral distance strafed within one encounter (guards against creeping sideways along a long wall). Must stay above strafe_speed * strafe_timeout (max_strafe_distance, currently 0.75) or the strafe_ok cap check fails on the very first attempt and STRAFE becomes unreachable. Lower = escalates to TURN sooner, but never below max_strafe_distance
-    turn_speed: float = 0.6                # Angular speed while turning, rad/s. Higher = faster turns but more overshoot past turn_step_deg
+    turn_speed: float = 0.75                # Angular speed while turning, rad/s. Higher = faster turns but more overshoot past turn_step_deg
     turn_step_deg: float = 30.0            # Heading change commanded per TURN attempt. Bigger = clears wider obstacles in one attempt but deviates further from goal heading
     turn_timeout: float = 1.5              # Max seconds to hold a TURN before moving on to DRIVE_PAST regardless of whether turn_step_deg was reached
     reverse_trigger_range: float = 0.20    # (Currently unused by _turn/_recover, which key off rear_clearance_min instead) Intended FRONT range below which a reverse nudge is warranted
@@ -74,7 +74,7 @@ class AvoidanceConfig: # All measurements are in meters or m/s for the speed. Al
     clear_drive_duration: float = 3.0      # Seconds of sustained clean driving before an encounter is considered over and its counters (cumulative_strafe, attempt count) reset
     recover_backup_clearance: float = 0.50 # (Currently unused by _recover, which keys off rear_clearance_min) Intended rear clearance required before backing up during recovery
     recover_commit_distance: float = 0.50  # Max distance to drive during RECOVER's commit phase before giving up and halting. Higher = more patient attempt to power through the gap
-    min_gap_clearance: float = 0.60        # Minimum range a beam must have to count as part of a usable gap for RECOVER. Higher = only wider-open gaps are considered viable
+    min_gap_clearance: float = 0.50        # Minimum range a beam must have to count as part of a usable gap for RECOVER. Higher = only wider-open gaps are considered viable
     min_gap_width_deg: float = 40.0        # Minimum angular width a clear run of beams must span to count as a usable gap. Bigger = only wide enough gaps are chosen, small ones ignored
     control_rate_hz: float = 20.0          # Control loop frequency. Higher = finer-grained reaction and PID stepping, but must stay under actual scan/odom publish rate to be meaningful
     disable_avoidance: bool = False        # If true, ASSESS always halts instead of maneuvering (used for clean go-and-stop distance/PID-tuning runs, no turn/strafe)
