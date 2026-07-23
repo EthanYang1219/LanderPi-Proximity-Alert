@@ -20,11 +20,11 @@ The system drives a mobile robot from a fixed point A to point B, reactively sto
 
 ## Project overview
 
-This project measures how surface material affects a mobile robot's real-world driving performance versus its own internal estimate of that performance. Concretely, for each surface the robot is driven along a fixed marked track from point A to point B, and the following are compared:
+This project measures how surface material affects a mobile robot's real-world driving performance versus its own internal estimate of that performance. Concretely, for each surface, the robot is driven along a fixed marked track from point A to point B, and the following are compared:
 
 - **Transit time** — how long the run took
-- **Odometry-estimated distance** — the robot's own dead-reckoned estimate of how far it traveled (see the important caveat on what this actually measures, below)
-- **Ground-truth distance** — how far it actually traveled, read by hand off a marked/taped track
+- **Odometry-estimated distance** — the robot's own dead-reckoned estimate of how far it travelled (see the important caveat on what this actually measures, below)
+- **Ground-truth distance** — how far it actually travelled, read by hand off a marked/taped track
 
 The gap between odometry and ground truth quantifies wheel slippage, which is expected to vary by surface (granite and metal are expected to slip more than wood or concrete, for example). A LiDAR-based safety stop is layered on top so the robot avoids collisions with obstacles placed along or at the end of the track, independent of the distance measurement itself.
 
@@ -45,13 +45,13 @@ Raw per-trial data is written to CSV so it can be handed off directly for statis
 | Main compute | Raspberry Pi 5 (ROS 2 controller) |
 | Low-level control | STM32 microcontroller (motor commands) |
 | LiDAR | LD19 (the running driver node identifies as `LD19`/`LDLiDAR_LD19`; worth double-checking against this unit's actual spec sheet if "MS200" is documented elsewhere) |
-| Odometry | Wheel encoders |
+| Odometry | Integrated from /cmd_vel |
 | Alert (planned) | Onboard buzzer, I2C |
 | OS | Ubuntu 22.04 LTS |
 | Middleware | ROS 2 Humble, running inside Docker |
 | Language | Python 3 (`rclpy`) |
 
-The buzzer is intentionally not wired into the current nodes — it is a separate, later integration step (see [Roadmap](#roadmap)) so it doesn't add risk while the motion-tracking behavior is still being validated.
+The buzzer is intentionally not wired into the current nodes — it is a separate, later integration step (see [Roadmap](#roadmap)) so it doesn't add risk while the motion-tracking behaviour is still being validated.
 
 ## Repository structure
 
