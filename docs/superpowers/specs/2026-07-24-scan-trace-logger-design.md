@@ -29,11 +29,14 @@ Add a new, independent logging node that continuously records the **raw LiDAR sc
 
 A fourth node, `scan_trace_logger.py`, following the same independence principle already established by `trial_logger` (watches `/odom` on its own) and `decision_logger` (watches `/avoidance_decision` on its own): it subscribes **directly to `/scan_raw`**, with no dependency on `path_tracker`'s internals or process lifetime. Any node can be developed, run, or omitted without affecting the others.
 
+**Scan topic confirmed.** `/scan_raw` is the actual, currently-published topic on hardware (`ros2 topic list` on the running container shows `/scan_raw`; no `/scan` topic exists). No ambiguity — this node subscribes to `/scan_raw` directly, same topic `path_tracker` uses.
+
 Per scan message received, it:
 
-1. Extracts the raw scan fields needed to fully reconstruct beam geometry later (see §5).
-2. Calls the existing pure `reduce_to_sectors(...)` from `scan_utils.py` — the same function `path_tracker` already uses — to attach the reduced sector summary alongside the raw data. This means a coarse pass ("was front ever below X") doesn't require re-deriving sector logic from raw ranges by hand; the raw ranges remain available for the deep-dive blind-spot check.
-3. Appends one JSON Lines (`.jsonl`) record to the configured output file.
+1. Extracts the raw scan fields needed to fully reconstruct beam geometry later (see §5), keyed off the message's own `header.stamp` rather than wall-clock time (see §5's `stamp_sec`/`stamp_nanosec` note).
+2. Assigns the next `scan_number` (see §5).
+3. Calls the existing pure `reduce_to_sectors(...)` from `scan_utils.py` — the same function `path_tracker` already uses — to attach the reduced sector summary alongside the raw data. This means a coarse pass ("was front ever below X") doesn't require re-deriving sector logic from raw ranges by hand; the raw ranges remain available for the deep-dive blind-spot check.
+4. Appends one JSON Lines (`.jsonl`) record to the configured output file.
 
 No new topics are published; this node only consumes and persists.
 
@@ -43,7 +46,9 @@ One JSON object per line (JSON Lines, not a single JSON array — so the file is
 
 ```json
 {
-  "timestamp": "2026-07-24 14:32:07.183241",
+  "scan_number": 4821,
+  "stamp_sec": 1784824869,
+  "stamp_nanosec": 454205692,
   "angle_min": -3.14159,
   "angle_increment": 0.01745,
   "range_min": 0.12,
@@ -58,10 +63,11 @@ One JSON object per line (JSON Lines, not a single JSON array — so the file is
 
 Field notes:
 
-- `timestamp` — wall-clock, **microsecond precision** (`%Y-%m-%d %H:%M:%S.%f`). This is a deliberate difference from `trial_logger`'s/`decision_logger`'s second-resolution timestamps: correlating "which tick was the robot passing the chair leg" against the trial CSV's start/end times needs sub-second resolution, since a scan tick is ~100ms apart at the LD19's observed ~10Hz rate.
+- `scan_number` — a monotonically increasing integer this node assigns itself, starting at 0 and incrementing once per received `/scan_raw` message, in receipt order. ROS 2's `std_msgs/Header` no longer carries a `seq` field (dropped from ROS 1), so nothing upstream provides a sequence number — this node is the source of it. Storing it makes referencing/correlating a specific scan ("scan #4821 shows...") far more convenient than always having to quote a full timestamp pair, and gives an unambiguous, gap-detectable ordering even if two scans somehow shared a timestamp.
+- `stamp_sec` / `stamp_nanosec` — copied directly from the incoming `LaserScan` message's `header.stamp` (ROS `Time`: int32 seconds + uint32 nanoseconds), **not** wall-clock time (`datetime.now()`). Confirmed on hardware that the driver populates this with real, monotonically-increasing values (~100ms apart, matching the LD19's ~10Hz rate) rather than leaving it zeroed. Using the message's own stamp — rather than whatever wall-clock time this node happens to observe it at — keeps this log on the same clock as every other ROS message (`/odom`, `/cmd_vel`, etc.), which is what makes cross-message correlation for offline analysis valid; wall-clock timestamps would carry extra DDS transport/scheduling jitter that has nothing to do with when the LiDAR actually took the reading. Stored as the two raw ROS `Time` integer fields (not combined into a single float) to avoid float64 precision loss at 10-digit second values.
 - `angle_min`, `angle_increment`, `range_min`, `range_max` — copied verbatim from the incoming `LaserScan` message. Together with `ranges`, this fully reconstructs each beam's angle via `angle = angle_min + i * angle_increment`, matching the existing convention in `scan_utils.py`.
 - `ranges` — the full, unmodified ranges array. Non-finite values (`inf`, `nan`) are serialized as the string `"inf"` / `"nan"` (Python's `json` module cannot round-trip float `inf`/`nan` through standard JSON; using strings for these two sentinel cases keeps the file valid JSON per line while staying unambiguous — a finite range is a JSON number, a non-finite one is one of exactly two strings).
-- `sectors` — the dict returned by `reduce_to_sectors`, reusing `path_tracker`'s existing default parameters (`front_arc_deg`, `front_subsector_deg`, `side_window_deg`, `rear_window_deg`), independently declared as ROS params on this node (matching how `trial_logger`/`decision_logger` each independently declare their own `csv_path` rather than sharing config with `path_tracker`).
+- `sectors` — the dict returned by `reduce_to_sectors`, reusing `path_tracker`'s existing default parameters (`front_arc_deg`, `front_subsector_deg`, `side_window_deg`, `rear_window_deg`), independently declared as ROS params on this node (matching how `trial_logger`/`decision_logger` each independently declare their own `csv_path` rather than sharing config with `path_tracker`). **This is intentionally duplicated data** — every value in `sectors` is always fully recomputable from `ranges` plus the four sector-window parameters, so it adds no new information. It's stored anyway purely to speed up coarse offline analysis (e.g. "was `front` ever below X across this whole trace") without needing to re-run `reduce_to_sectors` over the raw arrays first. The trade-off is a larger file for a faster common-case query; `ranges` remains the ground truth if `sectors` and a from-scratch recomputation ever need to be cross-checked.
 
 ## 6. File location and naming
 
@@ -77,8 +83,8 @@ One continuous file per logging session (per the approved design decision): no p
 
 This is analysis guidance, not code, but worth stating since it's the entire reason this log exists:
 
-1. From the trial CSV, get the trial's approximate start/end wall-clock window (from `timestamp` and `transit_time_s`).
-2. Filter `scan_trace.jsonl` to that window.
+1. From the trial CSV, get the trial's approximate start/end wall-clock window (from `timestamp` and `transit_time_s`). `trial_logger`/`decision_logger` still record wall-clock time; `scan_trace.jsonl` records ROS `header.stamp` (epoch seconds + nanoseconds). Since this project runs on the system clock (no `use_sim_time`, no simulation), these are the same underlying clock — convert `stamp_sec` to local wall-clock (e.g. `datetime.fromtimestamp(stamp_sec)`) to line the window up against the trial CSV's timestamps.
+2. Filter `scan_trace.jsonl` to that window. Once the rough window is found, `scan_number` gives a convenient, unambiguous way to reference or re-locate specific scans within it (e.g. "the miss is visible starting around scan #4821") without repeating a full timestamp pair.
 3. For a suspected miss at a known approximate bearing (e.g. "the chair leg was roughly ahead-left"), inspect the raw `ranges` at that bearing across the window:
    - If every beam near that bearing reads `range_max` or `"inf"` the entire time → the obstacle was never in the scan plane at all → sensor-geometry blind spot (§1, case 1).
    - If some beams show a finite reading close to the obstacle's actual distance, but `sectors.front` (or the relevant sub-sector) never crossed `safety_distance`/`obstacle_detect_range` → thresholding miss → tunable (§1, case 2).
@@ -92,6 +98,6 @@ Same split already used by every other module in this package:
 
 ## 9. Open questions / edge cases considered
 
-- **File growth.** Trials are short (~10-35s observed) and this is opt-in per logging session (you start the node alongside the other two, same as today), so unbounded growth isn't a concern for the current single-session-at-a-time workflow. Not adding rotation/truncation now (YAGNI) — revisit if a session runs unattended for a long time.
+- **Intended logging duration.** This logger is designed and scoped for **bounded trial sessions** — you start it alongside the other two nodes, run one or a handful of short trials (~10-35s each, observed), then stop it, the same opt-in workflow as today. Long-duration or unattended logging, log rotation, and compression are **intentionally out of scope** for this design; the node has no size cap, rotation, or truncation logic. If a future use case needs multi-hour or continuous unattended capture, that's a separate design problem (rotation policy, compression, retention) and should not be retrofitted onto this node without revisiting this spec.
 - **`ranges` array length varies slightly between scans.** Not assumed fixed-width; stored as whatever length arrives, exactly as published. Reconstruction always uses `angle_min + i * angle_increment` per stored `ranges` length, matching `scan_utils.py`'s existing indexing convention.
 - **Why JSON Lines over CSV.** A LaserScan's `ranges` is a ~450-element variable-length float array; CSV has no clean way to represent that as a single field, and a fixed-column-per-beam CSV would be brittle against beam-count drift. JSON Lines keeps the array structured and each line independently parseable.
