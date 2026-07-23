@@ -25,6 +25,7 @@ setup(
             'trial_logger = proximity_alert.trial_logger:main',
             'decision_logger = proximity_alert.decision_logger:main',
             'floor_test_reconcile = proximity_alert.floor_test_reconcile:main',
+            'scan_trace_logger = proximity_alert.scan_trace_logger:main',
         ],
     },
 )
