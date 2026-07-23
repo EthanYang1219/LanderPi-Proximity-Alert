@@ -61,10 +61,22 @@ The buzzer is intentionally not wired into the current nodes — it is a separat
 │   ├── package.xml
 │   ├── setup.py / setup.cfg
 │   └── proximity_alert/
-│       ├── path_tracker.py     # Drives A -> B, reactive LiDAR obstacle avoidance
-│       └── trial_logger.py     # Logs transit time, odometry distance, ground truth per trial
-├── trials/                     # Suggested output location for per-surface CSV logs (not committed)
+│       ├── path_tracker.py           # Drives A -> B, reactive LiDAR obstacle avoidance
+│       ├── avoidance.py              # Pure, ROS-free obstacle-avoidance state machine
+│       ├── trial_logger.py           # Logs transit time, odometry distance, ground truth per trial
+│       ├── decision_logger.py        # Logs each avoidance decision to its own CSV
+│       └── floor_test_reconcile.py   # Fills floor_test_log.csv's Time/Stop-clearance from real trial data
+├── trials/                     # CSVs, gitignored (not committed) -- see below
+│   ├── floor_test_log.csv      # Hand-maintained PID/safety-distance tuning session report
+│   ├── granite.csv             # -> symlink to /home/pi/docker/tmp/trials/granite.csv
+│   └── decision_log.csv        # -> symlink to /home/pi/docker/tmp/trials/decision_log.csv
 └── README.md
+```
+
+`trials/granite.csv` and `trials/decision_log.csv` are symlinks into the container's bind-mounted shared folder (see [Two separate CSVs](#two-separate-csvs-both-on-your-computer) below) — they exist purely so both logs show up directly in this repo's VS Code Explorer/file tree instead of requiring you to browse to `/home/pi/docker/tmp/trials/` separately. They live-update as the nodes write to them. If you log a new surface (e.g. `concrete.csv`), symlink it the same way:
+
+```bash
+ln -sf /home/pi/docker/tmp/trials/concrete.csv trials/concrete.csv
 ```
 
 `path_tracker.py` and `trial_logger.py` are independent ROS 2 nodes. `trial_logger.py` does not modify or depend on the internals of `path_tracker.py` — it only observes `/odom`, so either node can be developed, tested, or replaced without breaking the other.
@@ -73,16 +85,23 @@ The buzzer is intentionally not wired into the current nodes — it is a separat
 
 The robot's ROS 2 stack already runs in a Docker container named `MentorPi` on the Pi — you don't need to install ROS yourself. Do this from a VS Code integrated terminal (open the repo folder via the Remote-SSH extension if you're connecting from another machine, or directly if VS Code is running on the Pi itself):
 
-1. **Copy the package into the container:**
+1. **Copy the package into the container.** `docker cp` nests the source inside the destination if the destination already exists, silently leaving a stale duplicate that colcon keeps building instead of your edits — this bit us mid-session (see [Troubleshooting](#troubleshooting)). Always clear the destination first:
 
    ```bash
-   docker cp proximity_alert MentorPi:/home/ubuntu/ros2_ws/src/proximity_alert
+   docker exec -u ubuntu MentorPi rm -rf /home/ubuntu/ros2_ws/src/proximity_alert/proximity_alert
+   docker cp proximity_alert/proximity_alert MentorPi:/home/ubuntu/ros2_ws/src/proximity_alert/proximity_alert
    ```
 
-2. **Build it** (must run under `bash`, not `zsh` — colcon's environment hooks need it):
+2. **Build it** as the `ubuntu` user via `zsh` (not `bash` + `/opt/ros/humble/setup.bash` — that fails in this container; `~/.zshrc` is what actually sets up the workspace environment correctly):
 
    ```bash
-   docker exec MentorPi bash -lc "source /opt/ros/humble/setup.bash && cd /home/ubuntu/ros2_ws && colcon build --packages-select proximity_alert"
+   docker exec -u ubuntu MentorPi zsh -lc "source ~/.zshrc && cd ~/ros2_ws && colcon build --packages-select proximity_alert"
+   ```
+
+   If a previous build was ever run as `root` (e.g. via plain `docker exec` without `-u ubuntu`), leftover root-owned files under `build/proximity_alert` or `install/proximity_alert` will make this fail with `Permission denied`. Fix with:
+
+   ```bash
+   docker exec -u root MentorPi bash -c "chown -R ubuntu:ubuntu /home/ubuntu/ros2_ws/build/proximity_alert /home/ubuntu/ros2_ws/install/proximity_alert"
    ```
 
 3. **Run each node in its own terminal**, as the `ubuntu` user via `zsh` (this loads `need_compile` and other env vars some of the robot's own launch files expect):
@@ -108,7 +127,7 @@ After step 2, repeat only step 3 for future runs — you only need to rebuild wh
 
 ## Setup
 
-1. **Docker + ROS 2 Humble.** The project's Docker container (`MentorPi`, image `ros:humble`) is already running on the robot's Pi — confirm it can see the LanderPi's ROS 2 stack with `docker exec MentorPi bash -lc "source /opt/ros/humble/setup.bash && ros2 topic list"` (`/scan_raw`, `/odom`, `/cmd_vel` should be visible).
+1. **Docker + ROS 2 Humble.** The project's Docker container (`MentorPi`, image `ros:humble`) is already running on the robot's Pi — confirm it can see the LanderPi's ROS 2 stack with `docker exec -u ubuntu MentorPi zsh -lc "source ~/.zshrc && ros2 topic list"` (`/scan_raw`, `/odom`, `/cmd_vel` should be visible). Always include `-u ubuntu` — running as `root` silently breaks FastRTPS's shared-memory transport between nodes (discovery still matches over UDP, but zero data ever delivers), which cost an entire debugging session before it was traced to this.
 2. **Copy the package in** and **build** it — see [Running it in VS Code](#running-it-in-vs-code-quick-start) above for the exact commands.
 
 ## Usage
@@ -196,7 +215,17 @@ The two logs are deliberately kept in **separate files** so the motion/slippage 
 - **Trial motion log** (`trial_logger`) — one row per A→B trial: transit time, odometry vs. ground-truth distance, slippage, `avoidance_events`, `lidar_stop_range_m`.
 - **Decision log** (`decision_logger`) — one row per avoidance *decision*, for research/debugging: `timestamp, encounter_id, state, chosen_maneuver, reason, obstacle_span_deg, front_distance_m, front_left_m, front_center_m, front_right_m, left_clearance_m, right_clearance_m, rear_clearance_m, required_clearing_m, cumulative_strafe_m, consecutive_avoid_count, recovery_triggered, outcome, maneuver_duration_s`.
 
-Both default to (or should be pointed at) `/home/ubuntu/shared/trials/` inside the container, which is bind-mounted to **`/home/pi/docker/tmp/trials/`** on the Pi — so both CSVs appear directly in your local file manager (and survive container restarts) with no `docker` digging.
+Both default to (or should be pointed at) `/home/ubuntu/shared/trials/` inside the container, which is bind-mounted to **`/home/pi/docker/tmp/trials/`** on the Pi — so both CSVs appear directly in your local file manager (and survive container restarts) with no `docker` digging. This repo's `trials/` folder also symlinks straight to them (see [Repository structure](#repository-structure)) so they show up in VS Code too.
+
+### Reconciling floor_test_log.csv
+
+`floor_test_log.csv` (the hand-maintained Google-Sheet-schema report of PID/safety-distance tuning sessions) is never written by any ROS node — it's a manual transcription of Time and Stop clearance from the real trial CSV, plus the `safety_distance`/`Kp`/`Ki`/`Kd` you ran with (which aren't persisted anywhere else). That transcription step is easy to forget. Run this after a session to auto-fill whatever's derivable from the trial data, on the host (no ROS needed):
+
+```bash
+python3 -m proximity_alert.floor_test_reconcile --floor-log trials/floor_test_log.csv --trial-csv trials/granite.csv
+```
+
+It only fills Time/Stop-clearance, never fabricates Safety Distance/Speed/Kp/Ki/Kd, and refuses to guess when two session rows share the same date (nothing to disambiguate which trials belong to which row) — it reports both cases so you can fill them by hand instead of silently leaving (or corrupting) a blank.
 
 ## Roadmap
 
@@ -214,6 +243,8 @@ Both default to (or should be pointed at) `/home/ubuntu/shared/trials/` inside t
 - **Robot makes contact with an obstacle that has a thin or overhanging profile (e.g. a pedestal desk, chair legs).** This is very likely the LiDAR's fixed-height blind spot, not a `safety_distance` or code issue — see the limitation note in [Project overview](#project-overview). Reposition the obstacle so it has a consistent cross-section at the LiDAR's mounted height, don't just lower `safety_distance`.
 - **No `/scan_raw` or `/odom` data.** Confirm the LanderPi's sensor drivers are running inside the `MentorPi` container (`docker exec MentorPi bash -lc "source /opt/ros/humble/setup.bash && ros2 node list"` should show `LD19`, `ekf_filter_node`, etc.) before starting either node. If the list comes back empty, the driver stack itself has died and needs restarting — see `~/robot_pi/tool/bringup.sh` on the Pi.
 - **`path_tracker` holds still and logs "No fresh scan within scan_timeout."** This is the scan-freshness watchdog working as intended — the LiDAR isn't currently publishing. Check `ros2 topic hz /scan_raw`; this LD19 has been observed to intermittently stop publishing mid-session.
+- **Edits to a `.py` file don't seem to take effect after rebuilding.** `docker cp` nests the source inside the destination directory if the destination already exists, rather than overwriting it — running the copy step twice without clearing the destination first silently produces a stale duplicate package tree that colcon keeps building from instead of your latest edit. This happened mid-session and cost real time to trace. Always `rm -rf` the destination package dir before `docker cp` (see [Running it in VS Code](#running-it-in-vs-code-quick-start)), and if in doubt, `find ~/ros2_ws/src/proximity_alert -name '<file>.py'` inside the container to check for more than one copy.
+- **Rebuild fails with `Permission denied` on files under `build/` or `install/`.** A previous build ran as `root` (e.g. a bare `docker exec` without `-u ubuntu`) and left root-owned artifacts that the `ubuntu` user can't overwrite. `chown -R ubuntu:ubuntu` those two directories (command in [Running it in VS Code](#running-it-in-vs-code-quick-start)) and rebuild.
 
 ## Authors
 

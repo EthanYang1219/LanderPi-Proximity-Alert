@@ -24,6 +24,7 @@ setup(
             'path_tracker = proximity_alert.path_tracker:main',
             'trial_logger = proximity_alert.trial_logger:main',
             'decision_logger = proximity_alert.decision_logger:main',
+            'floor_test_reconcile = proximity_alert.floor_test_reconcile:main',
         ],
     },
 )
