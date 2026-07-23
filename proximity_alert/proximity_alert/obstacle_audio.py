@@ -52,6 +52,10 @@ class ObstacleAudio(Node):
             # aplay is spawned non-blocking. Overlapping playback (two
             # encounters in quick succession) is left unguarded intentionally:
             # cosmetic doubled sound only, not worth added state for a prototype.
+            # Finished aplay processes are also not reaped -- they linger as
+            # <defunct> until this node exits. Negligible for a demo (a handful
+            # of obstacles); a long unattended run would slowly leak PIDs. Both
+            # are deliberate prototype trade-offs (see spec Open questions).
             # The try/except catches only aplay-not-installed (OSError); a
             # missing WAV doesn't raise here -- aplay handles that itself.
             try:
