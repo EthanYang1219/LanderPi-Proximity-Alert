@@ -2,7 +2,7 @@
 
 A LiDAR-based Advanced Driver Assistance System (ADAS) proximity alert for a mobile robot, developed as part of an undergraduate research project at the University of Prince Edward Island (UPEI) under the supervision of Dr. Bingxian Mu.
 
-The system drives a mobile robot from a fixed point A to point B, reactively stopping and turning away from obstacles detected by an onboard LiDAR, while logging transit time and odometry drift across four surface materials: granite, concrete, wood, and metal.
+The system drives a mobile robot from a fixed point A to point B, reactively stopping and turning away from obstacles detected by an onboard LiDAR, while logging transit time and odometry drift across five surface materials: granite, concrete, wood, metal, and plastic laminate (HPL).
 
 ## Table of contents
 
@@ -78,10 +78,10 @@ The buzzer is intentionally not wired into the current nodes — it is a separat
 └── README.md
 ```
 
-`trials/granite.csv`, `trials/decision_log.csv`, and `trials/scan_trace.jsonl` are symlinks into the container's bind-mounted shared folder (see [Three logs](#three-logs-all-on-your-computer) below) — they exist purely so all three logs show up directly in this repo's VS Code Explorer/file tree instead of requiring you to browse to `/home/pi/docker/tmp/trials/` separately. They live-update as the nodes write to them. If you log a new surface (e.g. `concrete.csv`), symlink it the same way:
+`trials/granite.csv`, `trials/decision_log.csv`, and `trials/scan_trace.jsonl` are symlinks into the container's bind-mounted shared folder (see [Three logs](#three-logs-all-on-your-computer) below) — they exist purely so all three logs show up directly in this repo's VS Code Explorer/file tree instead of requiring you to browse to `/home/pi/docker/tmp/trials/` separately. They live-update as the nodes write to them. If you log a new surface (e.g. `hpl.csv` for plastic laminate), symlink it the same way:
 
 ```bash
-ln -sf /home/pi/docker/tmp/trials/concrete.csv trials/concrete.csv
+ln -sf /home/pi/docker/tmp/trials/hpl.csv trials/hpl.csv
 ```
 
 `path_tracker.py` and `trial_logger.py` are independent ROS 2 nodes. `trial_logger.py` does not modify or depend on the internals of `path_tracker.py` — it only observes `/odom`, so either node can be developed, tested, or replaced without breaking the other.
@@ -154,7 +154,7 @@ Then, for each trial:
 1. Place the robot at point A on the marked track for the current surface.
 2. Place an obstacle (or rely on the track's natural endpoint) at point B.
 3. Let the robot drive. `trial_logger` detects the start automatically when the robot begins moving, and the end automatically once `path_tracker`'s obstacle stop has held for one second.
-4. When prompted in Terminal 2, read the robot's actual stop position off your tape-measure marks and enter the surface name and ground-truth distance.
+4. When prompted in Terminal 2, read the robot's actual stop position off your tape-measure marks and enter the surface name (granite/concrete/wood/metal/hpl) and ground-truth distance.
 5. Repeat for each trial and surface, pointing `csv_path` at a different file (or the same file — `trial_num` increments automatically) per surface.
 
 ## Data collected
@@ -262,7 +262,7 @@ It only fills Time/Stop-clearance, never fabricates Safety Distance/Speed/Kp/Ki/
 - [x] Reactive obstacle-avoidance driver (`path_tracker.py`)
 - [x] Per-trial transit time / odometry / ground-truth logging (`trial_logger.py`)
 - [ ] Re-integrate the I2C buzzer so it fires simultaneously with the obstacle-avoidance stop
-- [ ] Collect full trial sets across all four surfaces
+- [ ] Collect full trial sets across all five surfaces
 - [ ] Statistical analysis of slippage by surface (Haotian)
 - [ ] Methodology and Results sections, IEEE conference format
 

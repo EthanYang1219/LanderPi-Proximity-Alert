@@ -23,7 +23,7 @@ slippage) than a clean run and must not be silently pooled with clean
 trials in the stats -- see avoidance_events below.
 
 Then, at the terminal, it prompts you for:
-    - surface material    (granite / concrete / wood / metal)
+    - surface material    (granite / concrete / wood / metal / hpl)
     - ground_truth_distance_m (read off your tape-measure marks by eye)
     - notes                (freeform, optional -- e.g. "motors fought each
                              other on the turn", "oscillated near desk")
@@ -307,7 +307,7 @@ def main(args=None):
                     f"odom_distance={odom_distance_m:.3f}m{avoid_note} ---"
                 )
                 surface = input(
-                    "Surface material (granite/concrete/wood/metal): "
+                    "Surface material (granite/concrete/wood/metal/hpl): "
                 ).strip()
                 # Re-prompt until a valid positive number, or let the user
                 # discard the trial. Never write a bogus ground-truth value:
