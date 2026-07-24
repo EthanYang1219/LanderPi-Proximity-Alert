@@ -27,7 +27,13 @@ class DecisionLogger(Node):
                 csv.writer(f).writerow(DecisionRecord.csv_header())
 
     def on_decision(self, msg):
-        rec = DecisionRecord.from_json(msg.data)
+        # A companion node must never die from bad input it doesn't control:
+        # a malformed message on the topic is logged and skipped, not fatal.
+        try:
+            rec = DecisionRecord.from_json(msg.data)
+        except (ValueError, TypeError) as e:
+            self.get_logger().warn(f"Ignoring unparseable /avoidance_decision message: {e}")
+            return
         with open(self.csv_path, "a", newline="") as f:
             csv.writer(f).writerow(rec.csv_row())
 
