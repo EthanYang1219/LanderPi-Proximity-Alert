@@ -12,6 +12,8 @@ after new sessions if you need fresh data here.
 ## Files
 - `carpet.csv` — trials run on carpet.
 - `granite.csv` — trials run on granite.
+- `wood.csv` — trials run on wood (15 trials). Was sitting in the container's
+  bind mount unlinked/uncopied until 2026-07-29 — see caveat below.
 
 ## Columns
 
@@ -38,6 +40,11 @@ after new sessions if you need fresh data here.
 - `granite.csv` trials 4-5 have outlier `ground_truth_distance_m` values
   (23.2m, 22.5m) that the trial's own notes already flag as bad ("need to
   adjust starting position," "forgot to renew starting position").
+- `wood.csv` trial 1 has `ground_truth_distance_m = 13.10m` versus ~0.12-0.15m
+  for every other wood trial, driving `slippage_pct` to -96.22% — its own
+  note ("low battery run") doesn't explain a 10x-off tape measurement, so
+  this looks like a data-entry error (e.g. wrong units or wrong tape
+  reading) rather than a real result. Exclude from slippage stats.
 
 These were flagged, not altered, per project convention of surfacing
 anomalies rather than silently fixing them.
