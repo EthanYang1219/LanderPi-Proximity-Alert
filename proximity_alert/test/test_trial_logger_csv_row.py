@@ -30,6 +30,7 @@ def test_append_row_includes_lidar_stop_range_and_keeps_existing_columns():
         avoidance_events=0,
         lidar_stop_range_m=0.28,
         notes="clean run",
+        battery_level_str="High",
     )
 
     with open(path, newline="") as f:
@@ -42,7 +43,7 @@ def test_append_row_includes_lidar_stop_range_and_keeps_existing_columns():
         os.remove("trial_log.csv")  # side effect of TrialLogger() default param
 
     header, row = rows[0], rows[1]
-    # New column exists, sits after avoidance_events, and notes stays last.
+    # New column exists, sits after avoidance_events, and battery_level is last.
     assert header == [
         "timestamp",
         "surface",
@@ -55,11 +56,13 @@ def test_append_row_includes_lidar_stop_range_and_keeps_existing_columns():
         "avoidance_events",
         "lidar_stop_range_m",
         "notes",
+        "battery_level",
     ]
     by_col = dict(zip(header, row))
     assert by_col["lidar_stop_range_m"] == "0.2800"
     assert by_col["avoidance_events"] == "0"
     assert by_col["notes"] == "clean run"
+    assert by_col["battery_level"] == "High"
 
 
 def test_ensure_header_migrates_stale_short_header_and_pads_old_rows():
@@ -97,6 +100,7 @@ def test_ensure_header_migrates_stale_short_header_and_pads_old_rows():
         avoidance_events=0,
         lidar_stop_range_m=0.256,
         notes="PID tuning",
+        battery_level_str="Medium",
     )
 
     with open(path, newline="") as f:
@@ -112,14 +116,16 @@ def test_ensure_header_migrates_stale_short_header_and_pads_old_rows():
         "timestamp", "surface", "trial_num", "transit_time_s",
         "odom_distance_m", "ground_truth_distance_m", "slippage_error_m",
         "slippage_pct", "avoidance_events", "lidar_stop_range_m", "notes",
+        "battery_level",
     ]
     assert rows[0] == canonical
     assert len(rows[1]) == len(canonical)          # old row padded, not left short
     assert rows[1][:8] == old_row                  # original data untouched
-    assert rows[1][8:] == ["", "", ""]              # padded blank, not fabricated
+    assert rows[1][8:] == ["", "", "", ""]          # padded blank, not fabricated
     assert len(rows[2]) == len(canonical)           # new row same width
     by_col = dict(zip(canonical, rows[2]))
     assert by_col["notes"] == "PID tuning"
+    assert by_col["battery_level"] == "Medium"
 
 
 def test_append_row_logs_blank_range_for_infinite_reading():
@@ -137,6 +143,7 @@ def test_append_row_logs_blank_range_for_infinite_reading():
         avoidance_events=2,
         lidar_stop_range_m=float("inf"),
         notes="",
+        battery_level_str="",
     )
 
     with open(path, newline="") as f:

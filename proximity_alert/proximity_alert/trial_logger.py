@@ -34,11 +34,14 @@ manual spreadsheet wrangling.
 CSV columns:
     timestamp, surface, trial_num, transit_time_s, odom_distance_m,
     ground_truth_distance_m, slippage_error_m, slippage_pct,
-    avoidance_events, notes
+    avoidance_events, lidar_stop_range_m, notes, battery_level
 
 Topics:
     Subscribes: /odom (nav_msgs/Odometry)
     Subscribes: /cmd_vel (geometry_msgs/Twist)
+    Subscribes: /ros_robot_controller/battery (std_msgs/UInt16, raw mV) --
+                converted to a rough High/Medium/Low estimate assuming a 2S
+                Li-ion pack (6.0V empty - 8.4V full); not a precise SoC.
 
 Parameters:
     csv_path                (str,   default "trial_log.csv")
@@ -63,7 +66,7 @@ import rclpy
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
-from std_msgs.msg import Float32
+from std_msgs.msg import Float32, UInt16
 
 
 CSV_HEADER = [
@@ -78,7 +81,35 @@ CSV_HEADER = [
     "avoidance_events",
     "lidar_stop_range_m",
     "notes",
+    "battery_level",
 ]
+
+# /ros_robot_controller/battery publishes raw millivolts (std_msgs/UInt16),
+# not a percentage. This robot's pack is a 2S Li-ion (nominal 7.4V), so the
+# range below is a rough estimate, not a manufacturer-specified curve --
+# good enough for a High/Medium/Low bucket, not for precise SoC.
+BATTERY_MIN_MV = 6000
+BATTERY_MAX_MV = 8400
+
+# Low/Medium boundary confirmed against real hardware: the robot's own
+# low-battery beep was observed at 6952 mV, which the original 6800 mV cutoff
+# missed (classified it as "Medium"). Raised past the observed beep point so
+# that reading -- and anything at or below it -- lands in "Low".
+BATTERY_LOW_MAX_MV = 7100
+BATTERY_MEDIUM_MAX_MV = 7600
+
+
+def battery_percent(mv):
+    pct = (mv - BATTERY_MIN_MV) / (BATTERY_MAX_MV - BATTERY_MIN_MV) * 100.0
+    return max(0.0, min(100.0, pct))
+
+
+def battery_level(mv):
+    if mv < BATTERY_LOW_MAX_MV:
+        return "Low"
+    elif mv < BATTERY_MEDIUM_MAX_MV:
+        return "Medium"
+    return "High"
 
 
 class TrialLogger(Node):
@@ -109,6 +140,13 @@ class TrialLogger(Node):
         # Latest forward-arc LiDAR range from path_tracker; captured at the
         # moment a trial finalizes to record the actual stop distance.
         self.last_min_range = None
+
+        self.battery_sub = self.create_subscription(
+            UInt16, "/ros_robot_controller/battery", self.battery_callback, 10
+        )
+        # Latest raw battery reading (millivolts); captured at trial-finalize
+        # time, same pattern as last_min_range.
+        self.last_battery_mv = None
 
         # State machine: "idle" -> "moving" -> trial finalized -> "idle"
         self.state = "idle"
@@ -182,6 +220,7 @@ class TrialLogger(Node):
         avoidance_events,
         lidar_stop_range_m,
         notes,
+        battery_level_str,
     ):
         self.trial_num += 1
         error = odom_distance_m - ground_truth_m
@@ -208,6 +247,7 @@ class TrialLogger(Node):
                     avoidance_events,
                     range_str,
                     notes,
+                    battery_level_str,
                 ]
             )
         if avoidance_events:
@@ -232,6 +272,9 @@ class TrialLogger(Node):
 
     def range_callback(self, msg: Float32):
         self.last_min_range = msg.data
+
+    def battery_callback(self, msg: UInt16):
+        self.last_battery_mv = msg.data
 
     def odom_callback(self, msg: Odometry):
         pos = msg.pose.pose.position
@@ -266,6 +309,7 @@ class TrialLogger(Node):
                         odom_distance_m,
                         self.avoidance_events,
                         self.last_min_range,
+                        self.last_battery_mv,
                     )
                     self.state = "idle"
                     avoid_note = (
@@ -295,6 +339,7 @@ def main(args=None):
                     odom_distance_m,
                     avoidance_events,
                     lidar_stop_range_m,
+                    battery_mv,
                 ) = node.pending_trial
                 node.pending_trial = None
                 avoid_note = (
@@ -302,9 +347,19 @@ def main(args=None):
                     if avoidance_events
                     else ""
                 )
+                if battery_mv is not None:
+                    battery_level_str = battery_level(battery_mv)
+                    battery_note = (
+                        f", battery=~{battery_percent(battery_mv):.0f}% "
+                        f"({battery_level_str})"
+                    )
+                else:
+                    battery_level_str = ""
+                    battery_note = ", battery=unknown (no reading yet)"
                 print(
                     f"\n--- Trial ready: transit_time={transit_time_s:.2f}s, "
-                    f"odom_distance={odom_distance_m:.3f}m{avoid_note} ---"
+                    f"odom_distance={odom_distance_m:.3f}m{avoid_note}"
+                    f"{battery_note} ---"
                 )
                 surface = input(
                     "Surface material (granite/concrete/wood/metal/hpl): "
@@ -344,6 +399,7 @@ def main(args=None):
                         avoidance_events,
                         lidar_stop_range_m,
                         notes,
+                        battery_level_str,
                     )
     except KeyboardInterrupt:
         pass

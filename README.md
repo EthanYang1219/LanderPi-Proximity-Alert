@@ -174,6 +174,7 @@ Each row appended to the CSV represents one trial:
 | `avoidance_events` | Count of obstacle-avoidance maneuvers `path_tracker` triggered during the trial (detected via reverse `/cmd_vel` commands, which only occur in its `AVOIDING` state). **Non-zero means this was not a clean A→B run** and should be filtered out or analyzed separately from clean-run slippage stats. |
 | `lidar_stop_range_m` | The actual LiDAR range to the closest obstacle in the forward arc at the moment the trial finalized (i.e. the real stop clearance), captured from `path_tracker`'s `/forward_min_range` topic. Useful for checking proximity-trigger accuracy against the `safety_distance` parameter and whether it varies by surface. Blank if nothing valid was in the arc at stop. |
 | `notes` | Freeform text entered at logging time for anything unusual observed (e.g. "motors fought each other on the turn", "oscillated near desk", "false stop") |
+| `battery_level` | Rough `High`/`Medium`/`Low` estimate captured from `/ros_robot_controller/battery` (raw millivolts) at the moment the trial finalized, assuming a 2S Li-ion pack (6.0V empty - 8.4V full). Not a precise state-of-charge reading -- just enough to flag "was the pack getting low during this session." Blank if no reading had arrived yet. |
 
 ## Refined obstacle avoidance
 
