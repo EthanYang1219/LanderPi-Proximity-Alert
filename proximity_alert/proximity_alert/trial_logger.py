@@ -22,8 +22,11 @@ avoidance_events > 0 measure something different (avoidance-affected
 slippage) than a clean run and must not be silently pooled with clean
 trials in the stats -- see avoidance_events below.
 
+Surface material is inferred automatically from the CSV filename (e.g.
+csv_path=".../granite.csv" -> surface="granite") -- override with the
+`surface` parameter if the filename doesn't match (e.g. a shared/misc log).
+
 Then, at the terminal, it prompts you for:
-    - surface material    (granite / concrete / wood / metal / hpl)
     - ground_truth_distance_m (read off your tape-measure marks by eye)
     - notes                (freeform, optional -- e.g. "motors fought each
                              other on the turn", "oscillated near desk")
@@ -45,6 +48,9 @@ Topics:
 
 Parameters:
     csv_path                (str,   default "trial_log.csv")
+    surface                 (str,   default "" -- inferred from csv_path's
+                                     filename, e.g. "granite.csv" -> "granite";
+                                     set explicitly to override)
     move_velocity_threshold (float, default 0.03) m/s -- above this = "moving"
     stop_velocity_threshold (float, default 0.02) m/s -- below this = "stopped"
     stop_confirm_duration   (float, default 1.0)  seconds of continuous
@@ -117,6 +123,7 @@ class TrialLogger(Node):
         super().__init__("trial_logger")
 
         self.declare_parameter("csv_path", "trial_log.csv")
+        self.declare_parameter("surface", "")
         self.declare_parameter("move_velocity_threshold", 0.03)
         self.declare_parameter("stop_velocity_threshold", 0.02)
         self.declare_parameter("stop_confirm_duration", 1.0)
@@ -125,6 +132,15 @@ class TrialLogger(Node):
         self.move_threshold = self.get_parameter("move_velocity_threshold").value
         self.stop_threshold = self.get_parameter("stop_velocity_threshold").value
         self.stop_confirm_duration = self.get_parameter("stop_confirm_duration").value
+
+        # Surface defaults to the CSV filename (e.g. ".../granite.csv" ->
+        # "granite") -- one CSV per surface is already this project's
+        # convention, so the filename already says what's being logged;
+        # override with the `surface` param if a file doesn't follow it.
+        surface_param = self.get_parameter("surface").value
+        self.surface = surface_param or os.path.splitext(
+            os.path.basename(self.csv_path)
+        )[0]
 
         self._ensure_csv_header()
 
@@ -170,7 +186,8 @@ class TrialLogger(Node):
         self.pending_trial = None
 
         self.get_logger().info(
-            f"trial_logger up. Writing to '{self.csv_path}'. "
+            f"trial_logger up. Writing to '{self.csv_path}' "
+            f"(surface='{self.surface}'). "
             "Waiting for the robot to start moving to begin a trial."
         )
 
@@ -361,9 +378,6 @@ def main(args=None):
                     f"odom_distance={odom_distance_m:.3f}m{avoid_note}"
                     f"{battery_note} ---"
                 )
-                surface = input(
-                    "Surface material (granite/concrete/wood/metal/hpl): "
-                ).strip()
                 # Re-prompt until a valid positive number, or let the user
                 # discard the trial. Never write a bogus ground-truth value:
                 # a single wrong row silently corrupts the slippage dataset.
@@ -392,7 +406,7 @@ def main(args=None):
                         "oscillation, false stop (blank if none): "
                     ).strip()
                     node._append_row(
-                        surface,
+                        node.surface,
                         transit_time_s,
                         odom_distance_m,
                         ground_truth_m,

@@ -22,8 +22,7 @@ def _rec():
 
 def test_survives_malformed_decision_json():
     # A bad or empty message on the topic (e.g. from a stray publish) must
-    # not kill the subscription or crash the node -- mirrors
-    # obstacle_audio's test_survives_malformed_decision_json.
+    # not kill the subscription or crash the node.
     rclpy.init()
     fd, path = tempfile.mkstemp(suffix=".csv")
     os.close(fd)

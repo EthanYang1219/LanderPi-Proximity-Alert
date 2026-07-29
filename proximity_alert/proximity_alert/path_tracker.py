@@ -8,9 +8,17 @@ clearances, sizes the obstacle, finds an escape gap, and feeds those to the
 pure AvoidanceController every control tick. It publishes the commanded Twist,
 the live forward-arc range (/forward_min_range) for trial_logger, and a
 structured JSON decision record (/avoidance_decision) for decision_logger.
+
+It also plays an audible alert through the robot's USB speaker on by
+default -- once per obstacle encounter, not on every escalation step within
+one -- via the same trigger logic as the (now folded-in) standalone
+obstacle_audio node; see the `audio_alert_enabled`/`wav_path`/`alsa_device`
+parameters. Set `audio_alert_enabled:=false` to disable it.
 """
 import math
+import os
 import signal
+import subprocess
 import time
 from dataclasses import fields as dc_fields
 
@@ -24,6 +32,7 @@ from nav_msgs.msg import Odometry
 from sensor_msgs.msg import LaserScan
 from std_msgs.msg import Float32, String
 
+from proximity_alert.audio_trigger import should_play
 from proximity_alert.scan_utils import reduce_to_sectors, size_obstacle, select_gap
 from proximity_alert.avoidance import AvoidanceController, AvoidanceConfig
 
@@ -59,6 +68,32 @@ class PathTracker(Node):
         odom_topic = self.get_parameter("odom_topic").value
         self.scan_timeout = self.get_parameter("scan_timeout").value
 
+        # Obstacle audio alert -- on by default (formerly a standalone
+        # obstacle_audio node you had to launch separately). Same
+        # once-per-encounter trigger logic (proximity_alert.audio_trigger),
+        # just fed directly from the decision this control tick already
+        # produced instead of round-tripping through /avoidance_decision.
+        self.declare_parameter("audio_alert_enabled", True)
+        self.declare_parameter("wav_path", "/home/ubuntu/shared/audio/obstacle_alert.wav")
+        self.declare_parameter("alsa_device", "plughw:2,0")
+        self.audio_alert_enabled = self.get_parameter("audio_alert_enabled").value
+        self.wav_path = self.get_parameter("wav_path").value
+        self.alsa_device = self.get_parameter("alsa_device").value
+        self._last_played_encounter_id = None
+
+        # Fail loudly at startup, not silently at the first obstacle. aplay is
+        # spawned non-blocking with its stderr discarded, so a missing WAV
+        # produces NO visible error at all -- the robot just never beeps and
+        # you find out by not hearing it (this happened: the audio/ folder had
+        # never been created). Checked once here rather than per-encounter.
+        if self.audio_alert_enabled and not os.path.exists(self.wav_path):
+            self.get_logger().error(
+                f"audio_alert_enabled is true but wav_path '{self.wav_path}' "
+                "does not exist -- the robot will NOT beep on obstacles. Drop a "
+                "WAV there (host side: /home/pi/docker/tmp/audio/), or pass "
+                "-p audio_alert_enabled:=false to silence this."
+            )
+
         self.controller = AvoidanceController(self.config)
 
         self.cmd_vel_pub = self.create_publisher(Twist, "/cmd_vel", 10)
@@ -86,7 +121,8 @@ class PathTracker(Node):
             f"path_tracker started: safety_distance={self.config.safety_distance}m "
             f"forward_speed={self.config.forward_speed}m/s "
             f"strafe_speed={self.config.strafe_speed}m/s "
-            f"disable_avoidance={self.config.disable_avoidance}"
+            f"disable_avoidance={self.config.disable_avoidance} "
+            f"audio_alert_enabled={self.audio_alert_enabled}"
         )
 
     def publish_stop(self):
@@ -158,6 +194,29 @@ class PathTracker(Node):
 
         if out.decision is not None:
             self.decision_pub.publish(String(data=out.decision.to_json()))
+            if self.audio_alert_enabled:
+                self._maybe_play_audio_alert(out.decision)
+
+    def _maybe_play_audio_alert(self, decision):
+        if not should_play(decision, self._last_played_encounter_id):
+            return
+        # Mark as played BEFORE launching so a failed launch doesn't retry
+        # within this encounter (retry within one encounter is suppressed by
+        # the once-per-encounter gate anyway).
+        self._last_played_encounter_id = decision.encounter_id
+        # aplay is spawned non-blocking so a slow/failed playback can never
+        # stall the control loop. Overlapping playback (two encounters in
+        # quick succession) is left unguarded intentionally: cosmetic doubled
+        # sound only. Finished aplay processes also aren't reaped -- they
+        # linger as <defunct> until this node exits; negligible for a
+        # session's worth of obstacles. Both are deliberate prototype
+        # trade-offs carried over from the original obstacle_audio node.
+        try:
+            subprocess.Popen(["aplay", "-D", self.alsa_device, self.wav_path])
+        except OSError as e:
+            self.get_logger().warn(
+                f"Could not launch aplay ({e}); is ALSA's aplay installed in this container?"
+            )
 
 
 def main(args=None):

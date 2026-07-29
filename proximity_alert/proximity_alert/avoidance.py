@@ -67,7 +67,7 @@ class AvoidanceConfig: # All measurements are in meters or m/s for the speed. Al
     max_drive_past_distance: float = 0.80  # Max distance to drive in DRIVE_PAST before giving up and re-assessing. Higher = more patient with a wide obstacle, but risks driving further off-line
     heading_kp: float = 1.0                # Heading-hold PID proportional gain. Higher = snappier correction toward goal/target heading, more prone to overshoot/oscillation
     heading_ki: float = 0.0                # Heading-hold PID integral gain. Nonzero corrects small steady-state heading bias, but risks windup/overshoot if too high
-    heading_kd: float = 0.1                # Heading-hold PID derivative gain. Higher = damps oscillation from kp, but amplifies noise in the heading error
+    heading_kd: float = 0.2               # Heading-hold PID derivative gain. Higher = damps oscillation from kp, but amplifies noise in the heading error, used to tune overshooting
     heading_max_correction: float = 0.3    # Clamp on the PID's angular_z output, rad/s. Lower = gentler heading correction, may not keep up with a large heading error
     heading_tol_deg: float = 5.0           # Heading error considered "on target" (used by TURN/RECOVER completion checks). Smaller = stricter alignment before proceeding, may hunt near the tolerance edge
     max_avoid_attempts: int = 3            # Consecutive failed STRAFE/TURN cycles before escalating to RECOVER. Lower = escalates sooner, higher = keeps retrying the normal ladder longer
@@ -77,7 +77,7 @@ class AvoidanceConfig: # All measurements are in meters or m/s for the speed. Al
     min_gap_clearance: float = 0.50        # Minimum range a beam must have to count as part of a usable gap for RECOVER. Higher = only wider-open gaps are considered viable
     min_gap_width_deg: float = 40.0        # Minimum angular width a clear run of beams must span to count as a usable gap. Bigger = only wide enough gaps are chosen, small ones ignored
     control_rate_hz: float = 20.0          # Control loop frequency. Higher = finer-grained reaction and PID stepping, but must stay under actual scan/odom publish rate to be meaningful
-    disable_avoidance: bool = True        # If true, ASSESS always halts instead of maneuvering (used for clean go-and-stop distance/PID-tuning runs, no turn/strafe)
+    disable_avoidance: bool = False        # If true, ASSESS always halts instead of maneuvering (used for clean go-and-stop distance/PID-tuning runs, no turn/strafe)
 
     @property 
     def max_strafe_distance(self):
