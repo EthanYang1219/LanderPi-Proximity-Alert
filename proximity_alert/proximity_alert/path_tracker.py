@@ -35,6 +35,7 @@ from std_msgs.msg import Float32, String
 from proximity_alert.audio_trigger import should_play
 from proximity_alert.scan_utils import reduce_to_sectors, size_obstacle, select_gap
 from proximity_alert.avoidance import AvoidanceController, AvoidanceConfig
+from proximity_alert.nav_utils import distance_from_start
 
 
 def normalize_angle(angle):
@@ -67,6 +68,13 @@ class PathTracker(Node):
         scan_topic = self.get_parameter("scan_topic").value
         odom_topic = self.get_parameter("odom_topic").value
         self.scan_timeout = self.get_parameter("scan_timeout").value
+
+        # Fixed-distance A-to-B stop. 0.0 disables it entirely, so a node
+        # launched without this parameter behaves exactly as it did before.
+        self.declare_parameter("target_distance", 0.0)
+        self.declare_parameter("odom_timeout_sec", 1.0)
+        self.target_distance = self.get_parameter("target_distance").value
+        self.odom_timeout_sec = self.get_parameter("odom_timeout_sec").value
 
         # Obstacle audio alert -- on by default (formerly a standalone
         # obstacle_audio node you had to launch separately). Same
@@ -113,6 +121,10 @@ class PathTracker(Node):
         self.current_yaw = None
         self.goal_heading_abs = None
         self._goal_set = False
+        self.start_pos = None
+        self.distance_traveled = 0.0
+        self.last_odom_time = None
+        self.arrived = False
 
         self.control_dt = 1.0 / self.config.control_rate_hz
         self.control_timer = self.create_timer(self.control_dt, self.control_loop)
@@ -166,11 +178,28 @@ class PathTracker(Node):
             self.controller.set_goal_heading(self.current_yaw)
             self._goal_set = True
 
+        # Straight-line distance from wherever the node started. Stored as
+        # plain floats rather than the message's position object, which is
+        # reused/overwritten by the middleware.
+        pos = msg.pose.pose.position
+        if self.start_pos is None:
+            self.start_pos = (pos.x, pos.y)
+        self.distance_traveled = distance_from_start(
+            self.start_pos[0], self.start_pos[1], pos.x, pos.y
+        )
+        self.last_odom_time = self.get_clock().now()
+
     def scan_is_stale(self):
         if self.last_scan_time is None:
             return True
         age = (self.get_clock().now() - self.last_scan_time).nanoseconds / 1e9
         return age > self.scan_timeout
+
+    def odom_is_stale(self):
+        if self.last_odom_time is None:
+            return True
+        age = (self.get_clock().now() - self.last_odom_time).nanoseconds / 1e9
+        return age > self.odom_timeout_sec
 
     def control_loop(self):
         if self.scan_is_stale() or self._sectors is None:
