@@ -112,8 +112,12 @@ The robot's ROS 2 stack already runs in a Docker container named `MentorPi` on t
 
    ```bash
    # Terminal A — drive the robot
-   docker exec -it -u ubuntu MentorPi zsh -lc "source ~/.zshrc && source ~/ros2_ws/install/setup.bash && ros2 run proximity_alert path_tracker --ros-args -p safety_distance:=0.20 -r scan:=/scan_raw"
+   docker exec -it -u ubuntu MentorPi zsh -lc "source ~/.zshrc && source ~/ros2_ws/install/setup.bash && ros2 run proximity_alert path_tracker --ros-args -p safety_distance:=0.20 -p target_distance:=2.0 -r scan:=/scan_raw"
    ```
+
+   `target_distance` is declared as a double parameter -- pass the decimal
+   form (`2.0`, not `2`), or `--ros-args` raises
+   `InvalidParameterTypeException` and the node never starts.
 
    ```bash
    # Terminal B — log the trial
@@ -204,7 +208,7 @@ The LiDAR is reduced each scan into FRONT (+ front sub-sectors), LEFT, RIGHT, an
 | `clear_drive_duration` | `3.0` | Sustained clean-drive time that closes an encounter and resets counters, seconds |
 | `min_gap_clearance` / `min_gap_width_deg` | `0.50` / `40.0` | What counts as a usable recovery gap (robot must fit) |
 | `disable_avoidance` | `false` | Halt on any obstacle, no turn/strafe (clean go-and-stop runs) |
-| `target_distance` | `0.0` | Straight-line distance from the start position, in meters, after which the robot stops and reports `arrived_target_distance`. `0.0` disables the whole feature — no distance tracking and no odom watchdog, exactly as before this parameter existed. Arrival is deferred until the avoidance state machine is back in `DRIVE`, so a strafe or turn finishes before the stop (costs a little overshoot) |
+| `target_distance` | `0.0` | Straight-line distance from the start position, in meters, after which the robot stops and reports `arrived_target_distance`. `0.0` disables — no stop condition and no odom watchdog, exactly as before this parameter existed (distance tracking itself still runs internally either way; nothing consumes it when disabled). Arrival is deferred until the avoidance state machine is back in `DRIVE`, so a strafe or turn finishes before the stop — this can cost real overshoot, up to roughly a metre if a full maneuver ladder (strafe, then turn, then drive-past) runs before DRIVE is reached again |
 | `odom_timeout_sec` | `1.0` | Odometry watchdog, seconds. If `target_distance` is set and no `/odom` message arrives within this window, the robot stops and reports `stopped_odom_fault` rather than driving on a stale distance estimate. Ignored entirely when `target_distance` is `0.0` |
 | `audio_alert_enabled` | `true` | Plays `wav_path` through the USB speaker once per obstacle encounter — see [Obstacle audio alert](#obstacle-audio-alert). Set `false` to disable |
 | `wav_path` | `/home/ubuntu/shared/audio/obstacle_alert.wav` | WAV file to play (host path — see below) |
@@ -223,11 +227,18 @@ control tick, reporting what is currently governing the robot:
 | `arrived_target_distance` | `target_distance` reached while in `DRIVE`; stopped and latched |
 | `arrived_obstacle` | The avoidance state machine reached `HALT` — it ran out of options. Note this is recoverable: if the obstacle is removed and the path stays clear, it returns to `driving` |
 | `stopped_odom_fault` | `/odom` went stale while `target_distance` was set; stopped as a precaution |
+| `stopped_scan_fault` | The scan-side counterpart to `stopped_odom_fault`: no fresh LiDAR scan within `scan_timeout`, so the node holds rather than driving blind. Never reported while an arrival is already latched — `arrived_target_distance` takes priority, so a LiDAR dropout after arrival still reports arrived |
 
 **One `path_tracker` process per trial.** Arrival latches permanently — once
 `arrived_target_distance` is reached the node stays stopped and will not
 drive again. Ctrl-C and relaunch between runs. This is deliberate: an
 auto-reset could be tripped by nudging the robot between trials.
+
+**Launch order matters.** `path_tracker` latches its start position (`start_pos`)
+on the first `/odom` message it receives after the node starts, not at any
+later "trial start" moment. Place the robot at point A **first**, then launch
+`path_tracker` — launching first and moving the robot to A afterward measures
+`target_distance` from the wrong origin.
 
 **`trial_logger`**
 

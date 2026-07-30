@@ -1,11 +1,47 @@
 import math
 
+import pytest
 import rclpy
 from sensor_msgs.msg import LaserScan
 from nav_msgs.msg import Odometry
 
 from proximity_alert.avoidance import DRIVE, HALT, STRAFE, ControllerOutput
+from proximity_alert.decision_record import DecisionRecord
 from proximity_alert.path_tracker import PathTracker
+
+
+@pytest.fixture(autouse=True)
+def _ensure_rclpy_shutdown():
+    """Guarantee rclpy.shutdown() runs even if a test body raises.
+
+    Every test in this file calls rclpy.init() at the top and
+    rclpy.shutdown() before its asserts -- deliberate, so a failed assert
+    never masks a shutdown bug. But if the test BODY itself raises before
+    reaching that shutdown call, shutdown() is skipped and every subsequent
+    test in the run dies with "rcl_init called while already initialized",
+    turning one real failure into a misleading cascade. This fixture is the
+    safety net: it never runs shutdown() itself when a test's own call
+    already succeeded (rclpy.ok() is False by then), so normal passing/
+    failing-on-assert tests are unaffected.
+    """
+    yield
+    try:
+        if rclpy.ok():
+            rclpy.shutdown()
+    except Exception:
+        pass
+
+
+def _decision(state="STRAFE", encounter_id=1):
+    return DecisionRecord(
+        timestamp="2026-07-24 10:00:00", encounter_id=encounter_id, state=state,
+        chosen_maneuver=state if state != "DRIVE" else "NONE", reason="test",
+        obstacle_span_deg=10.0, front_distance_m=0.29, front_left_m=0.5,
+        front_center_m=0.29, front_right_m=0.6, left_clearance_m=1.2,
+        right_clearance_m=0.4, rear_clearance_m=2.0, required_clearing_m=0.22,
+        cumulative_strafe_m=0.0, consecutive_avoid_count=1,
+        recovery_triggered=False, outcome="committed", maneuver_duration_s=0.0,
+    )
 
 
 class _FakeController:
@@ -20,11 +56,11 @@ class _FakeController:
     path_tracker forwards or replaces its output correctly.
     """
 
-    def __init__(self, state=DRIVE, linear_x=0.5):
+    def __init__(self, state=DRIVE, linear_x=0.5, decision=None):
         self.state = state
         self.goal_heading = None
         self.step_calls = 0
-        self._out = ControllerOutput(linear_x, 0.0, 0.0, state, None)
+        self._out = ControllerOutput(linear_x, 0.0, 0.0, state, decision)
 
     def set_goal_heading(self, yaw):
         self.goal_heading = yaw
@@ -122,6 +158,28 @@ def test_arrival_deferred_until_controller_returns_to_drive():
     assert after == "arrived_target_distance"
 
 
+def test_decision_on_arrival_tick_still_published():
+    # Regression: the decision-publish block used to sit AFTER the arrival
+    # check, which `return`ed before it ran -- dropping any DecisionRecord
+    # produced on the same tick arrival is decided. This fires systematically
+    # when arrival is deferred through a maneuver: the first DRIVE tick IS
+    # the _complete_to_drive tick carrying the "cleared" record.
+    rclpy.init()
+    decision = _decision(state="DRIVE", encounter_id=7)
+    fake = _FakeController(state=DRIVE, decision=decision)
+    node = _primed(PathTracker(), 2.0, fake)
+    node.odom_callback(_odom_at(2.5, 0.0))
+    published = []
+    node.decision_pub.publish = lambda msg: published.append(msg)
+    node.control_loop()
+    status = node._last_status
+    node.destroy_node()
+    rclpy.shutdown()
+    assert status == "arrived_target_distance"
+    assert len(published) == 1
+    assert '"encounter_id": 7' in published[0].data
+
+
 def test_arrival_latches_and_stops_stepping_controller():
     rclpy.init()
     fake = _FakeController(state=DRIVE)
@@ -193,7 +251,29 @@ def test_stale_scan_still_holds():
     node.target_distance = 2.0
     node.odom_callback(_odom_at(0.0, 0.0))   # odom fresh, scan never arrived
     node.control_loop()
-    cmd = node._last_cmd
+    cmd, status = node._last_cmd, node._last_status
     node.destroy_node()
     rclpy.shutdown()
     assert cmd.linear.x == 0.0
+    assert status == "stopped_scan_fault"
+
+
+def test_stale_scan_after_arrival_still_reports_arrived():
+    # Regression: the stale-scan hold branch used to run before the
+    # arrival/skip check and always published DRIVING, so a latched arrival
+    # followed by a LiDAR dropout (or the operator stopping the lidar node
+    # at end of run) flipped the published status back to "driving" even
+    # though self.arrived stayed latched and the robot never moved.
+    rclpy.init()
+    fake = _FakeController(state=DRIVE)
+    node = _primed(PathTracker(), 2.0, fake)
+    node.odom_callback(_odom_at(2.5, 0.0))
+    node.control_loop()
+    assert node._last_status == "arrived_target_distance"   # sanity check
+    node.last_scan_time = None   # simulate the scan going stale
+    node.control_loop()
+    cmd, status = node._last_cmd, node._last_status
+    node.destroy_node()
+    rclpy.shutdown()
+    assert cmd.linear.x == 0.0
+    assert status == "arrived_target_distance"

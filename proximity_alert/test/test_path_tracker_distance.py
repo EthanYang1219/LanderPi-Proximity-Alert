@@ -1,7 +1,30 @@
+import pytest
 import rclpy
 from nav_msgs.msg import Odometry
 
 from proximity_alert.path_tracker import PathTracker
+
+
+@pytest.fixture(autouse=True)
+def _ensure_rclpy_shutdown():
+    """Guarantee rclpy.shutdown() runs even if a test body raises.
+
+    Every test in this file calls rclpy.init() at the top and
+    rclpy.shutdown() before its asserts -- deliberate, so a failed assert
+    never masks a shutdown bug. But if the test BODY itself raises before
+    reaching that shutdown call, shutdown() is skipped and every subsequent
+    test in the run dies with "rcl_init called while already initialized",
+    turning one real failure into a misleading cascade. This fixture is the
+    safety net: it never runs shutdown() itself when a test's own call
+    already succeeded (rclpy.ok() is False by then), so normal passing/
+    failing-on-assert tests are unaffected.
+    """
+    yield
+    try:
+        if rclpy.ok():
+            rclpy.shutdown()
+    except Exception:
+        pass
 
 
 def _odom_at(x, y):
@@ -44,7 +67,10 @@ def test_tracks_distance_from_first_odom():
 
 
 def test_start_position_does_not_drift():
-    # start_pos must be a snapshot, not a reference into the last message.
+    # start_pos must be latched once, on the FIRST /odom message, and never
+    # re-stamped on subsequent ones -- not a test of middleware buffer reuse
+    # (these Odometry objects are freshly constructed, so buffer reuse is
+    # never exercised here).
     rclpy.init()
     node = PathTracker()
     node.odom_callback(_odom_at(1.0, 0.0))

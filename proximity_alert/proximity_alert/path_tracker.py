@@ -36,7 +36,7 @@ from proximity_alert.audio_trigger import should_play
 from proximity_alert.scan_utils import reduce_to_sectors, size_obstacle, select_gap
 from proximity_alert.avoidance import AvoidanceController, AvoidanceConfig
 from proximity_alert.nav_utils import (
-    ARRIVED_TARGET, DRIVING, STOPPED_ODOM_FAULT,
+    ARRIVED_TARGET, DRIVING, STOPPED_ODOM_FAULT, STOPPED_SCAN_FAULT,
     decide_arrival, distance_from_start, should_skip_controller,
 )
 
@@ -216,7 +216,12 @@ class PathTracker(Node):
                 "No fresh scan within scan_timeout; holding.",
                 throttle_duration_sec=1.0,
             )
-            self._publish(Twist(), DRIVING)
+            # A latched arrival must stay reported as arrived even through a
+            # scan dropout -- otherwise the terminal-reason signal flips back
+            # to "driving" the moment the LiDAR node goes quiet (or is shut
+            # down at the end of a run), even though the robot never moved.
+            status = ARRIVED_TARGET if self.arrived else STOPPED_SCAN_FAULT
+            self._publish(Twist(), status)
             return
 
         # Two stops are decided without the state machine. Ticking it
@@ -254,6 +259,17 @@ class PathTracker(Node):
             already_arrived=self.arrived,
         )
 
+        # Published on every tick where the controller produced a record,
+        # regardless of which stop condition fires below -- otherwise a
+        # decision produced on the same tick arrival is decided (e.g. the
+        # "cleared" record when a deferred arrival's final DRIVE tick is
+        # also the maneuver's _complete_to_drive tick) is dropped, and the
+        # encounter looks unterminated in the research log.
+        if out.decision is not None:
+            self.decision_pub.publish(String(data=out.decision.to_json()))
+            if self.audio_alert_enabled:
+                self._maybe_play_audio_alert(out.decision)
+
         if status == ARRIVED_TARGET:
             self.arrived = True
             self.get_logger().info(
@@ -268,11 +284,6 @@ class PathTracker(Node):
         cmd.linear.y = float(out.linear_y)
         cmd.angular.z = float(out.angular_z)
         self._publish(cmd, status)
-
-        if out.decision is not None:
-            self.decision_pub.publish(String(data=out.decision.to_json()))
-            if self.audio_alert_enabled:
-                self._maybe_play_audio_alert(out.decision)
 
     def _publish(self, cmd, status):
         """Single exit point for every tick, so /cmd_vel and the status topic
