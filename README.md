@@ -204,11 +204,30 @@ The LiDAR is reduced each scan into FRONT (+ front sub-sectors), LEFT, RIGHT, an
 | `clear_drive_duration` | `3.0` | Sustained clean-drive time that closes an encounter and resets counters, seconds |
 | `min_gap_clearance` / `min_gap_width_deg` | `0.50` / `40.0` | What counts as a usable recovery gap (robot must fit) |
 | `disable_avoidance` | `false` | Halt on any obstacle, no turn/strafe (clean go-and-stop runs) |
+| `target_distance` | `0.0` | Straight-line distance from the start position, in meters, after which the robot stops and reports `arrived_target_distance`. `0.0` disables the whole feature — no distance tracking and no odom watchdog, exactly as before this parameter existed. Arrival is deferred until the avoidance state machine is back in `DRIVE`, so a strafe or turn finishes before the stop (costs a little overshoot) |
+| `odom_timeout_sec` | `1.0` | Odometry watchdog, seconds. If `target_distance` is set and no `/odom` message arrives within this window, the robot stops and reports `stopped_odom_fault` rather than driving on a stale distance estimate. Ignored entirely when `target_distance` is `0.0` |
 | `audio_alert_enabled` | `true` | Plays `wav_path` through the USB speaker once per obstacle encounter — see [Obstacle audio alert](#obstacle-audio-alert). Set `false` to disable |
 | `wav_path` | `/home/ubuntu/shared/audio/obstacle_alert.wav` | WAV file to play (host path — see below) |
 | `alsa_device` | `plughw:2,0` | ALSA device string for the robot's USB speaker (confirmed via `aplay -l` inside the container) |
 
 Derived (computed, not configured): `max_strafe_distance = strafe_speed × strafe_timeout`; `corridor_half = robot_half_width + corridor_margin`; `clear_threshold = safety_distance + clear_margin`.
+
+### Arrival status (`/path_tracker/status`)
+
+`path_tracker` publishes a `std_msgs/String` on `/path_tracker/status` every
+control tick, reporting what is currently governing the robot:
+
+| Value | Meaning |
+|---|---|
+| `driving` | Driving forward, or mid-avoidance-maneuver |
+| `arrived_target_distance` | `target_distance` reached while in `DRIVE`; stopped and latched |
+| `arrived_obstacle` | The avoidance state machine reached `HALT` — it ran out of options. Note this is recoverable: if the obstacle is removed and the path stays clear, it returns to `driving` |
+| `stopped_odom_fault` | `/odom` went stale while `target_distance` was set; stopped as a precaution |
+
+**One `path_tracker` process per trial.** Arrival latches permanently — once
+`arrived_target_distance` is reached the node stays stopped and will not
+drive again. Ctrl-C and relaunch between runs. This is deliberate: an
+auto-reset could be tripped by nudging the robot between trials.
 
 **`trial_logger`**
 

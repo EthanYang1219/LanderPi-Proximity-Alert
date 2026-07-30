@@ -35,7 +35,10 @@ from std_msgs.msg import Float32, String
 from proximity_alert.audio_trigger import should_play
 from proximity_alert.scan_utils import reduce_to_sectors, size_obstacle, select_gap
 from proximity_alert.avoidance import AvoidanceController, AvoidanceConfig
-from proximity_alert.nav_utils import distance_from_start
+from proximity_alert.nav_utils import (
+    ARRIVED_TARGET, DRIVING, STOPPED_ODOM_FAULT,
+    decide_arrival, distance_from_start, should_skip_controller,
+)
 
 
 def normalize_angle(angle):
@@ -107,6 +110,7 @@ class PathTracker(Node):
         self.cmd_vel_pub = self.create_publisher(Twist, "/cmd_vel", 10)
         self.range_pub = self.create_publisher(Float32, "/forward_min_range", 10)
         self.decision_pub = self.create_publisher(String, "/avoidance_decision", 50)
+        self.status_pub = self.create_publisher(String, "/path_tracker/status", 10)
         self.scan_sub = self.create_subscription(
             LaserScan, scan_topic, self.scan_callback, qos_profile_sensor_data
         )
@@ -126,6 +130,9 @@ class PathTracker(Node):
         self.last_odom_time = None
         self.arrived = False
 
+        self._last_cmd = Twist()
+        self._last_status = DRIVING
+
         self.control_dt = 1.0 / self.config.control_rate_hz
         self.control_timer = self.create_timer(self.control_dt, self.control_loop)
 
@@ -134,7 +141,8 @@ class PathTracker(Node):
             f"forward_speed={self.config.forward_speed}m/s "
             f"strafe_speed={self.config.strafe_speed}m/s "
             f"disable_avoidance={self.config.disable_avoidance} "
-            f"audio_alert_enabled={self.audio_alert_enabled}"
+            f"audio_alert_enabled={self.audio_alert_enabled} "
+            f"target_distance={self.target_distance}"
         )
 
     def publish_stop(self):
@@ -208,23 +216,70 @@ class PathTracker(Node):
                 "No fresh scan within scan_timeout; holding.",
                 throttle_duration_sec=1.0,
             )
-            self.cmd_vel_pub.publish(Twist())
+            self._publish(Twist(), DRIVING)
+            return
+
+        # Two stops are decided without the state machine. Ticking it
+        # through them would keep advancing its maneuver timers against
+        # motion that is not happening. Note HALT is NOT one of them -- it
+        # is recoverable, and needs stepping to notice the path has cleared.
+        if should_skip_controller(
+            target_distance=self.target_distance,
+            odom_stale=self.odom_is_stale(),
+            already_arrived=self.arrived,
+        ):
+            if self.arrived:
+                self._publish(Twist(), ARRIVED_TARGET)
+            else:
+                self.get_logger().warn(
+                    "No fresh odom within odom_timeout_sec but target_distance "
+                    "is set; stopping rather than driving on a stale distance.",
+                    throttle_duration_sec=1.0,
+                )
+                self._publish(Twist(), STOPPED_ODOM_FAULT)
             return
 
         now = self.get_clock().now().nanoseconds / 1e9
         yaw = self.current_yaw if self.current_yaw is not None else 0.0
         out = self.controller.step(self._sectors, self._obstacle, self._gap, yaw, now)
 
+        # Arrival is decided AFTER the controller runs and only gates whether
+        # its output is forwarded. The state machine is never bypassed or
+        # altered, so avoidance behaves exactly as it did before.
+        status = decide_arrival(
+            controller_state=self.controller.state,
+            target_distance=self.target_distance,
+            distance_traveled=self.distance_traveled,
+            odom_stale=self.odom_is_stale(),
+            already_arrived=self.arrived,
+        )
+
+        if status == ARRIVED_TARGET:
+            self.arrived = True
+            self.get_logger().info(
+                f"Target distance {self.target_distance:.2f} m reached "
+                f"({self.distance_traveled:.2f} m travelled) -- stopping."
+            )
+            self._publish(Twist(), status)
+            return
+
         cmd = Twist()
         cmd.linear.x = float(out.linear_x)
         cmd.linear.y = float(out.linear_y)
         cmd.angular.z = float(out.angular_z)
-        self.cmd_vel_pub.publish(cmd)
+        self._publish(cmd, status)
 
         if out.decision is not None:
             self.decision_pub.publish(String(data=out.decision.to_json()))
             if self.audio_alert_enabled:
                 self._maybe_play_audio_alert(out.decision)
+
+    def _publish(self, cmd, status):
+        """Single exit point for every tick, so /cmd_vel and the status topic
+        can never disagree about what the robot is doing."""
+        self._last_cmd, self._last_status = cmd, status
+        self.cmd_vel_pub.publish(cmd)
+        self.status_pub.publish(String(data=status))
 
     def _maybe_play_audio_alert(self, decision):
         if not should_play(decision, self._last_played_encounter_id):
