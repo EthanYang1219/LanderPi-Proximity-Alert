@@ -193,3 +193,68 @@ def test_detection_after_cooldown_is_new_encounter():
         c.step(_sectors(front=5.0), None, None, 0.0, t)
     out = c.step(_sectors(front=front, fc=front, left=1.5), obst, None, 0.0, 4.0)
     assert out.decision.encounter_id == id_a + 1
+
+
+# ---------- reverse-arc geometry (turn_radius / rear_taper_zone) ----------
+
+
+def _turning(cfg, rear):
+    """Drives the controller into TURN with the given rear clearance and
+    returns that tick's output. Obstacle is wide (forces TURN, not STRAFE)
+    and both sides are blocked so it can't sidestep."""
+    c = AvoidanceController(cfg)
+    c.set_goal_heading(0.0)
+    obst = {"span_deg": 80.0, "y_lo": -0.6, "y_hi": 0.6, "preferred_side": 1.0}
+    front = _blocked_front(cfg)
+    s = _sectors(front=front, fc=front, left=0.15, right=0.15, rear=rear)
+    out = c.step(s, obst, gap_bearing=None, current_yaw=0.0, now=0.0)
+    assert out.state == "TURN", f"expected TURN, got {out.state}"
+    return out
+
+
+def test_turn_arcs_backward_while_rotating_by_default():
+    # Baseline: TURN commands reverse and rotation on the SAME tick (an arc),
+    # not a rotate-in-place pivot. Guards the property the radius math rests on.
+    out = _turning(_cfg(obstacle_confirm_scans=1), rear=5.0)
+    assert out.linear_x < 0.0
+    assert out.angular_z != 0.0
+
+
+def test_legacy_reverse_speed_used_when_turn_radius_unset():
+    cfg = _cfg(obstacle_confirm_scans=1, avoid_reverse_speed=0.10, turn_radius=0.0)
+    out = _turning(cfg, rear=5.0)
+    assert out.linear_x == -0.10
+
+
+def test_turn_radius_derives_reverse_speed_from_turn_speed():
+    # radius = v / omega, so v = radius * omega. A 0.5m radius at 0.75 rad/s
+    # is 0.375 m/s -- far wider than the legacy 0.10/0.75 = ~0.13m arc.
+    cfg = _cfg(obstacle_confirm_scans=1, turn_radius=0.5, turn_speed=0.75,
+               avoid_reverse_speed=0.10)
+    out = _turning(cfg, rear=5.0)
+    assert math.isclose(out.linear_x, -0.375, rel_tol=1e-9)
+    assert math.isclose(abs(out.linear_x / out.angular_z), 0.5, rel_tol=1e-9)
+
+
+def test_reverse_still_blocked_by_rear_clearance_regardless_of_radius():
+    # A wide radius must never override the rear-clearance safety gate.
+    cfg = _cfg(obstacle_confirm_scans=1, turn_radius=0.5, rear_clearance_min=0.25)
+    out = _turning(cfg, rear=0.10)
+    assert out.linear_x == 0.0
+    assert out.angular_z != 0.0          # still rotates, just no longer backing up
+
+
+def test_taper_scales_reverse_down_near_rear_limit():
+    # Halfway into the taper zone -> half the reverse speed, instead of the
+    # hard 0/full snap that made the maneuver lurch arc -> pivot.
+    cfg = _cfg(obstacle_confirm_scans=1, turn_radius=0.5, turn_speed=0.75,
+               rear_clearance_min=0.25, rear_taper_zone=0.20)
+    out = _turning(cfg, rear=0.35)       # 0.10 of headroom into a 0.20 zone
+    assert math.isclose(out.linear_x, -0.375 * 0.5, rel_tol=1e-9)
+
+
+def test_taper_does_not_exceed_full_speed_with_open_rear():
+    cfg = _cfg(obstacle_confirm_scans=1, turn_radius=0.5, turn_speed=0.75,
+               rear_clearance_min=0.25, rear_taper_zone=0.20)
+    out = _turning(cfg, rear=float("inf"))
+    assert math.isclose(out.linear_x, -0.375, rel_tol=1e-9)

@@ -198,6 +198,8 @@ The LiDAR is reduced each scan into FRONT (+ front sub-sectors), LEFT, RIGHT, an
 | `max_obstacle_width` | `0.50` | Above this *physical* lateral width (meters), the obstacle is "wide" (a wall) → turn, not strafe. Keyed on physical width, not angular span: at trigger range any real object subtends a large angle, so an angular-span gate would block strafing entirely. |
 | `max_cumulative_strafe` | `0.60` | Hard per-encounter lateral cap (long-wall guard), meters |
 | `turn_speed` / `turn_step_deg` / `turn_timeout` | `0.6` / `30.0` / `1.5` | Turn rate, per-turn increment, time cap (rad/s, deg, s) |
+| `turn_radius` | `0.0` | Reverse-arc radius during TURN/RECOVER, meters. Those states already command reverse + rotation together, so they trace an arc of radius `reverse_speed / turn_speed` — at legacy defaults a tight ~0.13m. Set > 0 to control that geometry directly (reverse speed becomes `turn_radius × turn_speed`): bigger = a wider, longer sweep instead of an almost-in-place pivot. `0` keeps the legacy fixed `avoid_reverse_speed` |
+| `rear_taper_zone` | `0.0` | Distance above `rear_clearance_min` over which the reverse component fades out linearly rather than snapping to zero, meters. The hard cutoff makes a turn lurch from arc to pure pivot the moment clearance runs low; a taper degrades smoothly. `0` keeps the legacy hard cutoff |
 | `max_avoid_attempts` | `3` | Failed cycles before escalating to recovery |
 | `clear_drive_duration` | `3.0` | Sustained clean-drive time that closes an encounter and resets counters, seconds |
 | `min_gap_clearance` / `min_gap_width_deg` | `0.60` / `40.0` | What counts as a usable recovery gap (robot must fit) |
