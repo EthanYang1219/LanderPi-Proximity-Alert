@@ -53,33 +53,35 @@ class AvoidanceConfig: # All measurements are in meters or m/s for the speed. Al
     corridor_margin: float = 0.05          # Extra clearance added beyond robot_half_width (-> corridor_half). Bigger = wider safety buffer on every strafe/pass, but rejects more strafes as "too far"
     forward_speed: float = 0.50            # Constant driving speed, m/s. Higher = faster runs but less reaction time before safety_distance is reached
     strafe_speed: float = 0.50             # Lateral (sideways) speed during STRAFE, m/s. Higher = clears an obstacle faster but overshoots more before the next scan reacts
-    strafe_timeout: float = 1.5            # Max seconds to hold a STRAFE before giving up and re-assessing. Also sets max_strafe_distance = strafe_speed * strafe_timeout
-    strafe_side_clearance_min: float = 0.30  # Minimum LEFT/RIGHT clearance required to permit a strafe that direction. Higher = more conservative, refuses strafes into tight gaps
-    max_obstacle_width: float = 0.50       # Max physical lateral width (y_hi - y_lo) still considered "narrow enough to strafe past". Above this it's treated as a wall -> TURN instead
-    max_cumulative_strafe: float = 1.00     # Hard cap on total lateral distance strafed within one encounter (guards against creeping sideways along a long wall). Must stay above strafe_speed * strafe_timeout (max_strafe_distance, currently 0.75) or the strafe_ok cap check fails on the very first attempt and STRAFE becomes unreachable. Lower = escalates to TURN sooner, but never below max_strafe_distance
-    turn_speed: float = 0.6                # Angular speed while turning, rad/s. Higher = faster turns but more overshoot past turn_step_deg
+    strafe_timeout: float = 2            # Max seconds to hold a STRAFE before giving up and re-assessing. Also sets max_strafe_distance = strafe_speed * strafe_timeout
+    strafe_side_clearance_min: float = 0.20  # Minimum LEFT/RIGHT clearance required to permit a strafe that direction. Higher = more conservative, refuses strafes into tight gaps
+    max_obstacle_width: float = 0.75      # Max physical lateral width (y_hi - y_lo) still considered "narrow enough to strafe past". Above this it's treated as a wall -> TURN instead
+    max_cumulative_strafe: float = 1.25     # Hard cap on total lateral distance strafed within one encounter (guards against creeping sideways along a long wall). Must stay above strafe_speed * strafe_timeout (max_strafe_distance, currently 0.75) or the strafe_ok cap check fails on the very first attempt and STRAFE becomes unreachable. Lower = escalates to TURN sooner, but never below max_strafe_distance
+    turn_speed: float = 0.75                # Angular speed while turning, rad/s. Higher = faster turns but more overshoot past turn_step_deg
     turn_step_deg: float = 30.0            # Heading change commanded per TURN attempt. Bigger = clears wider obstacles in one attempt but deviates further from goal heading
     turn_timeout: float = 1.5              # Max seconds to hold a TURN before moving on to DRIVE_PAST regardless of whether turn_step_deg was reached
     reverse_trigger_range: float = 0.20    # (Currently unused by _turn/_recover, which key off rear_clearance_min instead) Intended FRONT range below which a reverse nudge is warranted
-    avoid_reverse_speed: float = 0.10      # Speed of the small reverse nudge during TURN/RECOVER when rear is clear. Higher = backs off faster but eats into rear_clearance_min sooner
+    avoid_reverse_speed: float = 0.10      # Speed of the small reverse nudge during TURN/RECOVER when rear is clear. Higher = backs off faster but eats into rear_clearance_min sooner. Ignored when turn_radius > 0 (which derives this instead)
     rear_clearance_min: float = 0.25       # Minimum REAR clearance required to allow the reverse nudge during TURN/RECOVER. Lower = reverses even with less room behind
+    turn_radius: float = 0.0               # Reverse-arc radius during TURN/RECOVER, meters. TURN already commands reverse + rotation together, so it traces an arc of radius (reverse_speed / turn_speed) -- at the legacy defaults a tight ~0.13m. Set > 0 to control that geometry directly (reverse speed becomes turn_radius * turn_speed): bigger = a wider, longer sweeping arc instead of an almost-in-place pivot. 0 (default) keeps the legacy fixed avoid_reverse_speed
+    rear_taper_zone: float = 0.0           # Distance above rear_clearance_min over which the reverse component fades out linearly instead of snapping to 0, meters. The hard cutoff makes a turn lurch from arc to pure pivot the instant clearance runs low, which reads as the "repetitive little movements" -- a taper degrades smoothly instead. 0 (default) keeps the legacy hard cutoff
     pass_clearance: float = 0.35           # Inside-flank clearance required (alongside FRONT clear) before DRIVE_PAST starts confirming it has cleared the obstacle
     max_drive_past_distance: float = 0.80  # Max distance to drive in DRIVE_PAST before giving up and re-assessing. Higher = more patient with a wide obstacle, but risks driving further off-line
     heading_kp: float = 1.0                # Heading-hold PID proportional gain. Higher = snappier correction toward goal/target heading, more prone to overshoot/oscillation
     heading_ki: float = 0.0                # Heading-hold PID integral gain. Nonzero corrects small steady-state heading bias, but risks windup/overshoot if too high
-    heading_kd: float = 0.1                # Heading-hold PID derivative gain. Higher = damps oscillation from kp, but amplifies noise in the heading error
+    heading_kd: float = 0.2               # Heading-hold PID derivative gain. Higher = damps oscillation from kp, but amplifies noise in the heading error, used to tune overshooting
     heading_max_correction: float = 0.3    # Clamp on the PID's angular_z output, rad/s. Lower = gentler heading correction, may not keep up with a large heading error
     heading_tol_deg: float = 5.0           # Heading error considered "on target" (used by TURN/RECOVER completion checks). Smaller = stricter alignment before proceeding, may hunt near the tolerance edge
     max_avoid_attempts: int = 3            # Consecutive failed STRAFE/TURN cycles before escalating to RECOVER. Lower = escalates sooner, higher = keeps retrying the normal ladder longer
     clear_drive_duration: float = 3.0      # Seconds of sustained clean driving before an encounter is considered over and its counters (cumulative_strafe, attempt count) reset
     recover_backup_clearance: float = 0.50 # (Currently unused by _recover, which keys off rear_clearance_min) Intended rear clearance required before backing up during recovery
     recover_commit_distance: float = 0.50  # Max distance to drive during RECOVER's commit phase before giving up and halting. Higher = more patient attempt to power through the gap
-    min_gap_clearance: float = 0.60        # Minimum range a beam must have to count as part of a usable gap for RECOVER. Higher = only wider-open gaps are considered viable
+    min_gap_clearance: float = 0.50        # Minimum range a beam must have to count as part of a usable gap for RECOVER. Higher = only wider-open gaps are considered viable
     min_gap_width_deg: float = 40.0        # Minimum angular width a clear run of beams must span to count as a usable gap. Bigger = only wide enough gaps are chosen, small ones ignored
     control_rate_hz: float = 20.0          # Control loop frequency. Higher = finer-grained reaction and PID stepping, but must stay under actual scan/odom publish rate to be meaningful
     disable_avoidance: bool = False        # If true, ASSESS always halts instead of maneuvering (used for clean go-and-stop distance/PID-tuning runs, no turn/strafe)
 
-    @property
+    @property 
     def max_strafe_distance(self):
         return self.strafe_speed * self.strafe_timeout
 
@@ -254,8 +256,36 @@ class AvoidanceController:
         ly = cfg.strafe_speed * self._locked_dir
         return ControllerOutput(0.0, ly, self._hold(self.goal_heading), STRAFE, None)
 
-    def _turn(self):
+    def _reverse_component(self):
+        """Reverse (linear_x) part of the TURN/RECOVER arc, <= 0.
+
+        TURN/RECOVER command reverse and rotation on the same tick, so the
+        robot traces an arc of radius reverse_speed / turn_speed rather than
+        pivoting in place. turn_radius makes that geometry the thing you set
+        (reverse_speed = turn_radius * turn_speed) instead of an emergent
+        ratio of two speeds tuned for other reasons; turn_radius = 0 keeps
+        the legacy fixed avoid_reverse_speed.
+
+        Backing into something is worse than a tight turn, so the reverse
+        component still yields to rear clearance -- but rear_taper_zone lets
+        it fade out linearly instead of snapping to 0, which is what made a
+        turn lurch from arc to pure pivot mid-maneuver.
+        """
         s, cfg = self._s, self.config
+        rear = s["rear"]
+        if rear < cfg.rear_clearance_min:   # legacy gate was rear >= min
+            return 0.0
+
+        speed = (cfg.turn_radius * cfg.turn_speed if cfg.turn_radius > 0.0
+                 else cfg.avoid_reverse_speed)
+        if cfg.rear_taper_zone > 0.0:
+            # rear may be inf (nothing behind at all) -- inf/zone -> inf, and
+            # min() clamps it back to full speed, so no special-casing needed.
+            speed *= min(1.0, (rear - cfg.rear_clearance_min) / cfg.rear_taper_zone)
+        return -speed
+
+    def _turn(self):
+        cfg = self.config
         elapsed = self._now - self._maneuver_start
         reached = abs(normalize_angle(self._turn_target - self._yaw)) <= self._tol()
         if reached or elapsed >= cfg.turn_timeout:
@@ -265,8 +295,8 @@ class AvoidanceController:
             self._clear_since = None
             self._maneuver_start = self._now
             return self._drive_past()
-        lx = -cfg.avoid_reverse_speed if s["rear"] >= cfg.rear_clearance_min else 0.0
-        return ControllerOutput(lx, 0.0, cfg.turn_speed * self._locked_dir, TURN, None)
+        return ControllerOutput(self._reverse_component(), 0.0,
+                                cfg.turn_speed * self._locked_dir, TURN, None)
 
     def _drive_past(self):
         s, now, cfg = self._s, self._now, self.config
@@ -308,9 +338,8 @@ class AvoidanceController:
                 self._commit_dist = 0.0
                 self._maneuver_start = now
             else:
-                lx = -cfg.avoid_reverse_speed if s["rear"] >= cfg.rear_clearance_min else 0.0
                 az = cfg.turn_speed * (1.0 if err > 0 else -1.0)
-                return ControllerOutput(lx, 0.0, az, RECOVER, None)
+                return ControllerOutput(self._reverse_component(), 0.0, az, RECOVER, None)
         if s["front"] >= cfg.clear_threshold:
             return self._complete_to_drive("cleared", now - self._maneuver_start)
         self._commit_dist += cfg.forward_speed * self._dt

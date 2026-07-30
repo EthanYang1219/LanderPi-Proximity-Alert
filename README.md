@@ -2,7 +2,7 @@
 
 A LiDAR-based Advanced Driver Assistance System (ADAS) proximity alert for a mobile robot, developed as part of an undergraduate research project at the University of Prince Edward Island (UPEI) under the supervision of Dr. Bingxian Mu.
 
-The system drives a mobile robot from a fixed point A to point B, reactively stopping and turning away from obstacles detected by an onboard LiDAR, while logging transit time and odometry drift across four surface materials: granite, concrete, wood, and metal.
+The system drives a mobile robot from a fixed point A to point B, reactively stopping and turning away from obstacles detected by an onboard LiDAR, while logging transit time and odometry drift across five surface materials: granite, concrete, wood, metal, and plastic laminate (HPL).
 
 ## Table of contents
 
@@ -61,13 +61,14 @@ The buzzer is intentionally not wired into the current nodes — it is a separat
 │   ├── package.xml
 │   ├── setup.py / setup.cfg
 │   └── proximity_alert/
-│       ├── path_tracker.py           # Drives A -> B, reactive LiDAR obstacle avoidance
+│       ├── path_tracker.py           # Drives A -> B, reactive LiDAR obstacle avoidance, and plays the obstacle audio alert (on by default)
 │       ├── avoidance.py              # Pure, ROS-free obstacle-avoidance state machine
 │       ├── trial_logger.py           # Logs transit time, odometry distance, ground truth per trial
 │       ├── decision_logger.py        # Logs each avoidance decision to its own CSV
 │       ├── floor_test_reconcile.py   # Fills floor_test_log.csv's Time/Stop-clearance from real trial data
 │       ├── scan_trace_record.py      # Pure JSON-Lines record for one raw scan tick
-│       └── scan_trace_logger.py      # Logs every raw LiDAR scan continuously, for post-hoc miss diagnosis
+│       ├── scan_trace_logger.py      # Logs every raw LiDAR scan continuously, for post-hoc miss diagnosis
+│       └── audio_trigger.py          # Pure once-per-encounter trigger logic for the obstacle audio alert (used by path_tracker.py)
 ├── trials/                     # CSVs, gitignored (not committed) -- see below
 │   ├── floor_test_log.csv      # Hand-maintained PID/safety-distance tuning session report
 │   ├── granite.csv             # -> symlink to /home/pi/docker/tmp/trials/granite.csv
@@ -76,10 +77,10 @@ The buzzer is intentionally not wired into the current nodes — it is a separat
 └── README.md
 ```
 
-`trials/granite.csv`, `trials/decision_log.csv`, and `trials/scan_trace.jsonl` are symlinks into the container's bind-mounted shared folder (see [Three logs](#three-logs-all-on-your-computer) below) — they exist purely so all three logs show up directly in this repo's VS Code Explorer/file tree instead of requiring you to browse to `/home/pi/docker/tmp/trials/` separately. They live-update as the nodes write to them. If you log a new surface (e.g. `concrete.csv`), symlink it the same way:
+`trials/granite.csv`, `trials/decision_log.csv`, and `trials/scan_trace.jsonl` are symlinks into the container's bind-mounted shared folder (see [Three logs](#three-logs-all-on-your-computer) below) — they exist purely so all three logs show up directly in this repo's VS Code Explorer/file tree instead of requiring you to browse to `/home/pi/docker/tmp/trials/` separately. They live-update as the nodes write to them. If you log a new surface (e.g. `hpl.csv` for plastic laminate), symlink it the same way:
 
 ```bash
-ln -sf /home/pi/docker/tmp/trials/concrete.csv trials/concrete.csv
+ln -sf /home/pi/docker/tmp/trials/hpl.csv trials/hpl.csv
 ```
 
 `path_tracker.py` and `trial_logger.py` are independent ROS 2 nodes. `trial_logger.py` does not modify or depend on the internals of `path_tracker.py` — it only observes `/odom`, so either node can be developed, tested, or replaced without breaking the other.
@@ -131,7 +132,9 @@ The robot's ROS 2 stack already runs in a Docker container named `MentorPi` on t
 
    Pointing `csv_path` at `/home/ubuntu/shared/...` writes the file into the container's shared folder, which is bind-mounted to `~/docker/tmp` (i.e. `/home/pi/docker/tmp/trials/`) on the Pi — so all three logs appear in your local file manager and survive container restarts.
 
-After step 2, repeat only step 3 for future runs — you only need to rebuild when you change `path_tracker.py`/`trial_logger.py`/`decision_logger.py`/`scan_trace_logger.py`/`scan_trace_record.py` (repeat steps 1–2 each time).
+   Terminal A also plays the obstacle audio alert by default (no separate terminal needed — see [Obstacle audio alert](#obstacle-audio-alert)); pass `-p audio_alert_enabled:=false` there to disable it.
+
+After step 2, repeat only step 3 for future runs — you only need to rebuild when you change `path_tracker.py`/`trial_logger.py`/`decision_logger.py`/`scan_trace_logger.py`/`scan_trace_record.py`/`audio_trigger.py` (repeat steps 1–2 each time).
 
 ## Setup
 
@@ -147,7 +150,7 @@ Then, for each trial:
 1. Place the robot at point A on the marked track for the current surface.
 2. Place an obstacle (or rely on the track's natural endpoint) at point B.
 3. Let the robot drive. `trial_logger` detects the start automatically when the robot begins moving, and the end automatically once `path_tracker`'s obstacle stop has held for one second.
-4. When prompted in Terminal 2, read the robot's actual stop position off your tape-measure marks and enter the surface name and ground-truth distance.
+4. When prompted in Terminal 2, read the robot's actual stop position off your tape-measure marks and enter the surface name (granite/concrete/wood/metal/hpl) and ground-truth distance.
 5. Repeat for each trial and surface, pointing `csv_path` at a different file (or the same file — `trial_num` increments automatically) per surface.
 
 ## Data collected
@@ -165,8 +168,9 @@ Each row appended to the CSV represents one trial:
 | `slippage_error_m` | `odom_distance_m - ground_truth_distance_m` |
 | `slippage_pct` | Slippage error as a percentage of ground-truth distance |
 | `avoidance_events` | Count of obstacle-avoidance maneuvers `path_tracker` triggered during the trial (detected via reverse `/cmd_vel` commands, which only occur in its `AVOIDING` state). **Non-zero means this was not a clean A→B run** and should be filtered out or analyzed separately from clean-run slippage stats. |
-| `lidar_stop_range_m` | The actual LiDAR range to the closest obstacle in the forward arc at the moment the trial finalized (i.e. the real stop clearance), captured from `path_tracker`'s `/forward_min_range` topic. Useful for checking proximity-trigger accuracy against the `safety_distance` parameter and whether it varies by surface. Blank if nothing valid was in the arc at stop. |
+| `lidar_stop_range_m` | The actual LiDAR range to the closest obstacle in the forward arc at the moment the trial finalized (i.e. the real stop clearance), captured from `path_tracker`'s `/forward_min_range` topic. Useful for checking proximity-trigger accuracy against the `safety_distance` parameter and whether it varies by surface. Blank if nothing valid was in the arc at stop. **Measure `ground_truth_distance_m`/stop clearance from the LiDAR unit itself** (the rotating sensor housing), not the chassis front edge — `safety_distance` and this column are both computed against the LiDAR's own raw range, so that's the only measurement point directly comparable to them. Expect the real stop clearance to consistently undershoot the configured `safety_distance` by a few centimeters (at the defaults, `obstacle_confirm_scans=2` debounce scans at the LD19's ~10Hz rate, times `forward_speed`, accounts for ~5cm of it) — that's expected stop latency, not a measurement or code error. If your tape measurement doesn't match this logged value, that's the discrepancy worth investigating; a gap against `safety_distance` alone is not. |
 | `notes` | Freeform text entered at logging time for anything unusual observed (e.g. "motors fought each other on the turn", "oscillated near desk", "false stop") |
+| `battery_level` | Rough `High`/`Medium`/`Low` estimate captured from `/ros_robot_controller/battery` (raw millivolts) at the moment the trial finalized, assuming a 2S Li-ion pack (6.0V empty - 8.4V full). Not a precise state-of-charge reading -- just enough to flag "was the pack getting low during this session." Blank if no reading had arrived yet. |
 
 ## Refined obstacle avoidance
 
@@ -182,7 +186,7 @@ The LiDAR is reduced each scan into FRONT (+ front sub-sectors), LEFT, RIGHT, an
 
 ## Parameters
 
-**`path_tracker`** (every field is a ROS parameter; only the commonly-tuned ones are shown — see `AvoidanceConfig` in `proximity_alert/avoidance.py` for the full list)
+**`path_tracker`** (every field is a ROS parameter; only the commonly-tuned ones are shown — see `AvoidanceConfig` in `proximity_alert/avoidance.py` for the full list). This includes `heading_kp`/`heading_ki`/`heading_kd` (the heading-hold PID, [Data collected](#data-collected)'s `Kp`/`Ki`/`Kd` columns) — override per run/per surface with e.g. `--ros-args -p heading_kd:=0.2` without touching the shared defaults.
 
 | Parameter | Default | Description |
 |---|---|---|
@@ -194,10 +198,15 @@ The LiDAR is reduced each scan into FRONT (+ front sub-sectors), LEFT, RIGHT, an
 | `max_obstacle_width` | `0.50` | Above this *physical* lateral width (meters), the obstacle is "wide" (a wall) → turn, not strafe. Keyed on physical width, not angular span: at trigger range any real object subtends a large angle, so an angular-span gate would block strafing entirely. |
 | `max_cumulative_strafe` | `0.60` | Hard per-encounter lateral cap (long-wall guard), meters |
 | `turn_speed` / `turn_step_deg` / `turn_timeout` | `0.6` / `30.0` / `1.5` | Turn rate, per-turn increment, time cap (rad/s, deg, s) |
+| `turn_radius` | `0.0` | Reverse-arc radius during TURN/RECOVER, meters. Those states already command reverse + rotation together, so they trace an arc of radius `reverse_speed / turn_speed` — at legacy defaults a tight ~0.13m. Set > 0 to control that geometry directly (reverse speed becomes `turn_radius × turn_speed`): bigger = a wider, longer sweep instead of an almost-in-place pivot. `0` keeps the legacy fixed `avoid_reverse_speed` |
+| `rear_taper_zone` | `0.0` | Distance above `rear_clearance_min` over which the reverse component fades out linearly rather than snapping to zero, meters. The hard cutoff makes a turn lurch from arc to pure pivot the moment clearance runs low; a taper degrades smoothly. `0` keeps the legacy hard cutoff |
 | `max_avoid_attempts` | `3` | Failed cycles before escalating to recovery |
 | `clear_drive_duration` | `3.0` | Sustained clean-drive time that closes an encounter and resets counters, seconds |
 | `min_gap_clearance` / `min_gap_width_deg` | `0.60` / `40.0` | What counts as a usable recovery gap (robot must fit) |
 | `disable_avoidance` | `false` | Halt on any obstacle, no turn/strafe (clean go-and-stop runs) |
+| `audio_alert_enabled` | `true` | Plays `wav_path` through the USB speaker once per obstacle encounter — see [Obstacle audio alert](#obstacle-audio-alert). Set `false` to disable |
+| `wav_path` | `/home/ubuntu/shared/audio/obstacle_alert.wav` | WAV file to play (host path — see below) |
+| `alsa_device` | `plughw:2,0` | ALSA device string for the robot's USB speaker (confirmed via `aplay -l` inside the container) |
 
 Derived (computed, not configured): `max_strafe_distance = strafe_speed × strafe_timeout`; `corridor_half = robot_half_width + corridor_margin`; `clear_threshold = safety_distance + clear_margin`.
 
@@ -206,6 +215,7 @@ Derived (computed, not configured): `max_strafe_distance = strafe_speed × straf
 | Parameter | Default | Description |
 |---|---|---|
 | `csv_path` | `trial_log.csv` | Output CSV file path (point at `/home/ubuntu/shared/trials/<surface>.csv` to land on the host — see below) |
+| `surface` | `""` | Surface material logged per trial. Empty (default) infers it from `csv_path`'s filename — e.g. `.../granite.csv` → `granite` — no terminal prompt needed; set explicitly to override (e.g. a shared/misc log whose filename doesn't match the surface) |
 | `move_velocity_threshold` | `0.03` | Speed above which the robot is considered moving, m/s |
 | `stop_velocity_threshold` | `0.02` | Speed below which the robot is considered stopped, m/s |
 | `stop_confirm_duration` | `1.0` | Seconds of continuous stopped-ness before a trial is finalized |
@@ -215,6 +225,30 @@ Derived (computed, not configured): `max_strafe_distance = strafe_speed × straf
 | Parameter | Default | Description |
 |---|---|---|
 | `csv_path` | `/home/ubuntu/shared/trials/decision_log.csv` | Output CSV for the avoidance decision log (host path — see below) |
+
+### Obstacle audio alert
+
+`path_tracker` plays `wav_path` through the USB speaker (`aplay`, non-blocking) the first time an obstacle encounter enters a non-`DRIVE` state — once per `encounter_id`, not on every escalation step (strafe → turn → recover → halt) within it, and never during ordinary clear-path driving. It's on by default (`audio_alert_enabled:=true`); set `-p audio_alert_enabled:=false` to turn it off. This uses the same trigger logic (`audio_trigger.py`) as the original standalone `obstacle_audio` prototype node, now folded directly into `path_tracker` so it runs with no extra terminal — a non-blocking `aplay` call can never stall the control loop.
+
+**A WAV file must exist or nothing plays.** `aplay` is spawned non-blocking with its stderr discarded, so a missing file used to produce no visible error — the robot just silently never beeped. `path_tracker` now logs an `ERROR` at startup if `wav_path` doesn't exist. To generate a quick test beep (no dependencies, run on the Pi):
+
+```bash
+mkdir -p /home/pi/docker/tmp/audio
+python3 -c "
+import math, struct, wave
+r, d, f = 44100, 0.35, 880.0
+n = int(r*d)
+fr = b''.join(struct.pack('<h', int(32767*0.5*min(1,min(i,n-i)/(0.02*r))*math.sin(2*math.pi*f*i/r))) for i in range(n))
+w = wave.open('/home/pi/docker/tmp/audio/obstacle_alert.wav','w'); w.setnchannels(1); w.setsampwidth(2); w.setframerate(r); w.writeframes(fr); w.close()"
+```
+
+Verify it plays with the exact command the node uses:
+
+```bash
+docker exec -u ubuntu MentorPi aplay -D plughw:2,0 /home/ubuntu/shared/audio/obstacle_alert.wav
+```
+
+**To use your own dialogue clip:** drop a WAV file at `/home/pi/docker/tmp/audio/obstacle_alert.wav` on the Pi (create the `audio/` folder if it doesn't exist yet) — that's the host side of the same bind mount the CSV/JSONL logs already use, so it lands at `/home/ubuntu/shared/audio/obstacle_alert.wav` inside the container automatically, with no container restart needed. See `docs/superpowers/specs/2026-07-24-obstacle-audio-alert-design.md` for the original design (the trigger logic it describes is unchanged; only which node calls it moved).
 
 ### Three logs, all on your computer
 
@@ -241,7 +275,7 @@ It only fills Time/Stop-clearance, never fabricates Safety Distance/Speed/Kp/Ki/
 - [x] Reactive obstacle-avoidance driver (`path_tracker.py`)
 - [x] Per-trial transit time / odometry / ground-truth logging (`trial_logger.py`)
 - [ ] Re-integrate the I2C buzzer so it fires simultaneously with the obstacle-avoidance stop
-- [ ] Collect full trial sets across all four surfaces
+- [ ] Collect full trial sets across all five surfaces
 - [ ] Statistical analysis of slippage by surface (Haotian)
 - [ ] Methodology and Results sections, IEEE conference format
 

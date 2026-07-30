@@ -10,5 +10,12 @@ __pycache__/
 
 trials/
 
+# organized_data/ mirrors trials/ data as a browsable snapshot -- same reason
+# trials/ itself is excluded (live/bulky data, not source). Keep the READMEs
+# and DATA_INDEX.md tracked so the folder structure/docs survive; ignore the
+# data-file copies inside it.
+organized_data/**/*.csv
+organized_data/**/*.jsonl
+
 # Claude Code harness state (spawned-task worktrees, etc.), not project content.
 .claude/

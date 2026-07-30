@@ -22,8 +22,11 @@ avoidance_events > 0 measure something different (avoidance-affected
 slippage) than a clean run and must not be silently pooled with clean
 trials in the stats -- see avoidance_events below.
 
+Surface material is inferred automatically from the CSV filename (e.g.
+csv_path=".../granite.csv" -> surface="granite") -- override with the
+`surface` parameter if the filename doesn't match (e.g. a shared/misc log).
+
 Then, at the terminal, it prompts you for:
-    - surface material    (granite / concrete / wood / metal)
     - ground_truth_distance_m (read off your tape-measure marks by eye)
     - notes                (freeform, optional -- e.g. "motors fought each
                              other on the turn", "oscillated near desk")
@@ -34,14 +37,20 @@ manual spreadsheet wrangling.
 CSV columns:
     timestamp, surface, trial_num, transit_time_s, odom_distance_m,
     ground_truth_distance_m, slippage_error_m, slippage_pct,
-    avoidance_events, notes
+    avoidance_events, lidar_stop_range_m, notes, battery_level
 
 Topics:
     Subscribes: /odom (nav_msgs/Odometry)
     Subscribes: /cmd_vel (geometry_msgs/Twist)
+    Subscribes: /ros_robot_controller/battery (std_msgs/UInt16, raw mV) --
+                converted to a rough High/Medium/Low estimate assuming a 2S
+                Li-ion pack (6.0V empty - 8.4V full); not a precise SoC.
 
 Parameters:
     csv_path                (str,   default "trial_log.csv")
+    surface                 (str,   default "" -- inferred from csv_path's
+                                     filename, e.g. "granite.csv" -> "granite";
+                                     set explicitly to override)
     move_velocity_threshold (float, default 0.03) m/s -- above this = "moving"
     stop_velocity_threshold (float, default 0.02) m/s -- below this = "stopped"
     stop_confirm_duration   (float, default 1.0)  seconds of continuous
@@ -63,7 +72,7 @@ import rclpy
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
-from std_msgs.msg import Float32
+from std_msgs.msg import Float32, UInt16
 
 
 CSV_HEADER = [
@@ -78,7 +87,35 @@ CSV_HEADER = [
     "avoidance_events",
     "lidar_stop_range_m",
     "notes",
+    "battery_level",
 ]
+
+# /ros_robot_controller/battery publishes raw millivolts (std_msgs/UInt16),
+# not a percentage. This robot's pack is a 2S Li-ion (nominal 7.4V), so the
+# range below is a rough estimate, not a manufacturer-specified curve --
+# good enough for a High/Medium/Low bucket, not for precise SoC.
+BATTERY_MIN_MV = 6000
+BATTERY_MAX_MV = 8400
+
+# Low/Medium boundary confirmed against real hardware: the robot's own
+# low-battery beep was observed at 6952 mV, which the original 6800 mV cutoff
+# missed (classified it as "Medium"). Raised past the observed beep point so
+# that reading -- and anything at or below it -- lands in "Low".
+BATTERY_LOW_MAX_MV = 7100
+BATTERY_MEDIUM_MAX_MV = 7600
+
+
+def battery_percent(mv):
+    pct = (mv - BATTERY_MIN_MV) / (BATTERY_MAX_MV - BATTERY_MIN_MV) * 100.0
+    return max(0.0, min(100.0, pct))
+
+
+def battery_level(mv):
+    if mv < BATTERY_LOW_MAX_MV:
+        return "Low"
+    elif mv < BATTERY_MEDIUM_MAX_MV:
+        return "Medium"
+    return "High"
 
 
 class TrialLogger(Node):
@@ -86,6 +123,7 @@ class TrialLogger(Node):
         super().__init__("trial_logger")
 
         self.declare_parameter("csv_path", "trial_log.csv")
+        self.declare_parameter("surface", "")
         self.declare_parameter("move_velocity_threshold", 0.03)
         self.declare_parameter("stop_velocity_threshold", 0.02)
         self.declare_parameter("stop_confirm_duration", 1.0)
@@ -94,6 +132,15 @@ class TrialLogger(Node):
         self.move_threshold = self.get_parameter("move_velocity_threshold").value
         self.stop_threshold = self.get_parameter("stop_velocity_threshold").value
         self.stop_confirm_duration = self.get_parameter("stop_confirm_duration").value
+
+        # Surface defaults to the CSV filename (e.g. ".../granite.csv" ->
+        # "granite") -- one CSV per surface is already this project's
+        # convention, so the filename already says what's being logged;
+        # override with the `surface` param if a file doesn't follow it.
+        surface_param = self.get_parameter("surface").value
+        self.surface = surface_param or os.path.splitext(
+            os.path.basename(self.csv_path)
+        )[0]
 
         self._ensure_csv_header()
 
@@ -109,6 +156,13 @@ class TrialLogger(Node):
         # Latest forward-arc LiDAR range from path_tracker; captured at the
         # moment a trial finalizes to record the actual stop distance.
         self.last_min_range = None
+
+        self.battery_sub = self.create_subscription(
+            UInt16, "/ros_robot_controller/battery", self.battery_callback, 10
+        )
+        # Latest raw battery reading (millivolts); captured at trial-finalize
+        # time, same pattern as last_min_range.
+        self.last_battery_mv = None
 
         # State machine: "idle" -> "moving" -> trial finalized -> "idle"
         self.state = "idle"
@@ -132,7 +186,8 @@ class TrialLogger(Node):
         self.pending_trial = None
 
         self.get_logger().info(
-            f"trial_logger up. Writing to '{self.csv_path}'. "
+            f"trial_logger up. Writing to '{self.csv_path}' "
+            f"(surface='{self.surface}'). "
             "Waiting for the robot to start moving to begin a trial."
         )
 
@@ -182,6 +237,7 @@ class TrialLogger(Node):
         avoidance_events,
         lidar_stop_range_m,
         notes,
+        battery_level_str,
     ):
         self.trial_num += 1
         error = odom_distance_m - ground_truth_m
@@ -208,6 +264,7 @@ class TrialLogger(Node):
                     avoidance_events,
                     range_str,
                     notes,
+                    battery_level_str,
                 ]
             )
         if avoidance_events:
@@ -232,6 +289,9 @@ class TrialLogger(Node):
 
     def range_callback(self, msg: Float32):
         self.last_min_range = msg.data
+
+    def battery_callback(self, msg: UInt16):
+        self.last_battery_mv = msg.data
 
     def odom_callback(self, msg: Odometry):
         pos = msg.pose.pose.position
@@ -266,6 +326,7 @@ class TrialLogger(Node):
                         odom_distance_m,
                         self.avoidance_events,
                         self.last_min_range,
+                        self.last_battery_mv,
                     )
                     self.state = "idle"
                     avoid_note = (
@@ -295,6 +356,7 @@ def main(args=None):
                     odom_distance_m,
                     avoidance_events,
                     lidar_stop_range_m,
+                    battery_mv,
                 ) = node.pending_trial
                 node.pending_trial = None
                 avoid_note = (
@@ -302,13 +364,20 @@ def main(args=None):
                     if avoidance_events
                     else ""
                 )
+                if battery_mv is not None:
+                    battery_level_str = battery_level(battery_mv)
+                    battery_note = (
+                        f", battery=~{battery_percent(battery_mv):.0f}% "
+                        f"({battery_level_str})"
+                    )
+                else:
+                    battery_level_str = ""
+                    battery_note = ", battery=unknown (no reading yet)"
                 print(
                     f"\n--- Trial ready: transit_time={transit_time_s:.2f}s, "
-                    f"odom_distance={odom_distance_m:.3f}m{avoid_note} ---"
+                    f"odom_distance={odom_distance_m:.3f}m{avoid_note}"
+                    f"{battery_note} ---"
                 )
-                surface = input(
-                    "Surface material (granite/concrete/wood/metal): "
-                ).strip()
                 # Re-prompt until a valid positive number, or let the user
                 # discard the trial. Never write a bogus ground-truth value:
                 # a single wrong row silently corrupts the slippage dataset.
@@ -337,13 +406,14 @@ def main(args=None):
                         "oscillation, false stop (blank if none): "
                     ).strip()
                     node._append_row(
-                        surface,
+                        node.surface,
                         transit_time_s,
                         odom_distance_m,
                         ground_truth_m,
                         avoidance_events,
                         lidar_stop_range_m,
                         notes,
+                        battery_level_str,
                     )
     except KeyboardInterrupt:
         pass
