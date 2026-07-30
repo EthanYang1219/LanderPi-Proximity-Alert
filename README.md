@@ -190,19 +190,19 @@ The LiDAR is reduced each scan into FRONT (+ front sub-sectors), LEFT, RIGHT, an
 
 | Parameter | Default | Description |
 |---|---|---|
-| `safety_distance` | `0.30` | FRONT stop threshold, meters |
+| `safety_distance` | `0.20` | FRONT stop threshold, meters |
 | `forward_speed` | `0.50` | Constant forward speed, m/s |
 | `obstacle_confirm_scans` | `2` | Consecutive close scans required before a maneuver decision (debounce) |
-| `strafe_speed` / `strafe_timeout` | `0.25` / `1.5` | Lateral speed and per-strafe time cap (m/s, s) |
-| `strafe_side_clearance_min` | `0.30` | Side clearance required to strafe into it, meters |
-| `max_obstacle_width` | `0.50` | Above this *physical* lateral width (meters), the obstacle is "wide" (a wall) → turn, not strafe. Keyed on physical width, not angular span: at trigger range any real object subtends a large angle, so an angular-span gate would block strafing entirely. |
-| `max_cumulative_strafe` | `0.60` | Hard per-encounter lateral cap (long-wall guard), meters |
-| `turn_speed` / `turn_step_deg` / `turn_timeout` | `0.6` / `30.0` / `1.5` | Turn rate, per-turn increment, time cap (rad/s, deg, s) |
+| `strafe_speed` / `strafe_timeout` | `0.50` / `2` | Lateral speed and per-strafe time cap (m/s, s) |
+| `strafe_side_clearance_min` | `0.20` | Side clearance required to strafe into it, meters |
+| `max_obstacle_width` | `0.75` | Above this *physical* lateral width (meters), the obstacle is "wide" (a wall) → turn, not strafe. Keyed on physical width, not angular span: at trigger range any real object subtends a large angle, so an angular-span gate would block strafing entirely. |
+| `max_cumulative_strafe` | `1.25` | Hard per-encounter lateral cap (long-wall guard), meters |
+| `turn_speed` / `turn_step_deg` / `turn_timeout` | `0.75` / `30.0` / `1.5` | Turn rate, per-turn increment, time cap (rad/s, deg, s) |
 | `turn_radius` | `0.0` | Reverse-arc radius during TURN/RECOVER, meters. Those states already command reverse + rotation together, so they trace an arc of radius `reverse_speed / turn_speed` — at legacy defaults a tight ~0.13m. Set > 0 to control that geometry directly (reverse speed becomes `turn_radius × turn_speed`): bigger = a wider, longer sweep instead of an almost-in-place pivot. `0` keeps the legacy fixed `avoid_reverse_speed` |
 | `rear_taper_zone` | `0.0` | Distance above `rear_clearance_min` over which the reverse component fades out linearly rather than snapping to zero, meters. The hard cutoff makes a turn lurch from arc to pure pivot the moment clearance runs low; a taper degrades smoothly. `0` keeps the legacy hard cutoff |
 | `max_avoid_attempts` | `3` | Failed cycles before escalating to recovery |
 | `clear_drive_duration` | `3.0` | Sustained clean-drive time that closes an encounter and resets counters, seconds |
-| `min_gap_clearance` / `min_gap_width_deg` | `0.60` / `40.0` | What counts as a usable recovery gap (robot must fit) |
+| `min_gap_clearance` / `min_gap_width_deg` | `0.50` / `40.0` | What counts as a usable recovery gap (robot must fit) |
 | `disable_avoidance` | `false` | Halt on any obstacle, no turn/strafe (clean go-and-stop runs) |
 | `audio_alert_enabled` | `true` | Plays `wav_path` through the USB speaker once per obstacle encounter — see [Obstacle audio alert](#obstacle-audio-alert). Set `false` to disable |
 | `wav_path` | `/home/ubuntu/shared/audio/obstacle_alert.wav` | WAV file to play (host path — see below) |
