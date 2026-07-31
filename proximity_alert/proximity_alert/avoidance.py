@@ -51,12 +51,12 @@ class AvoidanceConfig: # All measurements are in meters or m/s for the speed. Al
     rear_window_deg: float = 60.0          # Angular width of the REAR clearance window (centered behind). Wider = more of the back considered when reversing/recovering
     robot_half_width: float = 0.085        # Physical half-width of the chassis. Sets the required strafe/pass clearance; too small risks clipping an obstacle, too big blocks strafes that would actually fit
     corridor_margin: float = 0.05          # Extra clearance added beyond robot_half_width (-> corridor_half). Bigger = wider safety buffer on every strafe/pass, but rejects more strafes as "too far"
-    forward_speed: float = 0.50            # Constant driving speed, m/s. Higher = faster runs but less reaction time before safety_distance is reached
-    strafe_speed: float = 0.50             # Lateral (sideways) speed during STRAFE, m/s. Higher = clears an obstacle faster but overshoots more before the next scan reacts
+    forward_speed: float = 0.20            # Constant driving speed, m/s. MUST match the speed actually delivered, not just the value commanded: path_tracker publishes to /cmd_vel, which the vendor's app-control node clamps to +/-0.20 m/s before it ever reaches the motors or /odom -- see README's "Speed clamp" note. Every distance-based timeout below (max_drive_past_distance, recover_commit_distance, cumulative_strafe accounting) integrates this value against real elapsed time, so setting it higher than what's delivered makes those counters overestimate real distance travelled and give up early. Higher = faster runs but less reaction time before safety_distance is reached
+    strafe_speed: float = 0.20             # Lateral (sideways) speed during STRAFE, m/s. Same delivered-speed caveat as forward_speed -- this also passes through the /cmd_vel clamp. Higher = clears an obstacle faster but overshoots more before the next scan reacts
     strafe_timeout: float = 2            # Max seconds to hold a STRAFE before giving up and re-assessing. Also sets max_strafe_distance = strafe_speed * strafe_timeout
     strafe_side_clearance_min: float = 0.20  # Minimum LEFT/RIGHT clearance required to permit a strafe that direction. Higher = more conservative, refuses strafes into tight gaps
     max_obstacle_width: float = 0.75      # Max physical lateral width (y_hi - y_lo) still considered "narrow enough to strafe past". Above this it's treated as a wall -> TURN instead
-    max_cumulative_strafe: float = 1.25     # Hard cap on total lateral distance strafed within one encounter (guards against creeping sideways along a long wall). Must stay above strafe_speed * strafe_timeout (max_strafe_distance, currently 0.75) or the strafe_ok cap check fails on the very first attempt and STRAFE becomes unreachable. Lower = escalates to TURN sooner, but never below max_strafe_distance
+    max_cumulative_strafe: float = 1.25     # Hard cap on total lateral distance strafed within one encounter (guards against creeping sideways along a long wall). Must stay above strafe_speed * strafe_timeout (max_strafe_distance, currently 0.40) or the strafe_ok cap check fails on the very first attempt and STRAFE becomes unreachable. Lower = escalates to TURN sooner, but never below max_strafe_distance
     turn_speed: float = 0.75                # Angular speed while turning, rad/s. Higher = faster turns but more overshoot past turn_step_deg
     turn_step_deg: float = 30.0            # Heading change commanded per TURN attempt. Bigger = clears wider obstacles in one attempt but deviates further from goal heading
     turn_timeout: float = 1.5              # Max seconds to hold a TURN before moving on to DRIVE_PAST regardless of whether turn_step_deg was reached
@@ -72,6 +72,13 @@ class AvoidanceConfig: # All measurements are in meters or m/s for the speed. Al
     heading_kd: float = 0.2               # Heading-hold PID derivative gain. Higher = damps oscillation from kp, but amplifies noise in the heading error, used to tune overshooting
     heading_max_correction: float = 0.3    # Clamp on the PID's angular_z output, rad/s. Lower = gentler heading correction, may not keep up with a large heading error
     heading_tol_deg: float = 5.0           # Heading error considered "on target" (used by TURN/RECOVER completion checks). Smaller = stricter alignment before proceeding, may hunt near the tolerance edge
+    # --- Cross-track (return-to-line) correction. Applied as a mecanum crab in DRIVE only; see nav_utils.lateral_correction. Every default below is DERIVED, not guessed -- the formula is given so they can be re-derived rather than fiddled with. All assume forward_speed's actual delivered value of 0.20 m/s above -- RESCALE these together with forward_speed if that ever changes (e.g. once the /cmd_vel clamp is lifted), per the formula in each comment
+    cross_track_kp: float = 0.6            # Gain from cross-track error (m) to crab velocity (m/s). Derived from the distance you want re-centering to take, not a time: e_dot = -kp*e settles 95% in 3 time constants, so kp = 3*v/D. At v=0.20 m/s and D=1.0 m of travel, kp = 0.6. RESCALE THIS IF forward_speed CHANGES -- holding kp fixed while raising speed re-centers over a proportionally longer distance. 0.0 disables the correction entirely (exact pre-feature behavior)
+    cross_track_max_speed: float = 0.10    # Clamp on the crab velocity, m/s. Derived from the largest crab angle you will accept: v_lat = tan(angle) * forward_speed, and past ~27 deg the LiDAR's forward arc no longer covers the direction the robot is actually travelling. At v=0.20 m/s, 27 deg gives 0.10. Higher = re-centers sooner but drives increasingly sideways-on
+    cross_track_deadband: float = 0.03     # Cross-track error below which the correction is exactly zero, m. Set from the smallest offset you can actually measure on the floor (~1 cm ruler-tip) times a small factor -- correcting below your own measurement resolution just chatters. Higher = settles to a wider band around the line and holds it more quietly
+    cross_track_ramp_time: float = 0.3     # Seconds to fade the crab in after a maneuver hands back to DRIVE. Derived from the chassis acceleration limit in the platform's own ekf.yaml (1.3 m/s^2): reaching 0.10 m/s needs >= 0.077 s, rounded up for margin. Prevents a step from 0 to full crab in a single tick right as the robot clears an obstacle. 0 = engage at full strength immediately
+    cross_track_tolerance: float = 0.05    # How close to the line counts as "on it" for the arrival centering phase, m. After covering target_distance the robot stops driving forward and keeps crabbing until within this band. Larger = accepts a bigger final offset and finishes sooner. 0.0 disables centering, so arrival latches the instant the distance is covered
+    centering_timeout: float = 5.0         # Max seconds to spend centering before declaring arrival regardless of remaining offset. Guarantees the run terminates when the correction is gated off or the flank is blocked; the leftover offset is then measured on the floor instead
     max_avoid_attempts: int = 3            # Consecutive failed STRAFE/TURN cycles before escalating to RECOVER. Lower = escalates sooner, higher = keeps retrying the normal ladder longer
     clear_drive_duration: float = 3.0      # Seconds of sustained clean driving before an encounter is considered over and its counters (cumulative_strafe, attempt count) reset
     recover_backup_clearance: float = 0.50 # (Currently unused by _recover, which keys off rear_clearance_min) Intended rear clearance required before backing up during recovery
@@ -124,6 +131,8 @@ class AvoidanceController:
         self._recover_phase = "orient"
         self._recover_target = 0.0
         self._commit_dist = 0.0
+        self._lateral_correction = 0.0
+        self._drive_since = None
         self._prev_now = None
         self._pid = HeadingPID(config.heading_kp, config.heading_ki,
                                config.heading_kd, config.heading_max_correction)
@@ -138,6 +147,69 @@ class AvoidanceController:
     def set_goal_heading(self, yaw):
         self.goal_heading = yaw
         self.target_heading = yaw
+
+    def set_lateral_correction(self, v_lat):
+        """Crab velocity requested by path_tracker to return to the A->B line.
+
+        Pushed in every tick BEFORE step(); consulted only while DRIVE is
+        actually driving. Deliberately a separate channel from goal_heading:
+        the maneuver states (STRAFE/TURN/DRIVE_PAST/RECOVER) must never see
+        it, because a line-correction firing mid-strafe would fight the very
+        maneuver that is trying to get around the obstacle.
+
+        Defaults to 0.0 and stays there unless something calls this, so a
+        controller driven without it -- every test in
+        test_avoidance_controller.py, and any caller predating this feature
+        -- behaves exactly as before.
+        """
+        self._lateral_correction = v_lat
+
+    def _gated_lateral(self):
+        """The requested crab, suppressed when it would close on the obstacle
+        we just avoided.
+
+        A completed STRAFE is the dangerous case, and it is not an edge
+        case -- it is the normal one. _strafe commands linear_x = 0.0, so a
+        strafe makes NO forward progress: it ends the instant the front arc
+        clears, with the robot exactly level with the obstacle and offset by
+        the bare minimum that uncovered its front. Crabbing straight back
+        then drives into the obstacle's flank. Worse, it is a stable limit
+        cycle -- strafe out, front clears, crab back, front blocks, strafe
+        out -- so the run hangs rather than merely bumping.
+
+        The gate is asymmetric, because the two directions are not equally
+        risky. Moving AWAY from the avoided side can only increase
+        clearance, so it is never blocked. Moving TOWARD it requires that
+        side's live LiDAR clearance to exceed pass_clearance -- the same
+        threshold DRIVE_PAST already uses to decide it is safely past an
+        obstacle.
+
+        Gating on measured flank clearance rather than a fixed "drive
+        forward N metres first" is what makes this self-timing: it waits
+        exactly as long as the obstacle actually needs, which is longer for
+        a wall than for a cone, where any fixed N would be wrong for one of
+        them. Once the encounter closes (clear_drive_duration of clean
+        driving) there is no remembered obstacle left to protect, and the
+        correction runs unrestricted.
+        """
+        v = self._lateral_correction
+        if v == 0.0 or not self._in_encounter or self._locked_dir == 0.0:
+            return v
+        # We dodged toward _locked_dir, so the obstacle is on the far side.
+        obstacle_is_left = self._locked_dir < 0.0
+        closing = (v > 0.0) if obstacle_is_left else (v < 0.0)
+        if not closing:
+            return v
+        flank = self._s["left"] if obstacle_is_left else self._s["right"]
+        return v if flank >= self.config.pass_clearance else 0.0
+
+    def _drive_lateral(self):
+        """Gated crab, faded in over cross_track_ramp_time after entering DRIVE."""
+        v = self._gated_lateral()
+        ramp = self.config.cross_track_ramp_time
+        if v == 0.0 or ramp <= 0.0 or self._drive_since is None:
+            return v
+        return v * min(1.0, (self._now - self._drive_since) / ramp)
 
     # ---------- tick ----------
 
@@ -170,6 +242,8 @@ class AvoidanceController:
 
     def _drive(self):
         s, now, cfg = self._s, self._now, self.config
+        if self._drive_since is None:
+            self._drive_since = now
         blocked = self._o is not None and s["front"] <= cfg.safety_distance
         if blocked:
             self._clean_drive_since = None
@@ -177,6 +251,8 @@ class AvoidanceController:
             if self._confirm_count >= cfg.obstacle_confirm_scans:
                 self._confirm_count = 0
                 return self._assess()
+            # Confirming a possible obstacle -- hold still, and do NOT crab:
+            # the whole point of this tick is to not move while deciding.
             return ControllerOutput(0.0, 0.0, 0.0, DRIVE, None)  # confirming
         self._confirm_count = 0
         if self._clean_drive_since is None:
@@ -186,10 +262,12 @@ class AvoidanceController:
             self.consecutive_avoid_count = 0
             self.cumulative_strafe = 0.0
             self.has_recovered_this_encounter = False
-        return ControllerOutput(cfg.forward_speed, 0.0, self._hold(self.goal_heading), DRIVE, None)
+        return ControllerOutput(cfg.forward_speed, self._drive_lateral(),
+                                self._hold(self.goal_heading), DRIVE, None)
 
     def _assess(self):
         s, o, cfg = self._s, self._o, self.config
+        self._drive_since = None   # leaving DRIVE; the crab ramp restarts on return
         if not self._in_encounter:
             self.encounter_id += 1
             self._in_encounter = True
@@ -372,8 +450,14 @@ class AvoidanceController:
         self._clear_since = None
         self.target_heading = self.goal_heading
         self._pid.reset()
+        # Restart the crab ramp here, not on the next _drive() tick: this is
+        # the exact moment the robot is furthest off the line and least
+        # clear of the obstacle, so the correction must fade in from zero
+        # rather than step to full strength.
+        self._drive_since = self._now
         rec = self._record(DRIVE, outcome, 0.0, outcome, duration)
-        return ControllerOutput(self.config.forward_speed, 0.0, self._hold(self.goal_heading), DRIVE, rec)
+        return ControllerOutput(self.config.forward_speed, self._drive_lateral(),
+                                self._hold(self.goal_heading), DRIVE, rec)
 
     # ---------- record ----------
 

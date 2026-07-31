@@ -107,3 +107,81 @@ def test_odom_freshness_tracked():
     rclpy.shutdown()
     assert stale_before is True     # nothing received yet
     assert stale_after is False
+
+
+# --- path-frame tracking and the crab correction it feeds ---
+
+def _at_heading_zero(node):
+    """Latch the A->B line as +x, so along-track is x and cross-track is y."""
+    node.odom_callback(_odom_at(0.0, 0.0))
+    return node
+
+
+def test_tracks_along_and_cross_track_from_odom():
+    rclpy.init()
+    node = _at_heading_zero(PathTracker())
+    node.odom_callback(_odom_at(1.2, 0.4))
+    along, cross = node.along_track, node.cross_track
+    node.destroy_node()
+    rclpy.shutdown()
+    assert along == pytest.approx(1.2)
+    assert cross == pytest.approx(0.4)      # +y is left of the line
+
+
+def test_along_track_unaffected_by_lateral_drift():
+    rclpy.init()
+    node = _at_heading_zero(PathTracker())
+    node.odom_callback(_odom_at(1.2, 0.0))
+    straight = node.along_track
+    node.odom_callback(_odom_at(1.2, -0.7))
+    drifted = node.along_track
+    node.destroy_node()
+    rclpy.shutdown()
+    assert straight == pytest.approx(drifted)
+
+
+def test_correction_pushed_to_controller_with_correcting_sign():
+    rclpy.init()
+    node = _at_heading_zero(PathTracker())
+    node.odom_callback(_odom_at(1.0, 0.4))       # drifted left
+    left_drift = node.controller._lateral_correction
+    node.odom_callback(_odom_at(1.0, -0.4))      # drifted right
+    right_drift = node.controller._lateral_correction
+    node.destroy_node()
+    rclpy.shutdown()
+    assert left_drift < 0.0                      # crab right, back to the line
+    assert right_drift > 0.0                     # crab left
+
+
+def test_no_correction_requested_while_on_the_line():
+    rclpy.init()
+    node = _at_heading_zero(PathTracker())
+    node.odom_callback(_odom_at(3.0, 0.0))
+    v = node.controller._lateral_correction
+    node.destroy_node()
+    rclpy.shutdown()
+    assert v == 0.0
+
+
+def test_correction_respects_the_configured_clamp():
+    rclpy.init()
+    node = _at_heading_zero(PathTracker())
+    node.odom_callback(_odom_at(1.0, 5.0))       # absurdly far off line
+    v, limit = node.controller._lateral_correction, node.config.cross_track_max_speed
+    node.destroy_node()
+    rclpy.shutdown()
+    assert abs(v) == pytest.approx(limit)
+
+
+def test_start_position_latches_the_line_not_just_the_origin():
+    # The line is (start_pos, goal_heading). Starting away from the odom
+    # origin must not make the robot think it is already off the line.
+    rclpy.init()
+    node = PathTracker()
+    node.odom_callback(_odom_at(10.0, -4.0))     # first fix: this is point A
+    node.odom_callback(_odom_at(11.0, -4.0))     # 1 m straight down +x
+    along, cross = node.along_track, node.cross_track
+    node.destroy_node()
+    rclpy.shutdown()
+    assert along == pytest.approx(1.0)
+    assert cross == pytest.approx(0.0)

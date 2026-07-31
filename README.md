@@ -71,6 +71,7 @@ The buzzer is intentionally not wired into the current nodes — it is a separat
 │       └── audio_trigger.py          # Pure once-per-encounter trigger logic for the obstacle audio alert (used by path_tracker.py)
 ├── trials/                     # CSVs, gitignored (not committed) -- see below
 │   ├── floor_test_log.csv      # Hand-maintained PID/safety-distance tuning session report
+│   ├── lateral_offset_trials.csv  # Hand-maintained return-to-line (cross-track) trial report
 │   ├── granite.csv             # -> symlink to /home/pi/docker/tmp/trials/granite.csv
 │   ├── decision_log.csv        # -> symlink to /home/pi/docker/tmp/trials/decision_log.csv
 │   └── scan_trace.jsonl        # -> symlink to /home/pi/docker/tmp/trials/scan_trace.jsonl
@@ -138,6 +139,8 @@ The robot's ROS 2 stack already runs in a Docker container named `MentorPi` on t
 
    Terminal A also plays the obstacle audio alert by default (no separate terminal needed — see [Obstacle audio alert](#obstacle-audio-alert)); pass `-p audio_alert_enabled:=false` there to disable it.
 
+   **Running with `target_distance` set to test the return-to-line correction?** No node logs the lateral (cross-track) offset automatically — measure it against your taped A→B line once the robot stops, and record it by hand in [`trials/lateral_offset_trials.csv`](trials/lateral_offset_trials.csv) (see [Lateral offset trials](#lateral-offset-trials-lateral_offset_trialscsv) below).
+
 After step 2, repeat only step 3 for future runs — you only need to rebuild when you change `path_tracker.py`/`trial_logger.py`/`decision_logger.py`/`scan_trace_logger.py`/`scan_trace_record.py`/`audio_trigger.py` (repeat steps 1–2 each time).
 
 ## Setup
@@ -195,9 +198,9 @@ The LiDAR is reduced each scan into FRONT (+ front sub-sectors), LEFT, RIGHT, an
 | Parameter | Default | Description |
 |---|---|---|
 | `safety_distance` | `0.20` | FRONT stop threshold, meters |
-| `forward_speed` | `0.50` | Constant forward speed, m/s |
+| `forward_speed` | `0.20` | Constant forward speed, m/s. Set to match what `/cmd_vel` actually delivers (see "Speed clamp" below), not an aspirational value — every distance-based timeout in this table (`max_drive_past_distance`, `recover_commit_distance`, `max_cumulative_strafe`) is `speed × elapsed_time`, so a mismatch here makes those give up before covering their configured real distance |
 | `obstacle_confirm_scans` | `2` | Consecutive close scans required before a maneuver decision (debounce) |
-| `strafe_speed` / `strafe_timeout` | `0.50` / `2` | Lateral speed and per-strafe time cap (m/s, s) |
+| `strafe_speed` / `strafe_timeout` | `0.20` / `2` | Lateral speed and per-strafe time cap (m/s, s). `strafe_speed` is subject to the same `/cmd_vel` clamp as `forward_speed` |
 | `strafe_side_clearance_min` | `0.20` | Side clearance required to strafe into it, meters |
 | `max_obstacle_width` | `0.75` | Above this *physical* lateral width (meters), the obstacle is "wide" (a wall) → turn, not strafe. Keyed on physical width, not angular span: at trigger range any real object subtends a large angle, so an angular-span gate would block strafing entirely. |
 | `max_cumulative_strafe` | `1.25` | Hard per-encounter lateral cap (long-wall guard), meters |
@@ -208,13 +211,58 @@ The LiDAR is reduced each scan into FRONT (+ front sub-sectors), LEFT, RIGHT, an
 | `clear_drive_duration` | `3.0` | Sustained clean-drive time that closes an encounter and resets counters, seconds |
 | `min_gap_clearance` / `min_gap_width_deg` | `0.50` / `40.0` | What counts as a usable recovery gap (robot must fit) |
 | `disable_avoidance` | `false` | Halt on any obstacle, no turn/strafe (clean go-and-stop runs) |
-| `target_distance` | `0.0` | Straight-line distance from the start position, in meters, after which the robot stops and reports `arrived_target_distance`. `0.0` disables — no stop condition and no odom watchdog, exactly as before this parameter existed (distance tracking itself still runs internally either way; nothing consumes it when disabled). Arrival is deferred until the avoidance state machine is back in `DRIVE`, so a strafe or turn finishes before the stop — this can cost real overshoot, up to roughly a metre if a full maneuver ladder (strafe, then turn, then drive-past) runs before DRIVE is reached again |
+| `target_distance` | `0.0` | Distance **along the A→B line** (the projection, not straight-line displacement) after which the robot stops and reports `arrived_target_distance`. `0.0` disables — no stop condition and no odom watchdog, exactly as before this parameter existed (distance tracking itself still runs internally either way; nothing consumes it when disabled). Arrival is deferred until the avoidance state machine is back in `DRIVE`, so a strafe or turn finishes before the stop — this can cost real overshoot, up to roughly a metre if a full maneuver ladder (strafe, then turn, then drive-past) runs before DRIVE is reached again |
+| `cross_track_kp` | `0.6` | Gain from cross-track error (m) to crab velocity (m/s) for the return-to-line correction. Derived from the *distance* you want re-centering to take, not a time: `ė = -kp·e` settles 95% in 3 time constants, so **`kp = 3v/D`** — at the delivered `v = 0.20` m/s and `D = 1.0` m, `kp = 0.6`. **Rescale if `forward_speed` changes**, or re-centering stretches over a proportionally longer distance. `0.0` disables the correction entirely |
+| `cross_track_max_speed` | `0.10` | Crab velocity clamp, m/s. Derived from the largest acceptable crab angle: `v_lat = tan(angle) × forward_speed`; past ~27° the LiDAR's forward arc stops covering the direction the robot is actually travelling. Higher = re-centers sooner but drives increasingly sideways-on |
+| `cross_track_deadband` | `0.03` | Offset below which the correction is exactly zero, meters. Set from the smallest offset you can actually measure on the floor (~1 cm ruler-tip) times a small factor — correcting below your own measurement resolution just chatters |
+| `cross_track_ramp_time` | `0.3` | Seconds to fade the crab in after a maneuver hands back to `DRIVE`. Derived from the chassis acceleration limit in the platform's own `ekf.yaml` (1.3 m/s²): reaching 0.10 m/s needs ≥ 0.077 s, rounded up for margin. `0` = full strength immediately |
+| `cross_track_tolerance` | `0.05` | How close to the line counts as "on it" for the arrival centering phase, meters. After covering `target_distance` the robot stops driving forward and keeps crabbing until within this band, then reports `arrived_target_distance`. `0.0` disables centering, so arrival latches the instant the distance is covered |
+| `centering_timeout` | `5.0` | Max seconds spent centering before declaring arrival regardless of remaining offset. Guarantees termination when the correction is gated off or a flank is blocked; the leftover offset is then measured on the floor rather than asserted by the robot |
 | `odom_timeout_sec` | `1.0` | Odometry watchdog, seconds. If `target_distance` is set and no `/odom` message arrives within this window, the robot stops and reports `stopped_odom_fault` rather than driving on a stale distance estimate. Ignored entirely when `target_distance` is `0.0` |
 | `audio_alert_enabled` | `true` | Plays `wav_path` through the USB speaker once per obstacle encounter — see [Obstacle audio alert](#obstacle-audio-alert). Set `false` to disable |
 | `wav_path` | `/home/ubuntu/shared/audio/obstacle_alert.wav` | WAV file to play (host path — see below) |
 | `alsa_device` | `plughw:2,0` | ALSA device string for the robot's USB speaker (confirmed via `aplay -l` inside the container) |
 
 Derived (computed, not configured): `max_strafe_distance = strafe_speed × strafe_timeout`; `corridor_half = robot_half_width + corridor_margin`; `clear_threshold = safety_distance + clear_margin`.
+
+### Speed clamp — why `forward_speed`/`strafe_speed` default to 0.20, not 0.50
+
+`path_tracker` publishes to `/cmd_vel`. On this platform that topic is read by
+the vendor's phone-app control node (`odom_publisher_node.py`), which clamps
+`linear.x`/`linear.y` to **±0.20 m/s** before the command reaches either the
+motors or `/odom` — a sensible limit for manual driving, but it applies to
+every publisher on that topic, `path_tracker` included. Every other
+autonomous node on this robot (`lidar_app`, `line_following`,
+`object_tracking`, etc.) avoids it by publishing to `/controller/cmd_vel`
+instead.
+
+Confirmed on hardware, not just read from the driver source: a `target_distance:=1.0`
+run's own log —
+
+```
+[INFO] path_tracker started: forward_speed=0.5m/s ... target_distance=1.0
+[WARN] No fresh scan within scan_timeout; holding.   (x3, ~1s apart, ~2.16s of startup)
+[INFO] Target distance 1.00 m reached (along-track 1.01 m, final offset +0.011 m) -- stopping.
+```
+
+— took 7.57 s end to end. Subtracting the ~2.16 s scan warm-up leaves ≤5.41 s
+to cover 1.01 m: **≥0.187 m/s actual**, against an expected 2.00 s if the
+configured 0.50 m/s were really reaching the motors — a 3.4 second gap,
+independently corroborated by a tape-and-stopwatch trial (~100 cm in 5.7 s,
+0.175 m/s).
+
+**Fixed by aligning the config to reality (`forward_speed`/`strafe_speed` set to
+`0.20`), not by switching topics.** Every distance-based counter in the
+controller — `_drive_past_dist` vs. `max_drive_past_distance`, `_commit_dist`
+vs. `recover_commit_distance`, `cumulative_strafe` vs. `max_cumulative_strafe`
+— is `configured_speed × elapsed_time`. With the old `0.50` default those all
+overestimated real distance travelled by ~2.5×, so e.g. `DRIVE_PAST` was
+giving up after ~32 cm of *real* travel while believing it had driven 80 cm —
+often not enough to actually clear an obstacle. Switching to
+`/controller/cmd_vel` instead would fix the clamp but make the robot 2.5×
+faster with no watchdog on the platform, invalidate every trial logged so
+far, and need a fresh re-tune; that's left as a deliberate, separate future
+change if higher speed is ever wanted.
 
 ### Arrival status (`/path_tracker/status`)
 
@@ -224,10 +272,59 @@ control tick, reporting what is currently governing the robot:
 | Value | Meaning |
 |---|---|
 | `driving` | Driving forward, or mid-avoidance-maneuver |
-| `arrived_target_distance` | `target_distance` reached while in `DRIVE`; stopped and latched |
+| `centering` | Along-track distance is covered, but the robot is still further than `cross_track_tolerance` off the A→B line. Forward motion has stopped; it is crabbing sideways onto the line. Ends in `arrived_target_distance` either on reaching the line or at `centering_timeout` |
+| `arrived_target_distance` | `target_distance` reached while in `DRIVE` (and centering finished); stopped and latched |
 | `arrived_obstacle` | The avoidance state machine reached `HALT` — it ran out of options. Note this is recoverable: if the obstacle is removed and the path stays clear, it returns to `driving` |
 | `stopped_odom_fault` | `/odom` went stale while `target_distance` was set; stopped as a precaution |
 | `stopped_scan_fault` | The scan-side counterpart to `stopped_odom_fault`: no fresh LiDAR scan within `scan_timeout`, so the node holds rather than driving blind. Never reported while an arrival is already latched — `arrived_target_distance` takes priority, so a LiDAR dropout after arrival still reports arrived |
+
+### Return-to-line correction — and what it cannot do
+
+Holding the goal *heading* was never enough to stay on the A→B line. A strafe
+leaves the robot pointing the right way but bodily offset, so before this
+correction existed it would clear an obstacle and then drive on **parallel to
+the original line, permanently offset**. The fix crabs it back: a `linear.y`
+command proportional to cross-track error, applied only in `DRIVE`.
+
+Crab, not steer, because the chassis is mecanum. Stanley, Pure Pursuit and
+line-of-sight guidance all exist to solve this on car-like bases that *cannot*
+move sideways; their machinery (lookahead, `atan(k·e/v)`, curvature limits) is
+there to turn lateral error into a steering angle without oscillating. This
+robot can move sideways directly — and lateral strafe is the one motion the
+platform does cleanly, since pure rotation hits the documented vendor
+kinematics quirk. Crabbing also keeps the LiDAR pointed down the path, so the
+forward-arc sectors keep meaning what the avoidance machine was tuned for.
+The closed loop is a plain first-order lag (`ė = -kp·e`): exponential decay,
+no overshoot for any `kp > 0`, and saturation only slows it.
+
+**The correction never closes on the obstacle it just avoided.** A strafe
+commands `linear_x = 0`, so it makes *no* forward progress — it ends with the
+robot level with the obstacle, offset by the bare minimum that uncovered its
+front arc. Crabbing straight back would drive into its flank, and worse, form
+a stable limit cycle (strafe out → front clears → crab back → front blocks →
+strafe out) that hangs the run. So the gate is asymmetric: moving *away* from
+the avoided side is never blocked, while moving *toward* it requires that
+side's live LiDAR clearance to exceed `pass_clearance`. Gating on measured
+clearance rather than "drive forward N metres first" makes it self-timing —
+it waits as long as the obstacle actually needs, which differs for a wall
+versus a cone.
+
+> **Scope limit — this corrects commanded displacement, not slip.**
+> `/odom`'s x/y on this platform is an **open-loop integral of commanded
+> velocity**: there are no wheel encoders, and the EKF's only configured
+> exteroceptive x/y source (`odom1: odom_rf2o`, laser odometry) is **not
+> running** — 0 publishers, so `odom0` contributes velocities only. The
+> correction therefore undoes lateral displacement the robot *commanded* —
+> which is exactly what a strafe-based avoidance maneuver produces, and the
+> bug this was written for — but it **cannot see wheel slip or dead-reckoning
+> drift**. If a strafe slips, odom still reports a perfect strafe and the
+> robot will happily "re-center" onto a line that has itself drifted. Yaw is
+> genuinely EKF-fused with the IMU and is trustworthy; position is not.
+> Accuracy degrades with distance and with the number of maneuvers.
+> **True path following requires an external position source** — starting the
+> rf2o laser-odometry node, or equivalent. Measure the final offset on the
+> floor (`centering` reports what the robot *believes*); don't take the
+> robot's own number as ground truth.
 
 **One `path_tracker` process per trial.** Arrival latches permanently — once
 `arrived_target_distance` is reached the node stays stopped and will not
@@ -255,6 +352,23 @@ later "trial start" moment. Place the robot at point A **first**, then launch
 | Parameter | Default | Description |
 |---|---|---|
 | `csv_path` | `/home/ubuntu/shared/trials/decision_log.csv` | Output CSV for the avoidance decision log (host path — see below) |
+
+### Lateral offset trials (`lateral_offset_trials.csv`)
+
+No node measures ground-truth cross-track offset — it can only ever be read off a tape measure on the floor, so [`trials/lateral_offset_trials.csv`](trials/lateral_offset_trials.csv) is a hand-maintained sheet, same pattern as `floor_test_log.csv` (header row, one row per session, blank cells you fill in after each run — not written by any ROS node).
+
+| Column | Fill in with |
+|---|---|
+| `Date and Session #` | Same convention as the other sheets |
+| `Target Distance (m)` / `± Target Distance Uncertainity (m)` | The `target_distance` you ran with, and your tape/ruler uncertainty |
+| `Forward Speed (m/s)` / `± Speed Uncertainity (m/s)` | Pre-filled `0.20` — the real delivered speed, see [Speed clamp](#speed-clamp--why-forward_speedstrafe_speed-default-to-020-not-050) |
+| `Cross Track Kp` / `Max Speed (m/s)` / `Tolerance (m)` | The `cross_track_*` values that run used — pre-filled with the shipped defaults so each row records exactly which tuning produced its result, useful once you start varying them |
+| `Along-Track Stop Distance (m)` | Where it actually stopped along the tape, checked against `Target Distance` |
+| `Lateral Offset at Stop (m)` / `± Lateral Offset Uncertainity (m)` | **The measurement this sheet exists for** — sideways offset from the taped A→B line at the moment it stopped. Pick a left/right sign convention and note it consistently |
+| `Obstacle Side (Left/Right)` | Which side you placed the obstacle / which way it dodged — lets you check later whether the correction converges the same from both directions |
+| `Measurement Method`, `Surface Type`, `Obstacle Type` | Same as the other sheets |
+| `Centering Outcome` | `Completed`, `Timed Out`, or `Not Triggered` — reflects the `driving` → `centering` → `arrived_target_distance` sequence on `/path_tracker/status` (see [Arrival status](#arrival-status-path_trackerstatus)) |
+| `Notes`, `Bugs/Issues`, `Battery level` | Same as the other sheets |
 
 ### Obstacle audio alert
 

@@ -258,3 +258,147 @@ def test_taper_does_not_exceed_full_speed_with_open_rear():
                rear_clearance_min=0.25, rear_taper_zone=0.20)
     out = _turning(cfg, rear=float("inf"))
     assert math.isclose(out.linear_x, -0.375, rel_tol=1e-9)
+
+
+# --- cross-track (return-to-line) crab correction ---
+
+def test_no_crab_unless_asked():
+    # Regression guard: a controller nobody calls set_lateral_correction on
+    # must behave exactly as it did before the feature existed.
+    c = AvoidanceController(_cfg())
+    c.set_goal_heading(0.0)
+    out = c.step(_sectors(), None, None, 0.0, 0.0)
+    assert out.linear_y == 0.0
+
+
+def test_crab_applied_while_driving():
+    c = AvoidanceController(_cfg(cross_track_ramp_time=0.0))
+    c.set_goal_heading(0.0)
+    c.set_lateral_correction(-0.10)
+    out = c.step(_sectors(), None, None, 0.0, 0.0)
+    assert out.state == "DRIVE"
+    assert out.linear_y == -0.10
+    assert out.linear_x > 0.0        # still driving forward, not just sliding
+
+
+def test_crab_does_not_disturb_heading_or_speed():
+    # The crab is an independent axis: it must not bleed into forward speed
+    # or the heading hold.
+    c = AvoidanceController(_cfg(cross_track_ramp_time=0.0))
+    c.set_goal_heading(0.0)
+    plain = c.step(_sectors(), None, None, 0.0, 0.0)
+
+    c2 = AvoidanceController(_cfg(cross_track_ramp_time=0.0))
+    c2.set_goal_heading(0.0)
+    c2.set_lateral_correction(-0.10)
+    crabbed = c2.step(_sectors(), None, None, 0.0, 0.0)
+
+    assert crabbed.linear_x == plain.linear_x
+    assert crabbed.angular_z == plain.angular_z
+
+
+def test_ramp_fades_the_crab_in_over_time():
+    cfg = _cfg(cross_track_ramp_time=1.0)
+    c = AvoidanceController(cfg)
+    c.set_goal_heading(0.0)
+    c.set_lateral_correction(-0.10)
+    at_entry = c.step(_sectors(), None, None, 0.0, 0.0)
+    midway = c.step(_sectors(), None, None, 0.0, 0.5)
+    settled = c.step(_sectors(), None, None, 0.0, 2.0)
+    assert at_entry.linear_y == 0.0                    # starts from nothing
+    assert midway.linear_y == -0.05                    # half ramped
+    assert settled.linear_y == -0.10                   # clamped at full
+
+
+def test_no_crab_while_confirming_an_obstacle():
+    # The confirming tick deliberately holds still; crabbing through it
+    # would move the robot while it is deciding whether it is blocked.
+    cfg = _cfg(obstacle_confirm_scans=2, cross_track_ramp_time=0.0)
+    c = AvoidanceController(cfg)
+    c.set_goal_heading(0.0)
+    c.set_lateral_correction(-0.10)
+    obst = {"span_deg": 10.0, "y_lo": -0.05, "y_hi": 0.05, "preferred_side": 1.0}
+    front = _blocked_front(cfg)
+    out = c.step(_sectors(front=front, fc=front), obst, None, 0.0, 0.0)
+    assert out.state == "DRIVE" and out.linear_x == 0.0
+    assert out.linear_y == 0.0
+
+
+def _strafe_then_clear(cfg, correction, inside_flank):
+    """Drive the controller into a leftward STRAFE, then clear the front so
+    it completes back to DRIVE, and return that completing output.
+
+    _locked_dir ends up +1 (dodged left), so the obstacle is on the RIGHT
+    and a correction back toward the right is the gated direction.
+    """
+    c = AvoidanceController(cfg)
+    c.set_goal_heading(0.0)
+    obst = {"span_deg": 10.0, "y_lo": -0.05, "y_hi": 0.05, "preferred_side": 1.0}
+    front = _blocked_front(cfg)
+    out = c.step(_sectors(front=front, fc=front, left=1.5), obst, None, 0.0, 0.0)
+    assert out.state == "STRAFE"
+    c.set_lateral_correction(correction)
+    # Front now clear -> _strafe completes to DRIVE on this tick.
+    return c, c.step(_sectors(left=1.5, right=inside_flank), None, None, 0.0, 0.5)
+
+
+def _strafe_cfg(**kw):
+    base = dict(obstacle_confirm_scans=1, strafe_speed=0.25, strafe_timeout=1.5,
+                cross_track_ramp_time=0.0)
+    base.update(kw)
+    return _cfg(**base)
+
+
+def test_crab_blocked_toward_the_obstacle_just_avoided():
+    # The limit-cycle guard. A strafe makes no forward progress, so on
+    # completion the robot is level with the obstacle -- crabbing back
+    # toward it would re-block the front and strafe out again, forever.
+    cfg = _strafe_cfg()
+    c, out = _strafe_then_clear(cfg, correction=-0.10,
+                                inside_flank=cfg.pass_clearance - 0.1)
+    assert out.state == "DRIVE"
+    assert out.linear_y == 0.0
+
+
+def test_crab_allowed_away_from_the_obstacle_just_avoided():
+    # Moving further from the obstacle can only increase clearance, so it is
+    # never gated even with the flank still close.
+    cfg = _strafe_cfg()
+    c, out = _strafe_then_clear(cfg, correction=+0.10,
+                                inside_flank=cfg.pass_clearance - 0.1)
+    assert out.linear_y == +0.10
+
+
+def test_crab_toward_obstacle_allowed_once_the_flank_is_clear():
+    cfg = _strafe_cfg()
+    c, out = _strafe_then_clear(cfg, correction=-0.10,
+                                inside_flank=cfg.pass_clearance + 0.5)
+    assert out.linear_y == -0.10
+
+
+def test_crab_ungated_once_the_encounter_closes():
+    # After clear_drive_duration of clean driving there is no remembered
+    # obstacle left to protect, so the correction runs unrestricted even
+    # back toward where the obstacle used to be.
+    cfg = _strafe_cfg(clear_drive_duration=1.0)
+    c, out = _strafe_then_clear(cfg, correction=-0.10,
+                                inside_flank=cfg.pass_clearance - 0.1)
+    assert out.linear_y == 0.0                       # gated at first
+    c.step(_sectors(right=cfg.pass_clearance - 0.1), None, None, 0.0, 1.0)
+    late = c.step(_sectors(right=cfg.pass_clearance - 0.1), None, None, 0.0, 3.0)
+    assert late.linear_y == -0.10                    # encounter closed, gate lifted
+
+
+def test_maneuvers_never_see_the_crab():
+    # A correction arriving mid-strafe must not bend the strafe: the
+    # maneuver states own linear_y outright.
+    cfg = _strafe_cfg()
+    c = AvoidanceController(cfg)
+    c.set_goal_heading(0.0)
+    obst = {"span_deg": 10.0, "y_lo": -0.05, "y_hi": 0.05, "preferred_side": 1.0}
+    front = _blocked_front(cfg)
+    c.step(_sectors(front=front, fc=front, left=1.5), obst, None, 0.0, 0.0)
+    c.set_lateral_correction(-0.10)
+    out = c.step(_sectors(front=front, fc=front, left=1.5), obst, None, 0.0, 0.1)
+    assert out.state == "STRAFE"
+    assert out.linear_y == +cfg.strafe_speed     # full strafe, uncontaminated

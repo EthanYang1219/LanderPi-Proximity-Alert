@@ -3,6 +3,19 @@
 refined obstacle-avoidance state machine (AvoidanceController): strafe-first,
 then turn-and-drive, then one bounded recovery, then halt.
 
+After an avoidance maneuver it also crabs back onto the original A->B line
+rather than resuming parallel to it (holding the goal HEADING was never
+enough -- a strafe leaves the robot pointing the right way but offset). The
+correction is a mecanum crab on linear.y, gated so it never closes on the
+obstacle it just avoided; see nav_utils.lateral_correction and
+AvoidanceController._gated_lateral.
+
+SCOPE LIMIT: that correction undoes COMMANDED lateral displacement only. On
+this platform /odom's x/y is an open-loop integral of commanded velocity --
+no wheel encoders, and the EKF's laser-odometry input (odom_rf2o) is not
+running -- so wheel slip and dead-reckoning drift are invisible to it. True
+path following needs an external position source. See nav_utils' docstring.
+
 This node is a thin ROS wrapper -- it reduces each LaserScan into sector
 clearances, sizes the obstacle, finds an escape gap, and feeds those to the
 pure AvoidanceController every control tick. It publishes the commanded Twist,
@@ -36,8 +49,9 @@ from proximity_alert.audio_trigger import should_play
 from proximity_alert.scan_utils import reduce_to_sectors, size_obstacle, select_gap
 from proximity_alert.avoidance import AvoidanceController, AvoidanceConfig
 from proximity_alert.nav_utils import (
-    ARRIVED_TARGET, DRIVING, STOPPED_ODOM_FAULT, STOPPED_SCAN_FAULT,
-    decide_arrival, distance_from_start, should_skip_controller,
+    ARRIVED_TARGET, CENTERING, DRIVING, STOPPED_ODOM_FAULT, STOPPED_SCAN_FAULT,
+    along_track_distance, cross_track_error, decide_arrival,
+    distance_from_start, lateral_correction, should_skip_controller,
 )
 
 
@@ -127,8 +141,11 @@ class PathTracker(Node):
         self._goal_set = False
         self.start_pos = None
         self.distance_traveled = 0.0
+        self.along_track = 0.0
+        self.cross_track = 0.0
         self.last_odom_time = None
         self.arrived = False
+        self.centering_since = None
 
         self._last_cmd = Twist()
         self._last_status = DRIVING
@@ -142,7 +159,8 @@ class PathTracker(Node):
             f"strafe_speed={self.config.strafe_speed}m/s "
             f"disable_avoidance={self.config.disable_avoidance} "
             f"audio_alert_enabled={self.audio_alert_enabled} "
-            f"target_distance={self.target_distance}"
+            f"target_distance={self.target_distance} "
+            f"cross_track_kp={self.config.cross_track_kp}"
         )
 
     def publish_stop(self):
@@ -192,9 +210,23 @@ class PathTracker(Node):
         pos = msg.pose.pose.position
         if self.start_pos is None:
             self.start_pos = (pos.x, pos.y)
-        self.distance_traveled = distance_from_start(
-            self.start_pos[0], self.start_pos[1], pos.x, pos.y
+        sx, sy = self.start_pos
+        self.distance_traveled = distance_from_start(sx, sy, pos.x, pos.y)
+
+        # Position rewritten in the A->B line's own frame. `along_track` is
+        # what arrival is measured against (a laterally-offset robot must not
+        # stop early); `cross_track` is what the crab correction closes.
+        self.along_track = along_track_distance(
+            sx, sy, self.goal_heading_abs, pos.x, pos.y
         )
+        self.cross_track = cross_track_error(
+            sx, sy, self.goal_heading_abs, pos.x, pos.y
+        )
+        cfg = self.config
+        self.controller.set_lateral_correction(lateral_correction(
+            self.cross_track, cfg.cross_track_kp, cfg.cross_track_max_speed,
+            cfg.cross_track_deadband,
+        ))
         self.last_odom_time = self.get_clock().now()
 
     def scan_is_stale(self):
@@ -202,6 +234,18 @@ class PathTracker(Node):
             return True
         age = (self.get_clock().now() - self.last_scan_time).nanoseconds / 1e9
         return age > self.scan_timeout
+
+    def _centering_elapsed(self):
+        """Seconds spent in the arrival centering phase, 0.0 before it starts.
+
+        Feeding this to decide_arrival is what bounds the phase: once it
+        passes centering_timeout, arrival latches whatever the remaining
+        offset is, so a blocked flank or a gated-off correction cannot leave
+        the robot crabbing at the finish line indefinitely.
+        """
+        if self.centering_since is None:
+            return 0.0
+        return (self.get_clock().now() - self.centering_since).nanoseconds / 1e9
 
     def odom_is_stale(self):
         if self.last_odom_time is None:
@@ -251,12 +295,17 @@ class PathTracker(Node):
         # Arrival is decided AFTER the controller runs and only gates whether
         # its output is forwarded. The state machine is never bypassed or
         # altered, so avoidance behaves exactly as it did before.
+        cfg = self.config
         status = decide_arrival(
             controller_state=self.controller.state,
             target_distance=self.target_distance,
-            distance_traveled=self.distance_traveled,
+            along_track=self.along_track,
             odom_stale=self.odom_is_stale(),
             already_arrived=self.arrived,
+            cross_track_err=self.cross_track,
+            cross_track_tolerance=cfg.cross_track_tolerance,
+            centering_elapsed=self._centering_elapsed(),
+            centering_timeout=cfg.centering_timeout,
         )
 
         # Published on every tick where the controller produced a record,
@@ -270,11 +319,29 @@ class PathTracker(Node):
             if self.audio_alert_enabled:
                 self._maybe_play_audio_alert(out.decision)
 
+        if status == CENTERING:
+            # Distance is covered; close the remaining offset before calling
+            # it arrived. Forward motion stops (the run's length is already
+            # decided) but the crab and the heading hold stay live, so the
+            # robot slides onto the line without rotating or advancing.
+            if self.centering_since is None:
+                self.centering_since = self.get_clock().now()
+                self.get_logger().info(
+                    f"Target distance reached at {self.cross_track:+.3f} m "
+                    "off the line -- centering before stopping."
+                )
+            cmd = Twist()
+            cmd.linear.y = float(out.linear_y)
+            cmd.angular.z = float(out.angular_z)
+            self._publish(cmd, status)
+            return
+
         if status == ARRIVED_TARGET:
             self.arrived = True
             self.get_logger().info(
                 f"Target distance {self.target_distance:.2f} m reached "
-                f"({self.distance_traveled:.2f} m travelled) -- stopping."
+                f"(along-track {self.along_track:.2f} m, "
+                f"final offset {self.cross_track:+.3f} m) -- stopping."
             )
             self._publish(Twist(), status)
             return

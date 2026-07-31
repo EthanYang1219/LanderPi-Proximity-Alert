@@ -56,14 +56,21 @@ class _FakeController:
     path_tracker forwards or replaces its output correctly.
     """
 
-    def __init__(self, state=DRIVE, linear_x=0.5, decision=None):
+    def __init__(self, state=DRIVE, linear_x=0.5, decision=None, linear_y=0.0):
         self.state = state
         self.goal_heading = None
+        self.lateral_correction = 0.0
         self.step_calls = 0
-        self._out = ControllerOutput(linear_x, 0.0, 0.0, state, decision)
+        self._out = ControllerOutput(linear_x, linear_y, 0.0, state, decision)
 
     def set_goal_heading(self, yaw):
         self.goal_heading = yaw
+
+    def set_lateral_correction(self, v_lat):
+        # odom_callback pushes this every tick; the real gating/ramping is
+        # covered in test_avoidance_controller.py. Recorded so the
+        # cross-track tests below can assert what path_tracker computed.
+        self.lateral_correction = v_lat
 
     def step(self, sectors, obstacle, gap, yaw, now):
         self.step_calls += 1
@@ -277,3 +284,104 @@ def test_stale_scan_after_arrival_still_reports_arrived():
     rclpy.shutdown()
     assert cmd.linear.x == 0.0
     assert status == "arrived_target_distance"
+
+
+# --- arrival measured along the line, not as displacement ---
+
+def test_arrival_uses_along_track_not_displacement():
+    # Regression for the early-stop bug: 1.20 m down the line but 0.40 m off
+    # to the side reads hypot = 1.265 m, which would have tripped a 1.25 m
+    # target having actually advanced only 1.20 m.
+    rclpy.init()
+    node = _primed(PathTracker(), 1.25, _FakeController(state=DRIVE))
+    node.odom_callback(_odom_at(1.20, 0.40))
+    node.control_loop()
+    status, along = node._last_status, node.along_track
+    node.destroy_node()
+    rclpy.shutdown()
+    assert math.hypot(1.20, 0.40) > 1.25      # displacement would have stopped
+    assert along == pytest.approx(1.20)
+    assert status == "driving"
+
+
+def test_arrives_once_along_track_actually_reaches_target():
+    rclpy.init()
+    node = _primed(PathTracker(), 1.25, _FakeController(state=DRIVE))
+    node.odom_callback(_odom_at(1.30, 0.02))   # offset inside tolerance
+    node.control_loop()
+    status = node._last_status
+    node.destroy_node()
+    rclpy.shutdown()
+    assert status == "arrived_target_distance"
+
+
+# --- arrival centering phase ---
+
+def test_centering_stops_forward_motion_but_keeps_crabbing():
+    rclpy.init()
+    node = _primed(PathTracker(), 2.0,
+                   _FakeController(state=DRIVE, linear_y=-0.10))
+    node.odom_callback(_odom_at(2.5, 0.30))     # distance covered, still off line
+    node.control_loop()
+    cmd, status = node._last_cmd, node._last_status
+    arrived = node.arrived
+    node.destroy_node()
+    rclpy.shutdown()
+    assert status == "centering"
+    assert cmd.linear.x == 0.0                  # run length already decided
+    assert cmd.linear.y == -0.10                # still sliding onto the line
+    assert arrived is False                     # not latched yet
+
+
+def test_centering_finishes_once_within_tolerance():
+    rclpy.init()
+    node = _primed(PathTracker(), 2.0, _FakeController(state=DRIVE))
+    node.odom_callback(_odom_at(2.5, 0.30))
+    node.control_loop()
+    assert node._last_status == "centering"
+    node.odom_callback(_odom_at(2.5, 0.01))     # crabbed onto the line
+    node.control_loop()
+    cmd, status = node._last_cmd, node._last_status
+    node.destroy_node()
+    rclpy.shutdown()
+    assert status == "arrived_target_distance"
+    assert cmd.linear.x == 0.0 and cmd.linear.y == 0.0
+
+
+def test_centering_gives_up_at_timeout():
+    # A blocked flank can make the offset uncloseable; the run must still
+    # terminate. centering_timeout=0 is the degenerate "never centre" case.
+    rclpy.init()
+    node = PathTracker()
+    node.config.centering_timeout = 0.0
+    node = _primed(node, 2.0, _FakeController(state=DRIVE))
+    node.odom_callback(_odom_at(2.5, 0.90))     # far off line
+    node.control_loop()
+    status = node._last_status
+    node.destroy_node()
+    rclpy.shutdown()
+    assert status == "arrived_target_distance"
+
+
+def test_centering_disabled_by_zero_tolerance():
+    rclpy.init()
+    node = PathTracker()
+    node.config.cross_track_tolerance = 0.0
+    node = _primed(node, 2.0, _FakeController(state=DRIVE))
+    node.odom_callback(_odom_at(2.5, 0.90))
+    node.control_loop()
+    status = node._last_status
+    node.destroy_node()
+    rclpy.shutdown()
+    assert status == "arrived_target_distance"
+
+
+def test_obstacle_halt_during_centering_reports_obstacle_stop():
+    rclpy.init()
+    node = _primed(PathTracker(), 2.0, _FakeController(state=HALT))
+    node.odom_callback(_odom_at(2.5, 0.30))
+    node.control_loop()
+    status = node._last_status
+    node.destroy_node()
+    rclpy.shutdown()
+    assert status == "arrived_obstacle"
