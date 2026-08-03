@@ -128,7 +128,10 @@ class AvoidanceController:
         self.encounter_id = 0
         self._in_encounter = False
         self._confirm_count = 0
-        self._clean_drive_since = None
+        self._clear_scan_streak = 0
+        self._clean_drive_start_pos = None
+        self._last_clear_tick_pos = None
+        self._pos = None
         self._locked_dir = 0.0
         self._maneuver_start = None
         self._turn_target = 0.0
@@ -194,7 +197,7 @@ class AvoidanceController:
         forward N metres first" is what makes this self-timing: it waits
         exactly as long as the obstacle actually needs, which is longer for
         a wall than for a cone, where any fixed N would be wrong for one of
-        them. Once the encounter closes (clear_drive_duration of clean
+        them. Once the encounter closes (clear_drive_distance of confirmed-clear
         driving) there is no remembered obstacle left to protect, and the
         correction runs unrestricted.
         """
@@ -219,10 +222,10 @@ class AvoidanceController:
 
     # ---------- tick ----------
 
-    def step(self, sectors, obstacle, gap_bearing, current_yaw, now):
+    def step(self, sectors, obstacle, gap_bearing, current_yaw, current_pos, now):
         self._advance_clock(now)
         self._s, self._o, self._gap = sectors, obstacle, gap_bearing
-        self._yaw, self._now = current_yaw, now
+        self._yaw, self._now, self._pos = current_yaw, now, current_pos
         handler = {DRIVE: self._drive, STRAFE: self._strafe, TURN: self._turn,
                    DRIVE_PAST: self._drive_past, RECOVER: self._recover,
                    HALT: self._halt}[self.state]
@@ -252,7 +255,7 @@ class AvoidanceController:
             self._drive_since = now
         blocked = self._o is not None and s["front"] <= cfg.safety_distance
         if blocked:
-            self._clean_drive_since = None
+            self._reset_clear_tracking()
             self._confirm_count += 1
             if self._confirm_count >= cfg.obstacle_confirm_scans:
                 self._confirm_count = 0
@@ -261,15 +264,45 @@ class AvoidanceController:
             # the whole point of this tick is to not move while deciding.
             return ControllerOutput(0.0, 0.0, 0.0, DRIVE, None)  # confirming
         self._confirm_count = 0
-        if self._clean_drive_since is None:
-            self._clean_drive_since = now
-        elif self._in_encounter and (now - self._clean_drive_since >= cfg.clear_drive_duration):
+        self._advance_clear_tracking(self._pos)
+        return ControllerOutput(cfg.forward_speed, self._drive_lateral(),
+                                self._hold(self.goal_heading), DRIVE, None)
+
+    def _reset_clear_tracking(self):
+        self._clear_scan_streak = 0
+        self._clean_drive_start_pos = None
+        self._last_clear_tick_pos = None
+
+    def _advance_clear_tracking(self, pos):
+        if not self._in_encounter or pos is None:
+            return
+        cfg = self.config
+        # Jump detection only matters once a measurement is actually active
+        # (clean_drive_start_pos is set) -- checking it during the
+        # confirm-scan streak, before there is anything to protect, would
+        # just restart the streak-building phase for no benefit.
+        if self._clean_drive_start_pos is not None and self._last_clear_tick_pos is not None:
+            if _distance(self._last_clear_tick_pos, pos) > cfg.odom_jump_threshold:
+                # Discontinuous odometry jump (e.g. a localization reset) --
+                # not real motion. Abandon the in-progress measurement rather
+                # than compute a meaningless displacement.
+                self._reset_clear_tracking()
+                self._last_clear_tick_pos = pos
+                return
+        self._last_clear_tick_pos = pos
+
+        self._clear_scan_streak += 1
+        if self._clear_scan_streak < cfg.encounter_close_confirm_scans:
+            return
+        if self._clean_drive_start_pos is None:
+            self._clean_drive_start_pos = pos
+            return
+        if _distance(self._clean_drive_start_pos, pos) >= cfg.clear_drive_distance:
             self._in_encounter = False
             self.consecutive_avoid_count = 0
             self.cumulative_strafe = 0.0
             self.has_recovered_this_encounter = False
-        return ControllerOutput(cfg.forward_speed, self._drive_lateral(),
-                                self._hold(self.goal_heading), DRIVE, None)
+            self._reset_clear_tracking()
 
     def _assess(self):
         s, o, cfg = self._s, self._o, self.config
@@ -451,7 +484,7 @@ class AvoidanceController:
 
     def _complete_to_drive(self, outcome, duration):
         self.state = DRIVE
-        self._clean_drive_since = None
+        self._reset_clear_tracking()
         self._confirm_count = 0
         self._clear_since = None
         self.target_heading = self.goal_heading
