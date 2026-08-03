@@ -61,6 +61,7 @@ class _FakeController:
         self.goal_heading = None
         self.lateral_correction = 0.0
         self.step_calls = 0
+        self.last_pos = None
         self._out = ControllerOutput(linear_x, linear_y, 0.0, state, decision)
 
     def set_goal_heading(self, yaw):
@@ -72,8 +73,12 @@ class _FakeController:
         # cross-track tests below can assert what path_tracker computed.
         self.lateral_correction = v_lat
 
-    def step(self, sectors, obstacle, gap, yaw, now):
+    def step(self, sectors, obstacle, gap, yaw, pos, now):
         self.step_calls += 1
+        # Recorded so the tests below can assert path_tracker threads the
+        # odometry position through; the real controller measures clear-drive
+        # displacement from it.
+        self.last_pos = pos
         return self._out
 
 
@@ -385,3 +390,32 @@ def test_obstacle_halt_during_centering_reports_obstacle_stop():
     node.destroy_node()
     rclpy.shutdown()
     assert status == "arrived_obstacle"
+
+
+def test_odometry_position_is_threaded_into_the_controller():
+    # The controller measures clear-drive displacement from this position to
+    # decide when an obstacle encounter is over, so path_tracker must hand it
+    # the live odometry fix -- not None, and not a stale first fix.
+    rclpy.init()
+    fake = _FakeController(state=DRIVE)
+    node = _primed(PathTracker(), 0.0, fake)
+    node.odom_callback(_odom_at(1.25, -0.5))
+    node.control_loop()
+    node.destroy_node()
+    rclpy.shutdown()
+    assert fake.last_pos == (1.25, -0.5)
+
+
+def test_controller_position_is_none_before_any_odom():
+    # No odometry yet must mean no fabricated coordinates -- the controller
+    # relies on None to keep the clear-distance measurement from starting.
+    rclpy.init()
+    fake = _FakeController(state=DRIVE)
+    node = PathTracker()
+    node.target_distance = 0.0
+    node.controller = fake
+    node.scan_callback(_clear_scan())     # fresh scan, but no odom ever
+    node.control_loop()
+    node.destroy_node()
+    rclpy.shutdown()
+    assert fake.last_pos is None

@@ -137,6 +137,7 @@ class PathTracker(Node):
         self._gap = None
         self.last_scan_time = None
         self.current_yaw = None
+        self.current_pos = None
         self.goal_heading_abs = None
         self._goal_set = False
         self.start_pos = None
@@ -208,6 +209,9 @@ class PathTracker(Node):
         # plain floats rather than the message's position object, which is
         # reused/overwritten by the middleware.
         pos = msg.pose.pose.position
+        # Also handed to the controller each tick, which measures clear-drive
+        # displacement from it to decide when an encounter is over.
+        self.current_pos = (pos.x, pos.y)
         if self.start_pos is None:
             self.start_pos = (pos.x, pos.y)
         sx, sy = self.start_pos
@@ -290,7 +294,9 @@ class PathTracker(Node):
 
         now = self.get_clock().now().nanoseconds / 1e9
         yaw = self.current_yaw if self.current_yaw is not None else 0.0
-        out = self.controller.step(self._sectors, self._obstacle, self._gap, yaw, now)
+        out = self.controller.step(
+            self._sectors, self._obstacle, self._gap, yaw, self.current_pos, now
+        )
 
         # Arrival is decided AFTER the controller runs and only gates whether
         # its output is forwarded. The state machine is never bypassed or
