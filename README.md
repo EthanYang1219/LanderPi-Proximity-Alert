@@ -208,7 +208,9 @@ The LiDAR is reduced each scan into FRONT (+ front sub-sectors), LEFT, RIGHT, an
 | `turn_radius` | `0.0` | Reverse-arc radius during TURN/RECOVER, meters. Those states already command reverse + rotation together, so they trace an arc of radius `reverse_speed / turn_speed` — at legacy defaults a tight ~0.13m. Set > 0 to control that geometry directly (reverse speed becomes `turn_radius × turn_speed`): bigger = a wider, longer sweep instead of an almost-in-place pivot. `0` keeps the legacy fixed `avoid_reverse_speed` |
 | `rear_taper_zone` | `0.0` | Distance above `rear_clearance_min` over which the reverse component fades out linearly rather than snapping to zero, meters. The hard cutoff makes a turn lurch from arc to pure pivot the moment clearance runs low; a taper degrades smoothly. `0` keeps the legacy hard cutoff |
 | `max_avoid_attempts` | `3` | Failed cycles before escalating to recovery |
-| `clear_drive_duration` | `3.0` | Sustained clean-drive time that closes an encounter and resets counters, seconds |
+| `clear_drive_distance` | `0.3` | Confirmed-clear straight-line displacement that closes an encounter and resets its counters (`cumulative_strafe`, attempt count), meters. Measured from odometry — see [Distance-based encounter close](#distance-based-encounter-close) |
+| `encounter_close_confirm_scans` | `3` | Consecutive clear scans required before `clear_drive_distance` even starts accumulating. Mirrors `obstacle_confirm_scans` on the exit side, so one noisy clear reading can't start (or falsely advance) the measurement |
+| `odom_jump_threshold` | `0.15` | Per-tick position delta above which motion is treated as a discontinuous odometry jump (e.g. a localization reset) rather than real travel, meters. The in-progress measurement is abandoned and restarts after the next confirmed-clear streak |
 | `min_gap_clearance` / `min_gap_width_deg` | `0.50` / `40.0` | What counts as a usable recovery gap (robot must fit) |
 | `disable_avoidance` | `false` | Halt on any obstacle, no turn/strafe (clean go-and-stop runs) |
 | `target_distance` | `0.0` | Distance **along the A→B line** (the projection, not straight-line displacement) after which the robot stops and reports `arrived_target_distance`. `0.0` disables — no stop condition and no odom watchdog, exactly as before this parameter existed (distance tracking itself still runs internally either way; nothing consumes it when disabled). Arrival is deferred until the avoidance state machine is back in `DRIVE`, so a strafe or turn finishes before the stop — this can cost real overshoot, up to roughly a metre if a full maneuver ladder (strafe, then turn, then drive-past) runs before DRIVE is reached again |
@@ -224,6 +226,55 @@ The LiDAR is reduced each scan into FRONT (+ front sub-sectors), LEFT, RIGHT, an
 | `alsa_device` | `plughw:2,0` | ALSA device string for the robot's USB speaker (confirmed via `aplay -l` inside the container) |
 
 Derived (computed, not configured): `max_strafe_distance = strafe_speed × strafe_timeout`; `corridor_half = robot_half_width + corridor_margin`; `clear_threshold = safety_distance + clear_margin`.
+
+### Distance-based encounter close
+
+An *encounter* is one obstacle, from the first confirmed detection until the
+robot has clearly driven past it. While an encounter is open, the attempt count
+and `cumulative_strafe` budget keep accruing; when it closes, they reset.
+
+That close used to be a *time* value (`clear_drive_duration`, 3.0 s). The
+problem: three seconds is not a place. Whether it corresponds to 10 cm or a
+full metre depends entirely on `forward_speed`, so tuning it against real
+obstacle spacing meant doing the arithmetic in your head every time — and two
+obstacles spaced closer together than that interval were merged into a single
+encounter, the second one inheriting the first's leftover attempt count and
+strafe budget and escalating to RECOVER or HALT far sooner than it should have.
+
+It is now a distance: `clear_drive_distance` (0.3 m) of confirmed-clear
+straight-line displacement, taken from odometry. You set it directly in the
+same units you measure the floor in.
+
+Three details worth knowing:
+
+- **`encounter_close_confirm_scans` (3) gates the start.** The measurement only
+  begins after that many consecutive clear scans, mirroring what
+  `obstacle_confirm_scans` does on the entry side, so a single noisy clear
+  reading can't start or falsely advance it. A re-block before the threshold is
+  reached discards the partial measurement outright — interrupted clear
+  stretches never sum.
+- **It is straight-line displacement, not integrated path length.** A robot
+  that strafes and curves around an obstacle covers more ground than its net
+  displacement, so this under-reports. That is deliberate: it errs toward
+  keeping an encounter open, never toward closing one early.
+- **`odom_jump_threshold` (0.15 m) rejects discontinuities.** A per-tick jump
+  larger than this is a localization reset, not travel, so the in-progress
+  measurement is abandoned rather than credited with a bogus few metres. Note
+  it is *not* scaled by elapsed `dt`: at the confirmed 0.20 m/s clamp even a
+  sluggish 5 Hz loop only covers ~0.04 m per tick, so 0.15 m is roughly 4×
+  margin. A stalled control loop that legitimately covers more ground in one
+  delayed tick could trip it — a known, accepted simplification, not a hidden
+  gap. If long scheduling stalls ever become real, the fix is a Δt-aware
+  version (`expected = forward_speed × dt`, jump if `actual > expected + margin`).
+
+**These three defaults are starting points, not measured constants**, and need
+on-hardware validation against real obstacle spacing and real odometry noise.
+
+**Known limitation:** obstacles spaced closer together than roughly
+`clear_drive_distance` plus the confirm-scan debounce distance are still
+treated as one encounter. Distance alone cannot resolve that; telling "same
+obstacle" from "new obstacle" would need a different signal entirely, which is
+out of scope here.
 
 ### Speed clamp — why `forward_speed`/`strafe_speed` default to 0.20, not 0.50
 
