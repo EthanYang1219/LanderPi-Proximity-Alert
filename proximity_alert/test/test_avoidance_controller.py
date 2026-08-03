@@ -1,5 +1,5 @@
 import math
-from proximity_alert.avoidance import AvoidanceController, AvoidanceConfig
+from proximity_alert.avoidance import AvoidanceController, AvoidanceConfig, _distance
 
 
 def _sectors(front=5.0, fl=5.0, fc=5.0, fr=5.0, left=5.0, right=5.0, rear=5.0):
@@ -402,3 +402,18 @@ def test_maneuvers_never_see_the_crab():
     out = c.step(_sectors(front=front, fc=front, left=1.5), obst, None, 0.0, 0.1)
     assert out.state == "STRAFE"
     assert out.linear_y == +cfg.strafe_speed     # full strafe, uncontaminated
+
+
+# ---------- distance-based encounter close ----------
+
+
+def test_distance_helper_straight_line():
+    assert _distance((0.0, 0.0), (3.0, 4.0)) == 5.0
+
+
+def test_config_has_distance_based_encounter_fields():
+    cfg = AvoidanceConfig()
+    assert cfg.clear_drive_distance == 0.3
+    assert cfg.encounter_close_confirm_scans == 3
+    assert cfg.odom_jump_threshold == 0.15
+    assert not hasattr(cfg, "clear_drive_duration")

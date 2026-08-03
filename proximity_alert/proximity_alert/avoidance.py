@@ -19,6 +19,10 @@ def normalize_angle(a):
     return math.atan2(math.sin(a), math.cos(a))
 
 
+def _distance(pos_a, pos_b):
+    return math.hypot(pos_b[0] - pos_a[0], pos_b[1] - pos_a[1])
+
+
 class HeadingPID:
     def __init__(self, kp, ki, kd, output_limit):
         self.kp, self.ki, self.kd, self.output_limit = kp, ki, kd, output_limit
@@ -80,7 +84,9 @@ class AvoidanceConfig: # All measurements are in meters or m/s for the speed. Al
     cross_track_tolerance: float = 0.05    # How close to the line counts as "on it" for the arrival centering phase, m. After covering target_distance the robot stops driving forward and keeps crabbing until within this band. Larger = accepts a bigger final offset and finishes sooner. 0.0 disables centering, so arrival latches the instant the distance is covered
     centering_timeout: float = 5.0         # Max seconds to spend centering before declaring arrival regardless of remaining offset. Guarantees the run terminates when the correction is gated off or the flank is blocked; the leftover offset is then measured on the floor instead
     max_avoid_attempts: int = 3            # Consecutive failed STRAFE/TURN cycles before escalating to RECOVER. Lower = escalates sooner, higher = keeps retrying the normal ladder longer
-    clear_drive_duration: float = 3.0      # Seconds of sustained clean driving before an encounter is considered over and its counters (cumulative_strafe, attempt count) reset
+    clear_drive_distance: float = 0.3        # Meters of confirmed-clear straight-line displacement before an encounter is considered over and its counters (cumulative_strafe, attempt count) reset. Physically meaningful (unlike the old time-based clear_drive_duration), tunable directly against real obstacle spacing; needs on-hardware validation. Measures straight-line odometric displacement, not integrated path length -- conservative (never closes an encounter early), consistent with distance tracking elsewhere in this project.
+    encounter_close_confirm_scans: int = 3   # Consecutive clear scans required before clear_drive_distance even starts accumulating -- mirrors obstacle_confirm_scans on the exit side, so a single noisy clear reading can't start (or falsely advance) the measurement.
+    odom_jump_threshold: float = 0.15        # Meters. A per-tick position delta larger than this during an in-progress clear-distance measurement is treated as a discontinuous odometry jump (e.g. a localization reset), not real motion -- the measurement is abandoned and restarts after the next confirmed-clear streak. Intentionally much larger than the robot's max expected per-tick displacement: confirmed hardware speed cap is 0.2 m/s, so even a sluggish 5 Hz control loop only covers ~0.04m/tick -- 0.15m is roughly 4x that, a reasonable buffer for timing jitter and odometry noise without being triggered by normal motion. This assumes a reasonably stable control loop; it does not scale with actual elapsed dt (a stalled loop that legitimately covers more distance in one delayed tick could in principle exceed this), which is an acceptable simplification for this project's scope, not a hidden gap -- a delta-t-aware version (`expected = forward_speed * dt`, jump if `actual > expected + margin`) is a documented future option if long scheduling stalls ever become a real concern. Needs on-hardware validation against real odometry noise.
     recover_backup_clearance: float = 0.50 # (Currently unused by _recover, which keys off rear_clearance_min) Intended rear clearance required before backing up during recovery
     recover_commit_distance: float = 0.50  # Max distance to drive during RECOVER's commit phase before giving up and halting. Higher = more patient attempt to power through the gap
     min_gap_clearance: float = 0.50        # Minimum range a beam must have to count as part of a usable gap for RECOVER. Higher = only wider-open gaps are considered viable
