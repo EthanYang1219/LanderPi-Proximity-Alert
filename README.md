@@ -133,7 +133,7 @@ The robot's ROS 2 stack already runs in a Docker container named `MentorPi` on t
    Note the `-r /cmd_vel:=/cmd_vel_unsafe` remap — `path_tracker` no longer publishes directly to the motor-facing topic. **Terminal A' (motion watchdog) below is not optional** — without it, nothing is publishing on `/cmd_vel` at all and the robot won't move; see [Motion watchdog and emergency stop](#motion-watchdog-and-emergency-stop) for why this exists.
 
    ```bash
-   # Terminal A' — motion watchdog (start this BEFORE or alongside Terminal A)
+   # Terminal A — motion watchdog (start this BEFORE or alongside Terminal A)
    docker exec -it -u ubuntu MentorPi zsh -lc "source ~/.zshrc && source ~/ros2_ws/install/setup.bash && ros2 run proximity_alert motion_watchdog"
    ```
 
