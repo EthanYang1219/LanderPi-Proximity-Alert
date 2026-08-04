@@ -27,7 +27,10 @@ csv_path=".../granite.csv" -> surface="granite") -- override with the
 `surface` parameter if the filename doesn't match (e.g. a shared/misc log).
 
 Then, at the terminal, it prompts you for:
-    - ground_truth_distance_m (read off your tape-measure marks by eye)
+    - ground_truth_distance_m        (read off your tape-measure marks by eye)
+    - ground_truth_lateral_offset_m  (tape-measured lateral offset from the
+                                       A->B line, blank if not measured;
+                                       + = right, - = left)
     - notes                (freeform, optional -- e.g. "motors fought each
                              other on the turn", "oscillated near desk")
 
@@ -37,7 +40,8 @@ manual spreadsheet wrangling.
 CSV columns:
     timestamp, surface, trial_num, transit_time_s, odom_distance_m,
     ground_truth_distance_m, slippage_error_m, slippage_pct,
-    avoidance_events, lidar_stop_range_m, notes, battery_level
+    avoidance_events, lidar_stop_range_m, notes, battery_level,
+    ground_truth_lateral_offset_m
 
 Topics:
     Subscribes: /odom (nav_msgs/Odometry)
@@ -88,6 +92,7 @@ CSV_HEADER = [
     "lidar_stop_range_m",
     "notes",
     "battery_level",
+    "ground_truth_lateral_offset_m",
 ]
 
 # /ros_robot_controller/battery publishes raw millivolts (std_msgs/UInt16),
@@ -238,6 +243,7 @@ class TrialLogger(Node):
         lidar_stop_range_m,
         notes,
         battery_level_str,
+        lateral_offset_m=None,
     ):
         self.trial_num += 1
         error = odom_distance_m - ground_truth_m
@@ -248,6 +254,12 @@ class TrialLogger(Node):
             f"{lidar_stop_range_m:.4f}"
             if lidar_stop_range_m is not None and math.isfinite(lidar_stop_range_m)
             else ""
+        )
+        # Not every trial measures a lateral offset (only offset trials do) --
+        # blank rather than fabricate a 0.0 that would misread as "measured
+        # and on-line".
+        lateral_str = (
+            f"{lateral_offset_m:.4f}" if lateral_offset_m is not None else ""
         )
         with open(self.csv_path, "a", newline="") as f:
             writer = csv.writer(f)
@@ -265,6 +277,7 @@ class TrialLogger(Node):
                     range_str,
                     notes,
                     battery_level_str,
+                    lateral_str,
                 ]
             )
         if avoidance_events:
@@ -401,6 +414,26 @@ def main(args=None):
                     ground_truth_m = value
 
                 if ground_truth_m is not None:
+                    # Optional -- only offset trials measure this. Blank means
+                    # "not measured", not "measured as zero", so it stays
+                    # None rather than being coerced to 0.0.
+                    lateral_offset_m = None
+                    lateral_entered = False
+                    while not lateral_entered:
+                        lat_raw = input(
+                            "Ground-truth lateral offset in m, + = right / "
+                            "- = left (blank if not measured): "
+                        ).strip()
+                        if lat_raw == "":
+                            lateral_entered = True
+                            continue
+                        try:
+                            lateral_offset_m = float(lat_raw)
+                        except ValueError:
+                            print(f"  '{lat_raw}' is not a number -- try again.")
+                            continue
+                        lateral_entered = True
+
                     notes = input(
                         "Notes -- anything unusual? e.g. motor conflict, "
                         "oscillation, false stop (blank if none): "
@@ -414,6 +447,7 @@ def main(args=None):
                         lidar_stop_range_m,
                         notes,
                         battery_level_str,
+                        lateral_offset_m,
                     )
     except KeyboardInterrupt:
         pass
