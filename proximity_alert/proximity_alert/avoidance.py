@@ -128,6 +128,7 @@ class AvoidanceController:
         self.encounter_id = 0
         self._in_encounter = False
         self._confirm_count = 0
+        self._maneuver_abort_count = 0
         self._clear_scan_streak = 0
         self._clean_drive_start_pos = None
         self._last_clear_tick_pos = None
@@ -346,6 +347,7 @@ class AvoidanceController:
         if strafe_ok:
             self._locked_dir = 1.0 if ps > 0 else -1.0
             self._maneuver_start = self._now
+            self._maneuver_abort_count = 0
             self.state = STRAFE
             rec = self._record(STRAFE, "strafe: narrow+side_clear", required, "committed")
             out = self._strafe()
@@ -369,6 +371,27 @@ class AvoidanceController:
             return self._complete_to_drive("cleared", elapsed)
         if elapsed >= cfg.strafe_timeout or self.cumulative_strafe >= cfg.max_cumulative_strafe:
             return self._assess()
+        # DRIVE asks "is there an obstacle?"; a maneuver asks "is the maneuver I
+        # chose still valid?" -- different questions. We already KNOW the front is
+        # blocked; that is why we are strafing, and front <= safety_distance stays
+        # true for most of a healthy strafe. So front is deliberately NOT checked
+        # here: doing so would abort every strafe ~1 tick after it started. What is
+        # genuinely new information is whether the gap we committed to using has
+        # closed off -- three obstacle contacts on 2026-08-03/04 came from exactly
+        # that going unnoticed (flank 0.369m -> 0.150m mid-strafe, unwatched).
+        #
+        # Known limitation, out of scope here: obstacle_confirm_scans debounces
+        # CONTROL TICKS, not distinct LiDAR scans. control_rate_hz (20) exceeds the
+        # LD19's ~10Hz publish rate, so two consecutive "ticks" may be the same scan
+        # counted twice. Affects every debounce in this controller; a future change
+        # should key debounce off new-scan arrival instead of tick count.
+        flank = s["left"] if self._locked_dir > 0 else s["right"]
+        if flank <= cfg.strafe_side_clearance_min:
+            self._maneuver_abort_count += 1
+            if self._maneuver_abort_count >= cfg.obstacle_confirm_scans:
+                return self._assess()
+        else:
+            self._maneuver_abort_count = 0
         self.cumulative_strafe += cfg.strafe_speed * self._dt
         ly = cfg.strafe_speed * self._locked_dir
         return ControllerOutput(0.0, ly, self._hold(self.goal_heading), STRAFE, None)

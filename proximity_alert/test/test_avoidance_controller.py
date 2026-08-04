@@ -537,3 +537,75 @@ def test_clear_driving_after_closure_does_not_reaccumulate():
     out = c.step(_sectors(front=5.0), None, None, 0.0, (2.0, 0.0), 10.6)
     assert out.state == "DRIVE"
     assert c._in_encounter is False
+
+
+# ---------- mid-maneuver invalidation: STRAFE ----------
+
+def _strafe_entry_cfg():
+    # strafe_speed/strafe_timeout pinned so STRAFE is actually reachable --
+    # see the comment in test_assess_chooses_strafe_for_narrow_obstacle_with_clear_side.
+    return _cfg(obstacle_confirm_scans=2, strafe_speed=0.25, strafe_timeout=1.5)
+
+
+def _enter_strafe(c, cfg):
+    """Two blocked DRIVE ticks (obstacle_confirm_scans=2) -> _assess() -> STRAFE."""
+    obst = {"span_deg": 10.0, "y_lo": -0.05, "y_hi": 0.05, "preferred_side": 1.0}
+    front = _blocked_front(cfg)
+    blocked = _sectors(front=front, fc=front, left=1.5)
+    c.step(blocked, obst, None, 0.0, (0.0, 0.0), 0.0)          # confirming
+    out = c.step(blocked, obst, None, 0.0, (0.0, 0.0), 0.1)    # -> _assess -> STRAFE
+    assert out.state == "STRAFE", f"setup failed, got {out.state}"
+    assert c.consecutive_avoid_count == 1
+    return obst
+
+
+def test_strafe_aborts_when_flank_closing_sustained():
+    cfg = _strafe_entry_cfg()
+    c = AvoidanceController(cfg)
+    c.set_goal_heading(0.0)
+    obst = _enter_strafe(c, cfg)
+    # Flank drops below strafe_side_clearance_min (0.20) for 2 consecutive ticks.
+    # front held at 0.25: above safety_distance so it is not "blocked", below
+    # clear_threshold (0.30) so the strafe does not complete -- isolating the flank.
+    closing = _sectors(front=0.25, left=0.15)
+    c.step(closing, obst, None, 0.0, (0.0, 0.0), 0.2)          # count=1
+    out = c.step(closing, obst, None, 0.0, (0.0, 0.0), 0.3)    # count=2 -> abort
+    assert c.consecutive_avoid_count == 2                       # _assess() ran again
+    assert out.state == "TURN"   # left=0.15 < strafe_side_clearance_min -> can't re-strafe
+
+
+def test_strafe_does_not_abort_on_single_close_reading():
+    cfg = _strafe_entry_cfg()
+    c = AvoidanceController(cfg)
+    c.set_goal_heading(0.0)
+    obst = _enter_strafe(c, cfg)
+    out = c.step(_sectors(front=0.25, left=0.15), obst, None, 0.0, (0.0, 0.0), 0.2)
+    assert out.state == "STRAFE"
+    assert c.consecutive_avoid_count == 1      # no re-assess -- only one close tick
+
+
+def test_strafe_abort_counter_resets_on_clear_tick():
+    cfg = _strafe_entry_cfg()
+    c = AvoidanceController(cfg)
+    c.set_goal_heading(0.0)
+    obst = _enter_strafe(c, cfg)
+    c.step(_sectors(front=0.25, left=0.15), obst, None, 0.0, (0.0, 0.0), 0.2)   # count=1
+    c.step(_sectors(front=0.25, left=1.5), obst, None, 0.0, (0.0, 0.0), 0.3)    # count=0
+    out = c.step(_sectors(front=0.25, left=0.15), obst, None, 0.0, (0.0, 0.0), 0.4)  # count=1
+    assert out.state == "STRAFE"
+    assert c.consecutive_avoid_count == 1      # never reached 2 consecutive
+
+
+def test_strafe_does_not_abort_on_blocked_front_alone():
+    # Regression guard for the removed absolute-front term. front <= safety_distance
+    # is the NORMAL condition throughout a strafe (it is why the strafe started), so
+    # a wide-open flank must keep the maneuver running no matter how close front is.
+    cfg = _strafe_entry_cfg()
+    c = AvoidanceController(cfg)
+    c.set_goal_heading(0.0)
+    obst = _enter_strafe(c, cfg)
+    blocked_front_open_flank = _sectors(front=0.10, left=1.5)
+    for i, t in enumerate((0.2, 0.3, 0.4, 0.5)):
+        out = c.step(blocked_front_open_flank, obst, None, 0.0, (0.0, 0.0), t)
+        assert out.state == "STRAFE", f"aborted on tick {i} with an open flank"
+    assert c.consecutive_avoid_count == 1      # never re-assessed
