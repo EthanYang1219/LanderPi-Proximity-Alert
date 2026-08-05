@@ -612,11 +612,41 @@ def test_strafe_does_not_abort_on_blocked_front_alone():
 
 
 def test_aborted_maneuver_replans_and_resumes_driving():
-    """STRAFE aborts mid-maneuver, re-plans, and returns to normal driving.
+    """Reproduces the 2026-08-03/04 obstacle collisions that motivated this check.
 
-    The isolated tests above each pin one behavior; this proves the abort is
-    RECOVERABLE rather than merely detected -- that the ladder returns to
-    driving instead of stalling or escalating once the hazard passes.
+    WHY THIS TEST EXISTS. Across one hardware session the robot made contact
+    with the same box obstacle three separate times -- trials 2, 7 and 10 in
+    trials/lateral_offset_trials.csv ("ran over the tape measurement", "two
+    obstacles, a box and chair in order", "touched the box slightly").
+    decision_log.csv shows the mechanism directly: at 19:10:00->19:10:02 a
+    STRAFE ran for ~2s (cumulative_strafe_m 0.0 -> 0.41) while left_clearance_m
+    collapsed from 0.369m to 0.150m. That is below strafe_side_clearance_min
+    (0.20m) -- the very threshold whose satisfaction authorized the strafe in
+    the first place -- and nothing was watching it. The controller committed to
+    an escape corridor on one pre-maneuver LiDAR snapshot and never re-checked
+    it, so it drove into a gap that had already closed.
+
+    A real box has corners: the clearance measured from the approach angle is
+    not the clearance along the strafe path. That discovery only arrives
+    mid-maneuver, which is why a pre-maneuver check cannot catch it.
+
+    WHAT IT LOCKS. The isolated tests above each pin one behavior in isolation;
+    this one walks the whole failure end to end -- strafe commits, flank closes,
+    maneuver aborts, hazard passes, controller re-plans and drives on -- and
+    asserts the abort is RECOVERABLE rather than merely detected. The recovery
+    assertions matter as much as the abort: a check that stalls the robot or
+    escalates it to RECOVER/HALT every time an obstacle brushes past would pass
+    an abort-only test while being useless on hardware.
+
+    This test is non-vacuous by construction. Stub out the flank check in
+    _strafe() and it fails at the first assertion with STRAFE != TURN: the
+    controller keeps strafing into the closing flank, exactly as it did on
+    hardware. If you are here because this test broke, the regression is real.
+
+    Scope note: only STRAFE has mid-maneuver invalidation. TURN deliberately
+    has none -- every logged TURN pivoted into 2.3-4.9m of open space, so the
+    evidence never supported one. See "Why TURN carries no check" in
+    docs/superpowers/specs/2026-08-04-mid-maneuver-clearance-check-design.md.
     """
     cfg = _strafe_entry_cfg()
     c = AvoidanceController(cfg)
