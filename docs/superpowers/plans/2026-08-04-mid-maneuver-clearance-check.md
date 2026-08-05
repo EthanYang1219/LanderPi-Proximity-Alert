@@ -203,7 +203,25 @@ git commit -m "feat: abort STRAFE when the flank it committed to closes mid-mane
 
 ---
 
-## Task 2: TURN maneuver-invalidation check
+## Task 2: TURN maneuver-invalidation check — WITHDRAWN, DO NOT IMPLEMENT
+
+> **Status: cancelled 2026-08-05.** This task was implemented, its six targeted
+> tests passed, and it was then reverted in full. It broke six pre-existing
+> reverse-arc geometry tests by driving the controller to `RECOVER` on the TURN
+> commit tick (`consecutive_avoid_count` 0 → 4 within one `step()` call via
+> re-entrant `_assess()`), and re-reading the hardware logs showed every logged
+> `TURN` pivoted into 2.3–4.9m of open space — the check would not have
+> prevented any observed collision.
+>
+> The failure is semantic, not an implementation defect: `TURN` is entered
+> *because* the environment is constrained, so aborting it for tight clearance
+> disables it in the case it exists to escape. **Do not patch and retry this
+> task.** See "Why TURN carries no check" and Known Limitation 1 in
+> `docs/superpowers/specs/2026-08-04-mid-maneuver-clearance-check-design.md`,
+> which also records the relative-clearance approach to revisit if hardware
+> evidence of TURN-side degradation ever appears.
+>
+> The steps below are retained only as a record of what was tried.
 
 **Files:**
 - Modify: `proximity_alert/proximity_alert/avoidance.py` (`_turn()`, `_assess()`'s TURN commit branch)
