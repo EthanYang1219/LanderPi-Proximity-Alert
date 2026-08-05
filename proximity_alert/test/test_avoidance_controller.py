@@ -69,7 +69,10 @@ def test_assess_chooses_turn_when_side_blocked():
     c.set_goal_heading(0.0)
     obst = {"span_deg": 10.0, "y_lo": -0.05, "y_hi": 0.05, "preferred_side": 1.0}
     front = _blocked_front(cfg)
-    out = c.step(_sectors(front=front, fc=front, left=0.15, right=1.5), obst, None, 0.0, (0.0, 0.0), 0.0)
+    # BOTH sides must be below strafe_side_clearance_min: _assess() tries the
+    # preferred side and then falls back to the other, so leaving one side open
+    # would (correctly) strafe that way instead of turning.
+    out = c.step(_sectors(front=front, fc=front, left=0.15, right=0.15), obst, None, 0.0, (0.0, 0.0), 0.0)
     assert out.state == "TURN"
 
 
@@ -567,11 +570,14 @@ def test_strafe_aborts_when_flank_closing_sustained():
     # Flank drops below strafe_side_clearance_min (0.20) for 2 consecutive ticks.
     # front held at 0.25: above safety_distance so it is not "blocked", below
     # clear_threshold (0.30) so the strafe does not complete -- isolating the flank.
-    closing = _sectors(front=0.25, left=0.15)
+    # Right is closed too, so the re-assess cannot simply strafe the other way
+    # (_assess falls back to the opposite side) -- this keeps the test isolating
+    # the abort itself rather than the direction chosen afterwards.
+    closing = _sectors(front=0.25, left=0.15, right=0.15)
     c.step(closing, obst, None, 0.0, (0.0, 0.0), 0.2)          # count=1
     out = c.step(closing, obst, None, 0.0, (0.0, 0.0), 0.3)    # count=2 -> abort
     assert c.consecutive_avoid_count == 2                       # _assess() ran again
-    assert out.state == "TURN"   # left=0.15 < strafe_side_clearance_min -> can't re-strafe
+    assert out.state == "TURN"   # both sides < strafe_side_clearance_min -> can't re-strafe
 
 
 def test_strafe_does_not_abort_on_single_close_reading():
@@ -654,8 +660,11 @@ def test_aborted_maneuver_replans_and_resumes_driving():
     obst = _enter_strafe(c, cfg)
     encounter = c.encounter_id
 
-    # Second obstacle appears alongside: the flank we committed to closes.
-    closing = _sectors(front=0.25, left=0.15)
+    # Second obstacle appears alongside: the flank we committed to closes. Both
+    # sides are closed so the re-plan is forced onto TURN -- with only the left
+    # closed, _assess() would (correctly) fall back to strafing right instead,
+    # which is a different scenario than the one this test walks.
+    closing = _sectors(front=0.25, left=0.15, right=0.15)
     c.step(closing, obst, None, 0.0, (0.0, 0.0), 0.2)
     out = c.step(closing, obst, None, 0.0, (0.0, 0.0), 0.3)
     assert out.state == "TURN"          # aborted the strafe, re-planned as a turn
@@ -673,3 +682,63 @@ def test_aborted_maneuver_replans_and_resumes_driving():
     assert c.encounter_id == encounter              # same encounter throughout
     assert c.has_recovered_this_encounter is False  # never escalated to RECOVER
     assert c.consecutive_avoid_count <= cfg.max_avoid_attempts
+
+
+# ---------- strafe direction fallback (both-sides feasibility) ----------
+
+def _fallback_cfg():
+    # Same pinning rationale as _strafe_entry_cfg: keep max_strafe_distance
+    # (0.40) consistent with max_cumulative_strafe so these tests exercise the
+    # direction choice, not today's tuning.
+    return _cfg(obstacle_confirm_scans=1, strafe_speed=0.20, strafe_timeout=2.0)
+
+
+def test_strafe_falls_back_to_other_side_when_preferred_side_too_far():
+    """Real geometry from the 2026-08-05 five-obstacle run, encounter 1.
+
+    The robot met a flat obstacle face whose left edge sat 8cm left of centre
+    but which extended 30cm to the right. size_obstacle picks preferred_side
+    from far-field openness only -- the right was wide open (2.1m) beyond the
+    obstacle, so it preferred RIGHT. Clearing rightward needed
+    corridor_half - y_lo = 0.438m, past max_strafe_distance (0.40), so
+    strafe_ok failed and the robot turned instead. Strafing LEFT needed only
+    y_hi + corridor_half = 0.218m and had 0.65m of room.
+
+    Every one of the six TURN commits that night had a feasible opposite side.
+    """
+    cfg = _fallback_cfg()
+    c = AvoidanceController(cfg)
+    c.set_goal_heading(0.0)
+    obst = {"span_deg": 68.0, "y_lo": -0.303, "y_hi": 0.083, "preferred_side": -1.0}
+    front = _blocked_front(cfg)
+    out = c.step(_sectors(front=front, fc=front, left=0.650, right=2.109),
+                 obst, None, 0.0, (0.0, 0.0), 0.0)
+    assert out.state == "STRAFE", f"expected STRAFE, got {out.state}"
+    assert out.linear_y > 0.0, "should strafe LEFT (the feasible side)"
+
+
+def test_strafe_keeps_preferred_side_when_it_is_feasible():
+    # Regression guard: the fallback must not change the direction chosen when
+    # the preferred side already works.
+    cfg = _fallback_cfg()
+    c = AvoidanceController(cfg)
+    c.set_goal_heading(0.0)
+    obst = {"span_deg": 10.0, "y_lo": -0.05, "y_hi": 0.05, "preferred_side": 1.0}
+    front = _blocked_front(cfg)
+    out = c.step(_sectors(front=front, fc=front, left=1.5, right=1.5),
+                 obst, None, 0.0, (0.0, 0.0), 0.0)
+    assert out.state == "STRAFE"
+    assert out.linear_y > 0.0, "preferred side was left and feasible"
+
+
+def test_turn_still_chosen_when_neither_side_is_feasible():
+    # Regression guard: the fallback must not make STRAFE reachable when the
+    # obstacle genuinely blocks both directions.
+    cfg = _fallback_cfg()
+    c = AvoidanceController(cfg)
+    c.set_goal_heading(0.0)
+    obst = {"span_deg": 120.0, "y_lo": -0.60, "y_hi": 0.60, "preferred_side": 1.0}
+    front = _blocked_front(cfg)
+    out = c.step(_sectors(front=front, fc=front, left=0.10, right=0.10),
+                 obst, None, 0.0, (0.0, 0.0), 0.0)
+    assert out.state == "TURN", f"expected TURN, got {out.state}"

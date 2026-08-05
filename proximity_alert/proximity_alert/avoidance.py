@@ -333,26 +333,41 @@ class AvoidanceController:
         # TURN every time. Physical width is distance-robust and is what "can I
         # strafe past this vs. is it a wall" actually depends on.
         width = o["y_hi"] - o["y_lo"]
-        if ps > 0:
-            required = o["y_hi"] + cfg.corridor_half
-            side_clear = s["left"]
-        else:
-            required = cfg.corridor_half - o["y_lo"]
-            side_clear = s["right"]
-        strafe_ok = (side_clear >= cfg.strafe_side_clearance_min
-                     and width <= cfg.max_obstacle_width
-                     and required <= cfg.max_strafe_distance
-                     and self.cumulative_strafe + cfg.max_strafe_distance <= cfg.max_cumulative_strafe)
 
-        if strafe_ok:
-            self._locked_dir = 1.0 if ps > 0 else -1.0
-            self._maneuver_start = self._now
-            self._maneuver_abort_count = 0
-            self.state = STRAFE
-            rec = self._record(STRAFE, "strafe: narrow+side_clear", required, "committed")
-            out = self._strafe()
-            out.decision = rec
-            return out
+        # Try BOTH directions, preferred first. size_obstacle picks
+        # preferred_side purely from far-field openness (which side has more
+        # room BEYOND the obstacle) -- it never considers how far you would have
+        # to travel sideways to get past the obstacle's edge. Those two can
+        # disagree badly: an obstacle sitting mostly to one side of the robot is
+        # cheap to clear on its near edge and expensive on its far edge, while
+        # the open space is usually beyond the FAR edge. Checking only the
+        # preferred side then rejects a perfectly good strafe and drops to TURN.
+        # Every one of the six TURN commits in the 2026-08-05 five-obstacle run
+        # was this case: preferred side needed 0.26-0.52m (limit 0.40) while the
+        # opposite side needed -0.06 to 0.22m with 0.44-0.65m of clearance.
+        for direction in (ps, -ps):
+            if direction > 0:
+                required = o["y_hi"] + cfg.corridor_half
+                side_clear = s["left"]
+            else:
+                required = cfg.corridor_half - o["y_lo"]
+                side_clear = s["right"]
+            # An obstacle entirely on the far side needs no lateral travel at
+            # all; clamp so the logged required_clearing_m stays physical.
+            required = max(0.0, required)
+            strafe_ok = (side_clear >= cfg.strafe_side_clearance_min
+                         and width <= cfg.max_obstacle_width
+                         and required <= cfg.max_strafe_distance
+                         and self.cumulative_strafe + cfg.max_strafe_distance <= cfg.max_cumulative_strafe)
+            if strafe_ok:
+                self._locked_dir = 1.0 if direction > 0 else -1.0
+                self._maneuver_start = self._now
+                self._maneuver_abort_count = 0
+                self.state = STRAFE
+                rec = self._record(STRAFE, "strafe: narrow+side_clear", required, "committed")
+                out = self._strafe()
+                out.decision = rec
+                return out
 
         self._locked_dir = 1.0 if s["left"] >= s["right"] else -1.0
         self._maneuver_start = self._now
