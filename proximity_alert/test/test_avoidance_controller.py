@@ -609,3 +609,37 @@ def test_strafe_does_not_abort_on_blocked_front_alone():
         out = c.step(blocked_front_open_flank, obst, None, 0.0, (0.0, 0.0), t)
         assert out.state == "STRAFE", f"aborted on tick {i} with an open flank"
     assert c.consecutive_avoid_count == 1      # never re-assessed
+
+
+def test_aborted_maneuver_replans_and_resumes_driving():
+    """STRAFE aborts mid-maneuver, re-plans, and returns to normal driving.
+
+    The isolated tests above each pin one behavior; this proves the abort is
+    RECOVERABLE rather than merely detected -- that the ladder returns to
+    driving instead of stalling or escalating once the hazard passes.
+    """
+    cfg = _strafe_entry_cfg()
+    c = AvoidanceController(cfg)
+    c.set_goal_heading(0.0)
+    obst = _enter_strafe(c, cfg)
+    encounter = c.encounter_id
+
+    # Second obstacle appears alongside: the flank we committed to closes.
+    closing = _sectors(front=0.25, left=0.15)
+    c.step(closing, obst, None, 0.0, (0.0, 0.0), 0.2)
+    out = c.step(closing, obst, None, 0.0, (0.0, 0.0), 0.3)
+    assert out.state == "TURN"          # aborted the strafe, re-planned as a turn
+
+    # Both obstacles clear. TURN runs out its turn_timeout (1.5s) and hands off to
+    # DRIVE_PAST, which needs front >= clear_threshold and inside flank >=
+    # pass_clearance sustained for clear_confirm_time (0.5s) before completing.
+    clear = _sectors(front=5.0, left=5.0, right=5.0)
+    c.step(clear, None, None, 0.0, (0.0, 0.0), 0.4)     # still turning
+    c.step(clear, None, None, 0.0, (0.0, 0.0), 2.0)     # timeout -> DRIVE_PAST
+    out = c.step(clear, None, None, 0.0, (0.0, 0.0), 2.7)   # clear_confirm_time met
+
+    assert out.state == "DRIVE"
+    assert out.linear_x > 0.0                       # actually driving again
+    assert c.encounter_id == encounter              # same encounter throughout
+    assert c.has_recovered_this_encounter is False  # never escalated to RECOVER
+    assert c.consecutive_avoid_count <= cfg.max_avoid_attempts
