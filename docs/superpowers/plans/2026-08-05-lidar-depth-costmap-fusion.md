@@ -50,11 +50,36 @@ docker exec -u ubuntu MentorPi bash -lc '
   fresh `docker exec` shell. Pass `-e need_compile=False`. (Value read from the running
   bringup process, `/proc/<pid>/environ`.)
 
+### Where source code lives, and why it is not where you would guess
+
+**Verified 2026-08-07: the host project repo is NOT bind-mounted into the container.**
+`docker inspect MentorPi` shows only `/dev`, `/home/pi/docker/tmp → /home/ubuntu/shared`,
+pulse, X11, and dbus. Worse, `/home/ubuntu/ros2_ws` **is itself a git repo — Hiwonder's
+vendor one** (`git log`: "update command", "update .typerc"). Anything written to
+`/home/ubuntu/ros2_ws/src/` lands in the vendor's history, not this project's, and is
+invisible to code review.
+
+So there is no single path that is both git-committable and ROS-runnable. The split:
+
+| | |
+|---|---|
+| **Author and commit here** | `/home/pi/Desktop/LanderPi-Proximity-Alert/poc_fusion/` — host, top level, beside the existing `proximity_alert/` package |
+| **Build and run here** | `/home/ubuntu/ros2_ws/src/poc_fusion/` — container, populated by the deploy script, never hand-edited |
+
+- **The host repo is the source of truth.** Every edit, every commit, every review diff
+  happens there. The container copy is a build artifact.
+- **Deploy before any on-robot step** via `scripts/deploy_poc_fusion.sh` (Task 2 Step 5).
+  If you edit in the container and forget to copy back, the next deploy silently
+  overwrites your work — the sync is one-directional by design.
+- **Pure-logic tests need no container at all.** Confirmed on the host:
+  `cd poc_fusion && python3 -m pytest test/ -q` — this is how the existing
+  `proximity_alert` suite runs (49 tests passing). Task 3 is entirely off-robot.
+
 ### Paths that do not exist — do not use them
 
 - **`~/ros_ws`** — does not exist anywhere.
-- **Host `~/ros2_ws`** — exists, but is a **stale clone**. Editing it changes nothing
-  the robot runs. The live workspace is inside the container.
+- **Host `~/ros2_ws`** — exists, but is a **stale clone**, and is *not* the project repo
+  either. Editing it changes nothing the robot runs and nothing that gets committed.
 
 ### Motion safety
 
@@ -75,7 +100,8 @@ Confirmed live on 2026-08-06. Do not re-derive; do re-check if something behaves
 | Scan rate | 9.87 Hz |
 | Depth image | `/ascamera/camera_publisher/depth0/image_raw`, 640×400, **14.7 Hz** |
 | Depth encoding | **`mono16`** — *not* `16UC1`. Must be relabelled before `depth_image_proc`, see Task 4 Step 1a |
-| Camera pose | ~**40°** below horizontal, 0.246 m above floor. Coverage ceiling ~**0.94 m**; nothing above 0.246 m ever in frame (Task 10) |
+| Camera pose (operating) | ~**40°** below horizontal, 0.246 m above floor. Coverage ceiling ~**0.94 m**; nothing above 0.246 m ever in frame (Task 10). **Every task except 10a assumes this pose.** |
+| Camera pose (overhang test only) | 5.4° **up**, 0.349 m above floor. Blind below ~0.97 m. Used only for Task 15 class 3, then reverted (Task 10a) |
 | Depth camera frame | **`depth_camera_link`** (URDF also defines `depth_cam_link` — different frame, not the one topics use) |
 | `camera_info` | `/ascamera/camera_publisher/depth0/camera_info` — **valid** |
 | Driver cloud | `/ascamera/camera_publisher/depth0/points` — already published |
@@ -125,10 +151,20 @@ speckle removal. Do not describe the LiDAR input as filtered anywhere in the wri
 - **Pure logic is unit-testable and tested off-robot.** Geometry, masking, and
   thresholding live in dependency-free modules under `poc_fusion/lib/` taking arrays
   and numbers, not ROS messages.
+- **Task 3 is strict TDD — test first, no exceptions.** Every function in
+  `lib/window_geometry.py` and `lib/obstacle_detection.py` gets its failing test
+  written and *observed failing* before any implementation exists. This is the math
+  that decides whether the robot stops; a test written after the code passes
+  immediately and proves nothing about whether it can catch the bug. The step order in
+  Task 3 encodes this and must not be reordered for convenience.
+- **Author on the host, deploy to the container.** No task writes source directly into
+  `/home/ubuntu/ros2_ws/src/`. See "Where source code lives" above.
 - **Every on-robot verification step records its output** into
   `docs/poc_fusion_verification.md`. "It looked right in RViz" is not a result.
 
 ## File Structure
+
+All paths relative to the host repo root, `/home/pi/Desktop/LanderPi-Proximity-Alert/`.
 
 ```
 poc_fusion/
@@ -151,6 +187,7 @@ poc_fusion/
     ├── test_window_geometry.py
     └── test_obstacle_detection.py
 
+scripts/deploy_poc_fusion.sh         # host poc_fusion/ -> container src/, one-directional
 docs/poc_fusion_verification.md      # running record of on-robot measurements
 ```
 
@@ -217,12 +254,18 @@ establishes the pitch-measurement procedure that Task 10 will use.
       From `tf2_echo base_link depth_camera_link`, take the optical **forward** axis in
       `base_link` and read its z-component; downward pitch = `asin(−z)`.
       Current measured: forward axis `(0.766, −0.005, −0.642)` → **39.9° down**.
-      This is the check Task 10 must satisfy at 20°.
+      This is the same procedure Task 10 uses to confirm the 40° pose each session,
+      and Task 10a uses to confirm the overhang-test pose (where the z-component flips
+      sign, to +0.094).
 
 ## Task 2: Package scaffolding
 
-- [ ] **Step 1: Create the `poc_fusion` package** in `/home/ubuntu/ros2_ws/src/`
-      (`ament_python`), with the file structure above and empty config files.
+- [ ] **Step 1: Create the `poc_fusion` package at the host repo root**
+      (`/home/pi/Desktop/LanderPi-Proximity-Alert/poc_fusion/`, `ament_python`), with the
+      file structure above and empty config files. **Not** in
+      `/home/ubuntu/ros2_ws/src/` — see "Where source code lives". Mirror the layout and
+      `setup.py`/`setup.cfg` conventions of the sibling `proximity_alert/` package rather
+      than inventing new ones.
 - [ ] **Step 2: Declare dependencies** in `package.xml` — **all of them, including the
       ones installed by hand in Task 0.** Task 0's `apt-get` makes them present on
       *this* container only; `package.xml` is what makes `rosdep install` reproduce the
@@ -250,15 +293,75 @@ establishes the pitch-measurement procedure that Task 10 will use.
 - [ ] **Step 3: Register entry points** in `setup.py`: `depth_preprocess_node`,
       `costmap_stop_monitor_node`, `latency_recorder_node`. Add `config/` and `launch/`
       to `data_files`.
-- [ ] **Step 4: Build and confirm the package is discoverable.**
-      `colcon build --packages-select poc_fusion` as `ubuntu`, then
-      `ros2 pkg executables poc_fusion`.
+- [ ] **Step 4: Write `scripts/deploy_poc_fusion.sh`.** Copies the host
+      `poc_fusion/` into `/home/ubuntu/ros2_ws/src/poc_fusion/` in the `MentorPi`
+      container. Requirements:
+      - **One-directional, host → container.** Never copies back. State this in a
+        comment at the top of the script, because the failure it prevents (editing in
+        the container, then losing it to the next deploy) is silent.
+      - Deletes files in the destination that no longer exist in the source, so a
+        renamed or removed module does not linger and get imported.
+      - Leaves `build/`, `install/`, `log/`, and `__pycache__` alone.
+      - Ends by `chown`ing the destination to `ubuntu:ubuntu` — a `docker cp` from the
+        host lands root-owned, and a subsequent `colcon build` as `ubuntu` then fails
+        with an error that does not name the real cause.
+      Verify by round-trip: deploy, then `docker exec -u ubuntu MentorPi diff -r` the
+      two trees and confirm no differences.
+- [ ] **Step 5: Build and confirm the package is discoverable.** Deploy first
+      (Step 4), then inside the container as `ubuntu`:
+      `colcon build --packages-select poc_fusion`, then
+      `ros2 pkg executables poc_fusion`. **Never `colcon build` as root.**
 
-## Task 3: Pure geometry and detection logic (off-robot)
+## Task 3: Pure geometry and detection logic (off-robot, strict TDD)
 
-Write and test these before touching hardware. Everything here is arrays and numbers.
+Everything here is arrays and numbers — no ROS, no hardware, no container. Run with
+`cd poc_fusion && python3 -m pytest test/ -q` on the host.
 
-- [ ] **Step 1: `lib/window_geometry.py` — `window_mask(...)`.**
+> **This task is strict test-driven development and the step order below is the
+> requirement, not a suggestion.** Steps 1–3 write tests against functions that do not
+> exist yet and watch them fail; Steps 4–6 make them pass. This is the arithmetic that
+> decides whether the robot stops for an obstacle, and it is the one place in this plan
+> where a silent error produces confident, plausible, wrong numbers rather than a
+> crash — the row/column-slice design this replaced would have shipped a detection
+> window that silently swung to the robot's back as it turned, while still returning
+> sensible-looking values. A test written after the implementation passes on first run
+> and demonstrates nothing about its ability to catch that.
+>
+> **Required of every function here:** the failing test exists first, you run it, and
+> you confirm it fails *for the intended reason* (function missing / wrong value) and
+> not from a typo or import error. Record the observed failure output in the task
+> report. A test that passed the first time you ran it is not evidence — delete the
+> implementation and start that function over.
+
+### Steps 1–3: RED — write the failing tests first
+
+- [ ] **Step 1: `test/test_window_geometry.py` — tests for `window_mask(...)`,**
+      written against the signature below before the module exists. Cover: a cell
+      directly ahead is in the mask; a cell behind is not; a cell beyond `forward_m`
+      is not; a cell outside `half_width_m` is not; a non-centred `origin` is honoured
+      (do **not** assume the robot sits at grid centre). Run them; confirm they fail on
+      the missing module.
+- [ ] **Step 2: `test/test_window_geometry.py` — the rotation test. The important one.**
+      Place a synthetic lethal cell 1 m directly ahead of the robot in `odom`. Sweep
+      `ryaw` through 0, ±45°, ±90°, 180°, **re-deriving the cell's `odom` position each
+      time so it stays physically ahead**: assert it is always in the mask. Then hold
+      the cell fixed in `odom` and rotate the robot away: assert it leaves the mask.
+      This is the regression test for the bug the earlier design would have shipped.
+      Also: a test for `area_cm2_to_cells(area_cm2, resolution)` asserting the same
+      physical area yields different cell counts at 0.05 and 0.10 resolution.
+- [ ] **Step 3: `test/test_obstacle_detection.py` — tests before the module exists.**
+      Empty grid → no stop. Fully-lethal window → stop. **A diagonal-only chain forms
+      one cluster under 8-connectivity** (this is the assertion that pins the
+      connectivity choice — under 4-connectivity it fragments and the trigger never
+      fires). Sub-threshold speckle → no stop. **Unknown (`-1`) cells are treated as
+      not-lethal — assert this explicitly**, since `-1 >= lethal` is false but the
+      intent must be pinned against a future change to unsigned handling.
+      Run all three files; confirm every test fails, and that each fails on the missing
+      import rather than on a mistake in the test.
+
+### Steps 4–6: GREEN — minimal implementations
+
+- [ ] **Step 4: `lib/window_geometry.py` — `window_mask(...)`.**
       Given costmap `width`, `height`, `resolution`, `origin_x`, `origin_y`, and the
       robot pose in `odom` (`rx`, `ry`, `ryaw`), plus `forward_m` and `half_width_m`,
       return a `(height, width)` boolean array marking cells whose centres fall inside
@@ -272,10 +375,10 @@ Write and test these before touching hardware. Everything here is arrays and num
       Vectorized with numpy; a 60×60 grid is 3600 points.
       **No `forward_sign` parameter. No "robot is at grid centre" assumption.**
       Forward is +x by REP-103, and `origin` is used directly.
-- [ ] **Step 2: `lib/window_geometry.py` — `area_cm2_to_cells(area_cm2, resolution)`.**
-      Physical area threshold → cell count, computed from the live resolution so the
-      threshold means the same thing if resolution changes.
-- [ ] **Step 3: `lib/obstacle_detection.py`.**
+      Also `area_cm2_to_cells(area_cm2, resolution)` — physical area threshold → cell
+      count, computed from the live resolution so the threshold means the same thing
+      if resolution changes.
+- [ ] **Step 5: `lib/obstacle_detection.py`.**
       - `occupancy_fraction(values, lethal_threshold)` — `values` is the 1-D array of
         masked cell costs.
       - `largest_cluster_cells(grid, mask, lethal_threshold)` — `scipy.ndimage.label`
@@ -284,18 +387,14 @@ Write and test these before touching hardware. Everything here is arrays and num
         blobs that frequently touch only diagonally; 4-connectivity fragments them
         below threshold and the trigger never fires.
       - `should_stop(...)` — OR of the fraction and area conditions.
-- [ ] **Step 4: Unit tests.** Empty grid → no stop. Fully-lethal window → stop. A
-      diagonal-only chain → one cluster under 8-connectivity. Sub-threshold speckle →
-      no stop. Unknown (`-1`) cells treated as not-lethal, explicitly asserted.
-- [ ] **Step 5: Rotation test for `window_mask` — the important one.**
-      Place a synthetic lethal cell 1m directly ahead of the robot in `odom`. Sweep
-      `ryaw` through 0, ±45°, ±90°, 180°, re-deriving the cell's `odom` position each
-      time so it stays physically ahead: assert it is always in the mask. Then hold the
-      cell fixed in `odom` and rotate the robot away: assert it leaves the mask.
-      **This is the regression test for the bug the earlier row/column-slice design
-      would have shipped** — a window that silently swings to the robot's side and
-      then its back as it turns, while still returning plausible numbers.
-- [ ] **Step 6: Run the full suite off-robot.** `colcon test --packages-select poc_fusion`.
+      Write the minimum that turns the Step 1–3 tests green. No extra parameters, no
+      configurability the tests do not demand.
+- [ ] **Step 6: Run the full suite and confirm it is green and clean.**
+      `cd poc_fusion && python3 -m pytest test/ -q` on the host — no container needed.
+      Output must be pristine: no warnings, no errors, no skips.
+      **In the task report, record for each function: the failing output observed at
+      RED and the passing output at GREEN.** A report that shows only the green run has
+      not demonstrated TDD and the task is not complete.
 
 ## Task 4: Depth preprocessing node
 
@@ -328,7 +427,8 @@ Write and test these before touching hardware. Everything here is arrays and num
       camera fault.
 - [ ] **Step 3: Self-arm ROI masking from YAML.** Read the ROI from
       `config/depth_preprocess_params.yaml` — **not hard-coded**, because it must be
-      re-derived whenever the arm pose changes (Task 10 changes it). Start with a
+      re-derived whenever the arm pose changes (Task 10a needs a second profile for
+      the overhang-test pose; keep them separate). Start with a
       permissive placeholder; Task 11 measures the real one.
 - [ ] **Step 4: Spatial denoising.** Median filter, kernel size a parameter. Keep it
       cheap — this runs at 14.7 Hz on a Pi 5 and Task 13 measures the cost.
@@ -495,40 +595,93 @@ existing pose can and cannot see, so the validation tasks test reachable things.
       `depth_preprocess_params.yaml` is pose-specific; since the pose is unchanged from
       when it was measured, it stays valid. Re-derive it only if Step 1 shows sag.
 - [ ] **Step 5: Record the consequences for the A/B study** so they are not rediscovered
-      mid-experiment: Task 15 moves from 1 m to **0.6 m**, and **class 3 (overhanging
-      obstacle) is not runnable at this pitch** — see Task 15 Step 2.
+      mid-experiment: Task 15 classes 1/2/4 move from 1 m to **0.6 m** and stay at this
+      pose; **class 3 (overhanging obstacle) is not runnable at this pitch** and moves
+      to the separate pose in Task 10a — see Task 15 Step 2.
 
-### Deferred: 20° pitch change
+## Task 10a: Command and verify the overhang-test pose (design doc §4d)
 
-Not cancelled, and now with a quantified payoff: at 20° the top ray points 5.2° *above*
-horizontal, so the FOV stops terminating on the floor — both the 0.94 m ceiling and the
-0.246 m height limit disappear, which is what makes the overhang class testable.
+**This is a second, test-only pose used solely to make Task 15's class 3 runnable.** It
+does not replace the ~40° operating pose. The arm returns to 40° immediately afterwards,
+and every other task in this plan runs at 40°.
 
-When it is done, the following apply and were verified during this review:
+Superseded plan text, for the record: an earlier revision deferred this as a "20° pitch
+change" to be done via the WonderPi app. Design doc §4d supersedes that — once the arm
+is repositioned through ROS rather than a paired phone, 20° is no longer the right
+target (it gains only 2.7 cm of height over the current pose), and a fuller
+reconfiguration is chosen instead.
 
-- **Positioning route:** WonderPi app's Robot Control interface, bypassing the flaky
-  `FollowJointTrajectory` path. **Force-close the app afterwards** — left running in the
-  background it can keep broadcasting heartbeat/control commands to the STM32 board and
-  fight the POC's own velocity commands, producing a fault that looks like a ROS bug and
-  is not one.
-- **Do NOT run `.stop_ros.sh` to "lock" the arm.** It exists only inside the container
-  (`/home/ubuntu/.stop_ros.sh`, not on the host) and its entire contents are
-  `ps aux | grep ros | ... | kill -9` — an indiscriminate kill of every ROS process,
-  including `robot_state_publisher` (destroying the `base_link → depth_camera_link` TF
-  chain being verified), the Aurora driver, and the LiDAR driver. It also does not do
-  what it is assumed to: HX-06L bus servos hold position from their own internal loop
-  while powered and torque-enabled, regardless of ROS. Simply send no arm commands.
-- **Verification cannot rely on TF alone.** `robot_state_publisher` computes TF *from*
-  `/joint_states`, so they are one source, not two — if `/joint_states` goes stale after
-  app-driven motion (likely, since the app talks to the servo bus directly), `tf2_echo`
-  will confidently report the wrong pose. Cross-check against the camera image
-  (`http://localhost:8080/snapshot?topic=/ascamera/camera_publisher/rgb0/image`) and/or
-  `/ros_robot_controller/bus_servo/get_state`.
-- **Target:** optical forward-axis z-component `−0.342 ± 0.03` (18.3°–21.7° down).
-  Current baseline: `joint2 = 0.9634`, `joint3 = −1.5499`, `joint4 = −1.6755`. Determine
-  the correction sign with a ≤0.1 rad nudge; it is not known a priori.
-- **Afterwards:** re-derive the self-arm ROI, recompute the coverage envelope, and
-  re-run Task 11's sweep and Task 15's A/B at the longer ranges the new pose permits.
+**Target pose**, from the forward-kinematics model validated against the live
+current-pose transform (computed pitch 39.94° vs. measured 39.9°; forward axis matched
+to three decimals):
+
+| | |
+|---|---|
+| Joints | `joint2 ≈ 0.3°`, `joint3 ≈ 0.3°`, `joint4 ≈ −84.7°` (grid-search resolution 5°) |
+| Camera height | **0.349 m** above floor (vs 0.246 m at 40°) |
+| Pitch | **5.4° up** from horizontal (vs 39.9° down) |
+| Top ray | **+30.6°** above horizontal |
+| Bottom ray | 19.8° below horizontal |
+
+- [ ] **Step 1: Refine the joint target to ~0.5° resolution** before generating the
+      trajectory goal. The 5° grid search above located the pose; it did not optimise
+      it. Re-run the same FK sweep at finer resolution around the listed values and
+      record the refined triple. This changes nothing structural — if the refined pose
+      differs from the table by more than ~2° in resulting pitch, stop and re-check the
+      FK model rather than trusting the new number.
+- [ ] **Step 2: Command the pose via `FollowJointTrajectory`** through the
+      `servo_controller` action path. **Known-flaky (Task 4 environment notes / design
+      §4): the `arm_controller`, `gripper_controller`, and `controller_manager` nodes
+      dropped out of the ROS graph once after a goal was sent and needed manual
+      relaunch.** If that happens, relaunch them manually and re-send. Expect it; it is
+      not a new bug.
+      **Do NOT run `.stop_ros.sh` at any point.** It exists only inside the container
+      (`/home/ubuntu/.stop_ros.sh`) and its entire contents are
+      `ps aux | grep ros | ... | kill -9` — an indiscriminate kill of every ROS process,
+      including `robot_state_publisher` (which would destroy the very
+      `base_link → depth_camera_link` chain this task verifies), the Aurora driver, and
+      the LiDAR driver. It also does not do what it is assumed to: HX-06L bus servos
+      hold position from their own internal control loop while powered and
+      torque-enabled, regardless of ROS. **To hold a pose, simply stop sending arm
+      commands.**
+- [ ] **Step 3: Verify the achieved pose — and not with TF alone.**
+      `robot_state_publisher` computes TF *from* `/joint_states`, so they are one source
+      of truth, not two: if `/joint_states` goes stale or resets, `tf2_echo` will
+      confidently report a pose the arm is not in, and nothing in the graph will
+      disagree. Use all three:
+      1. `ros2 run tf2_ros tf2_echo base_footprint depth_camera_link` — expect height
+         **0.349 m ± 0.02**, forward-axis z-component **+0.094 ± 0.03** (5.4° up;
+         note the **sign flip** from the 40° pose's −0.642 — the camera now points
+         above horizontal, and a negative z here means the move did not take).
+      2. The camera image itself — the test object must be visibly in frame.
+      3. `/ros_robot_controller/bus_servo/get_state`
+         (`ros_robot_controller_msgs/srv/GetBusServoState`) for true servo feedback if
+         it is available; this service is identified but not yet verified to work.
+- [ ] **Step 4: Re-derive the self-arm ROI for this pose.** The ROI in
+      `depth_preprocess_params.yaml` is **pose-specific and the 40° value is invalid
+      here** — the arm is in a completely different configuration, so the gripper
+      occupies a different image region. Read the new ROI off `/poc_fusion/debug_image`
+      and record it as a *separate* config profile; do not overwrite the 40° one, since
+      every other task needs it back.
+- [ ] **Step 5: Record the coverage envelope for this pose** in the verification doc:
+      floor not visible until **~0.97 m** (bottom ray is below horizontal but shallow),
+      and height ceiling **growing** with distance — 0.65 m at 0.5 m, 0.94 m at 1.0 m,
+      1.53 m at 2.0 m.
+      **Record the near-field blind zone as a hard constraint:** below ~0.97 m this pose
+      sees nothing at floor level, a real regression against the 40° pose. **No
+      near-field or low-obstacle test is ever run at this pose** — not Task 11's sweep,
+      not Task 15 classes 1/2/4. Running them here would attribute a pose limitation to
+      the sensor.
+- [ ] **Step 6: Record the class-3 visible window.** For a ~0.75 m test object at
+      0.349 m camera height, the object is in frame only at range **≥ 0.68 m** — closer
+      than that, the required look-up angle exceeds the +30.6° top ray and the object
+      scrolls out of the top of frame. **This is expected geometry, not a fault to
+      debug.** Task 15 places the object at 1.0–1.5 m accordingly.
+- [ ] **Step 7: Return the arm to the 40° pose and re-verify** via Task 10 Step 1
+      (expect forward-axis z back to −0.642, height back to 0.246 m), and restore the
+      40° self-arm ROI. **Do not leave the robot in the test pose** — every other task
+      in this plan assumes 40°, and a silently-changed pose invalidates their results
+      without any error appearing.
 
 
 ## Task 11: Validation and tuning
@@ -548,8 +701,9 @@ When it is done, the following apply and were verified during this review:
       compare against the recorded 39.9°.
       Magnitudes at this pose (max floor range 0.94 m): **1° sag → 1.6 cm lift,
       2° → 3.3 cm** — both under one 5 cm cell, so 40° is a forgiving pose for this.
-      It would matter far more after the 20° change, where the floor is visible to
-      several metres and the same 2° becomes ~7 cm at 2 m. Record the check either way.
+      It would matter far more at the Task 10a pose, where the floor is visible to
+      several metres and the same 2° becomes ~7 cm at 2 m — another reason that pose is
+      test-only. Record the check either way.
 - [ ] **Step 2: Self-mask check.** Confirm the gripper is excluded and that real
       obstacles near frame edges are **not** over-masked.
 - [ ] **Step 3: Detection sweep — ranges bounded by Task 10's coverage envelope.**
@@ -627,8 +781,9 @@ for without any way to measure it.
 ## Task 14: Graceful degradation
 
 - [ ] **Step 1: Disconnect the camera mid-run.** Confirm the costmap keeps updating from
-      the LiDAR, camera marks age out within 0.5s, and the watchdog logs an explicit
-      error naming the loss of fusion.
+      the LiDAR, camera marks age out within **`observation_persistence` (0.3 s per
+      Task 6 Step 2, or whatever value Task 11 Step 5a derived)**, and the watchdog logs
+      an explicit error naming the loss of fusion.
 - [ ] **Step 2: Reconnect.** Confirm fusion resumes and a recovery message is logged.
 - [ ] **Step 3: Confirm no silent degradation** — the failure must be visible in the log
       without inspecting topics.
@@ -650,13 +805,16 @@ already stops for obstacles.
          in frame at 0.6 m. **This class carries the POC at the 40° pose.**
       3. **Overhanging object** (pedestal-style form) — the class that caused the real
          2026-07-22 collision, and the strongest available motivation.
-         **⚠ NOT RUNNABLE at the 40° pose — skip it, do not substitute a proxy.**
-         Nothing above the camera's 0.246 m height enters the frame at any distance
-         (Task 10 Step 2), so the depth camera cannot see an overhang either. Running it
-         would yield a null result caused entirely by pose, and reporting that as
-         "fusion does not help with overhangs" would be a false negative published
-         against the project's own strongest motivating incident.
-         Deferred with the 20° pitch change (Task 10, "Deferred" section).
+         **⚠ Not runnable at the 40° pose, and not run at 0.6 m.** Nothing above the
+         camera's 0.246 m height enters the frame at any distance there (Task 10
+         Step 2). **Run this class on its own, at the Task 10a overhang-test pose, with
+         the object at 1.0–1.5 m** (inside the 0.68 m visible-window bound from Task 10a
+         Step 6), then return the arm to 40° per Task 10a Step 7 before anything else.
+         **Do not run classes 1/2/4 at the 10a pose** — its sub-0.97 m blind zone would
+         make the camera miss them for reasons that have nothing to do with fusion.
+         The distances are deliberately not comparable across classes: each is chosen
+         against its own pose's coverage ceiling, and the writeup must say so rather
+         than presenting a single distance for the study.
       4. **Thin vertical obstacle** (chair leg) — LiDAR's strength; included to check
          the camera path does not *degrade* anything.
 - [ ] **Step 3: Record false-positive counts per condition** over bare-floor runs.
@@ -664,19 +822,23 @@ already stops for obstacles.
 - [ ] **Step 4: Write up results honestly, including null results.** A class where
       fusion shows no benefit is legitimate and publishable, and far better than a
       reviewer finding the gap later.
-- [ ] **Step 5: State the pose limitation explicitly in the writeup.** Say that the
-      camera was left at the stock ~40° fall-prevention pitch for the POC, that this
-      bounds coverage to ~0.94 m and to objects below 0.246 m, and that the overhang
-      class therefore remains open pending the pitch change. Reporting a fusion benefit
-      while quietly dropping the class that motivated the work is the specific failure
-      mode to avoid.
+- [ ] **Step 5: State the two-pose structure explicitly in the writeup.** Classes 1/2/4
+      ran at the stock ~40° fall-prevention pitch, which bounds their coverage to
+      ~0.94 m and to objects below 0.246 m. Class 3 required a **second, test-only pose**
+      (Task 10a) to be observable at all, with its own narrower visible window
+      (≥0.68 m) and a sub-0.97 m near-field blind zone that rules that pose out for
+      general use. **The overhang result is therefore pose-specific and is not evidence
+      that the operating pose sees overhangs.** Presenting the two together as one
+      uniform experiment, or quietly omitting which pose produced which class, is the
+      specific failure mode to avoid.
 
 ## Task 16: Documentation
 
 - [ ] **Step 1: Finalize `docs/poc_fusion_verification.md`** with every measured value:
-      environment facts, TF chain, the as-is 40° pose with its derived coverage
-      envelope, tuned thresholds, sweep results, latency median/p95, CPU baseline vs
-      fused, A/B results, and the classes deferred with the 20° pitch change.
+      environment facts, TF chain, **both poses** (the as-is 40° operating pose and the
+      Task 10a overhang-test pose) each with its derived coverage envelope, tuned
+      thresholds, sweep results, latency median/p95, CPU baseline vs fused, and A/B
+      results **labelled with which pose produced each class**.
 - [ ] **Step 2: Write `poc_fusion/README.md`** — how to launch, what each config key
       does, the environment assumptions, and the two known approximations (unrectified
       depth; pipeline latency as a lower bound).
@@ -709,8 +871,13 @@ already stops for obstacles.
 - Feeding the fused costmap into `avoidance.py` (protects the trial dataset).
 - Formal checkerboard intrinsic calibration and depth rectification.
 - Full Nav2 navigation (global costmap, map server, planner, behavior tree).
-- Root-causing the `servo_controller` dropout, and finding a true bus-servo feedback
-  path — candidate identified but unverified: service
+- Root-causing the `servo_controller` dropout. Task 10a works around it by expecting the
+  dropout and relaunching manually.
+- Verifying the true bus-servo feedback path — service
   `/ros_robot_controller/bus_servo/get_state`
-  (`ros_robot_controller_msgs/srv/GetBusServoState`). Task 10 works around this by
-  verifying pose through TF instead.
+  (`ros_robot_controller_msgs/srv/GetBusServoState`) is identified but has not been
+  confirmed to work. Task 10a Step 3 uses it opportunistically and does not depend on
+  it, cross-checking against the camera image instead. **Note TF is not an independent
+  check** — `robot_state_publisher` derives it from `/joint_states`.
+- Adopting the Task 10a pose for general operation. Its sub-0.97 m near-field blind zone
+  makes it unsuitable; it exists only to make Task 15 class 3 observable.
