@@ -291,3 +291,197 @@ so `apt-get` could reach the ROS/Ubuntu mirrors. No HARD SAFETY RULE was touched
 `cmd_vel` publish, no arm motion, no `.stop_ros.sh`, no edits to `proximity_alert/` or the
 vendor `ros2_ws`. `poc_fusion/config/costmap_params.yaml` now holds the single
 source-of-truth `scan_topic: /scan_raw`.
+
+---
+
+## Task 1: TF chain verification — record only (2026-08-07)
+
+This task writes no source code. It documents the TF chain from `base_link` to the depth
+camera's optical frame and establishes the pitch-measurement procedure that Task 10 (and
+Task 10a) reuse each session. All commands below (`view_frames`, `tf2_echo`) are read-only
+per CONSTRAINTS.md — no `cmd_vel` publish, no arm command, no `.stop_ros.sh`.
+
+**What's freshly measured today vs. transcribed:** Steps 1–3 below are all live
+re-measurements taken today (2026-08-07), run from `/tmp` inside the container so no
+`view_frames` artifacts land in the vendor `ros2_ws`. The task-1 brief's own prior
+values (`(0.766, −0.005, −0.642)` → 39.9° down, verified 2026-08-06) are quoted only as
+the point of comparison in Step 3 — they are not what's reported as "today's number."
+
+### Step 1 — The TF chain
+
+Commands run from a scratch directory inside the container (not `/home/ubuntu/ros2_ws`,
+per CONSTRAINTS.md — `view_frames` writes its PDF/GV output into the CWD):
+```
+docker exec -u ubuntu MentorPi bash -lc '
+  source /opt/ros/humble/setup.bash
+  source /home/ubuntu/ros2_ws/install/setup.bash
+  mkdir -p /tmp/view_frames_scratch
+  cd /tmp/view_frames_scratch
+  timeout 15 ros2 run tf2_tools view_frames
+'
+```
+
+Actual output (`frame_yaml`, trimmed to the arm/camera/base lineage; full output also
+lists wheel, gripper and IMU frames not relevant here):
+```
+base_footprint:
+  parent: 'odom'
+base_link:
+  parent: 'base_footprint'
+back_shell_black_link:
+  parent: 'base_link'
+link1:
+  parent: 'back_shell_black_link'
+link2:
+  parent: 'link1'
+link3:
+  parent: 'link2'
+link4:
+  parent: 'link3'
+camera_connect_link:
+  parent: 'link4'
+depth_cam_link:
+  parent: 'camera_connect_link'
+depth_camera_link:
+  parent: 'depth_cam_link'
+rgb_camera_link:
+  parent: 'depth_camera_link'
+```
+
+**Full resolved chain, live-verified today:**
+`odom → base_footprint → base_link → back_shell_black_link → link1 → link2 → link3 →
+link4 → camera_connect_link → depth_cam_link → depth_camera_link`
+
+Two refinements versus the brief's shorthand chain (`base_link → link1..link4 →
+camera_connect_link → depth_cam_link → depth_camera_link`, plus `odom → base_link`):
+these are more precise, not contradictions —
+1. There's a `back_shell_black_link` hop between `base_link` and `link1` (the arm's
+   physical mount point on the chassis shell).
+2. `odom → base_link` is actually `odom → base_footprint → base_link` — `base_footprint`
+   is the intermediate ground-projection frame REP-105 expects; it doesn't change which
+   frames matter for the fusion transform, but a reader chasing this chain by hand needs
+   the intermediate frame name to match what `tf2_echo`/`view_frames` actually print.
+
+Artifacts (`frames_2026-08-07_*.gv` / `.pdf`) were written to
+`/tmp/view_frames_scratch` inside the container only — not committed to this repo, not
+written into `/home/ubuntu/ros2_ws`.
+
+**The `depth_cam_link` vs `depth_camera_link` trap — the single most important thing in
+this section.** The URDF (`landerpi_description/urdf/arm.urdf.xacro`) defines
+`depth_cam_link` as a real mesh link, fixed to `camera_connect_link` via the
+`depth_cam_joint` (translation `[-0.0100, 0.0006, -0.0001]`, near-zero rotation). A
+**second, separate** frame, `depth_camera_link`, is layered on top of it — added not by
+the URDF but by a `static_transform_publisher` node in
+`peripherals/launch/include/aurora930.launch.py`:
+```
+executable='static_transform_publisher',
+arguments = ['0', '0.02', '0', '-1.57', '0', '-1.57', 'depth_cam_link', 'depth_camera_link']
+# [x, y, z, roll, pitch, yaw, parent_frame, child_frame]
+```
+That's the standard `camera_link → camera_optical_frame` axis-convention rotation
+(roll/pitch/yaw ≈ −90°/0°/−90°): it re-expresses the mesh-link axes (x-forward, per REP-103
+convention for a body-fixed link) into the optical convention (x-right, y-down, z-forward)
+that `depth_image_proc` and the `sensor_msgs/CameraInfo` pipeline expect. **Every depth
+topic (`/ascamera/camera_publisher/depth0/image_raw`, `.../camera_info`, `.../points`) is
+stamped `depth_camera_link`, never `depth_cam_link`.** Using `depth_cam_link` for any TF
+lookup in this project silently shifts the whole point cloud by that rotation — no error,
+just wrong geometry. This confirms the CONSTRAINTS.md table entry; it is now traced to its
+exact source (the static transform above), not just asserted.
+
+### Step 2 — The transform is arm-driven, not a static fudge
+
+From the URDF (`arm.urdf.xacro`):
+```
+<joint name="joint4" type="revolute">
+  <parent link="link3" />
+  <child link="link4" />
+  <axis xyz="0.00859391749791871 -0.999923336386447 0.00891436659750842" />
+  <limit lower="-2.09" upper="2.09" effort="1000" velocity="10" />
+</joint>
+...
+<joint name="camera_connect_joint" type="fixed">
+  <origin xyz="-0.035657 0.015573 0.044852" rpy="-0.7888 -1.5585 0.79749" />
+  <parent link="link4" />
+  <child link="camera_connect_link" />
+</joint>
+```
+`camera_connect_joint` is itself `type="fixed"` — the camera mount does not wobble
+relative to `link4`. But its **parent is `link4`**, which is the child of the **revolute**
+`joint4` (±2.09 rad limit, i.e. ±120°, driven by the arm). So the entire downstream chain
+(`camera_connect_link → depth_cam_link → depth_camera_link`) rotates rigidly with `link4`
+whenever `joint4` moves. This is exactly why the arm must be **locked** for the duration
+of any fusion run in this POC: any joint4 motion changes the camera pitch measured in Step
+3 below, and nothing in the fusion pipeline re-measures it live — Task 10 re-checks it once
+per session as a manual gate, not continuously.
+
+`view_frames` corroborates this from the live graph: `link4`'s `rate: 13.137` /
+non-zero `buffer_length: 4.948` (Step 1 output above) shows it is being actively
+broadcast by `robot_state_publisher` from joint-state updates, unlike the `fixed`-joint
+downstream links which show `rate: 10000.000` / `buffer_length: 0.000` (static, published
+once, no joint-state dependency).
+
+### Step 3 — Pitch-measurement procedure and today's value
+
+Command:
+```
+docker exec -u ubuntu MentorPi bash -lc '
+  source /opt/ros/humble/setup.bash
+  source /home/ubuntu/ros2_ws/install/setup.bash
+  timeout 8 ros2 run tf2_ros tf2_echo base_link depth_camera_link
+'
+```
+
+Actual output (steady-state, repeated once per second once the buffer filled; the very
+first line is a transient "frame does not exist" warning printed before TF2's buffer had
+populated — it resolves within the same second and every subsequent sample is clean):
+```
+[INFO] [tf2_echo]: Waiting for transform base_link -> depth_camera_link: Invalid frame ID
+"base_link" passed to canTransform argument target_frame - frame does not exist
+At time 1786043135.721853992
+- Translation: [0.105, 0.021, 0.192]
+- Rotation: in Quaternion [-0.639, 0.642, -0.300, 0.298]
+- Rotation: in RPY (radian) [-2.268, -0.002, -1.576]
+- Rotation: in RPY (degree) [-129.974, -0.101, -90.289]
+- Matrix:
+ -0.005 -0.642  0.766  0.105
+ -1.000  0.002 -0.005  0.021
+  0.002 -0.766 -0.642  0.192
+  0.000  0.000  0.000  1.000
+```
+(Six further samples in the same run were byte-identical — arm was stationary throughout,
+consistent with Step 2's "must be locked" requirement being honored during this
+verification.)
+
+**Procedure:** the 3×3 rotation block's **third column** is `depth_camera_link`'s optical
+z-axis (forward, per the optical convention x-right/y-down/z-forward established in Step
+1) expressed in `base_link`. Reading that column off the matrix above:
+```
+forward axis (base_link frame) = (0.766, -0.005, -0.642)
+```
+Downward pitch = `asin(-z)` where `z = -0.642`:
+```
+$ python3 -c "import math; print(math.degrees(math.asin(0.642)))"
+39.94111664125141
+```
+**Today's measured value: forward axis `(0.766, −0.005, −0.642)` → 39.9° down.**
+
+**Comparison with the brief:** this matches the brief's recorded prior value —
+`(0.766, −0.005, −0.642)` → 39.9° down — to three decimal places on every component. No
+discrepancy to report; the arm's parked pose has not drifted between 2026-08-06 and
+today's re-measurement.
+
+### Task 1 summary
+
+All three steps recorded, no code written, no arm command issued, no velocity published.
+Key findings for future tasks:
+- The chain resolves as `odom → base_footprint → base_link → back_shell_black_link →
+  link1 → link2 → link3 → link4 → camera_connect_link → depth_cam_link →
+  depth_camera_link`; use `depth_camera_link` for every fusion lookup, never
+  `depth_cam_link` — the two are related by a `static_transform_publisher`-added optical
+  rotation, not by identity.
+- The pitch is arm-driven through revolute `joint4`, not a fixed offset baked into the
+  camera mount — Task 10 must re-verify it every session with the Step 3 procedure above,
+  and Task 10a reuses the same procedure to confirm the overhang-test pose where the
+  z-component is expected to flip sign (to +0.094 per the brief).
+- Today's live re-measurement reproduced the brief's recorded value exactly: forward axis
+  `(0.766, −0.005, −0.642)` → 39.9° down.
