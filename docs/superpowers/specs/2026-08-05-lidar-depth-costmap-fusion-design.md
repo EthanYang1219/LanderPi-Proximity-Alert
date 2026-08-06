@@ -268,6 +268,60 @@ terminates on the floor and both the ~0.94 m range ceiling and the "nothing abov
   in §12. Re-deriving it is a pose change plus a re-measured arm mask (§7), not a code
   change.
 
+### 4d. Overhang-test pose (Option C) — test-only, not a replacement for §4a
+
+**Decision (2026-08-07): add a second, test-only arm pose used exclusively to run the
+§12 class 3 overhang test.** This does not replace the 40°-down operating pose (§4a) —
+every other trial in §8 and §12 still runs at 40°. The arm returns to the 40° pose
+before and after this one test.
+
+**Why not just re-pitch to 20° (§4c) instead.** §4c was deferred because re-posing via
+the WonderPi app requires phone pairing over what's currently an SSH-only session — too
+much friction for a POC. This pose is instead commanded through the same ROS
+`FollowJointTrajectory` path already used for normal operation (§4, known-flaky
+blocker), which sidesteps the phone-pairing problem entirely. Once a ROS-commanded
+reposing is accepted as in scope, there's no reason to settle for 20°'s marginal gain
+(§4c) when a fuller reconfiguration gets meaningfully more height and a genuinely
+positive top-ray angle — see the comparison below.
+
+**Target pose**, from a forward-kinematics model built against the URDF and validated
+by reproducing the live-measured current-pose transform exactly (computed pitch 39.94°
+vs. measured 39.9°, forward axis (0.766, −0.005, −0.642) matched):
+
+| Config | Joint values | Camera height | Pitch | Top ray | Bottom ray |
+|---|---|---|---|---|---|
+| Current (§4a) | j2=0.9634, j3=−1.5499, j4=−1.6755 rad | 0.246m | 40° down | −14.7° | 65.1° down |
+| Wrist-only 20° (§4c) | j2, j3 unchanged, j4 only | 0.273m | 20° down | +5.6° | 44.8° down |
+| **This pose (C)** | j2≈0.3°, j3≈0.3°, j4≈−84.7° | **0.349m** | **5.4° up** | **+30.6°** | 19.8° down |
+
+(j2/j3/j4 target found by a 5° grid search over each joint's ±2.09 rad range, filtered
+to forward-pointing configurations; refine to ~0.5° resolution before generating the
+actual trajectory goal, which changes nothing about this design.)
+
+**What this buys.** With a +30.6° top ray, the frame's height ceiling grows with
+distance instead of shrinking: 0.65m at 0.5m range, 0.94m at 1m, 1.53m at 2m — enough
+to plausibly see a desk-height (~0.75m) test object, which none of the other poses can.
+
+**Cost: a near-field blind zone.** Bottom ray is 19.8° *below* horizontal, so the floor
+doesn't enter frame until ~0.97m out — everything closer than that is invisible to the
+camera at this pose, a regression against §4a's near-field coverage. This is why the
+pose is test-scoped rather than adopted generally: no near-field or low-profile-obstacle
+trial (§8 step 5, §12 classes 1/2/4) is ever run at this pose.
+
+**Visible window for the class-3 target.** For a ~0.75m test object at this camera
+height, the object is only in frame for range ≥ **0.68m** (below that, the required
+look-up angle exceeds the +30.6° top ray and the object scrolls out of the top of frame
+— this is an expected consequence of the fixed FOV, not a failure to diagnose). Test
+protocol: place the object at ~1.0–1.5m (inside the window with margin), confirm
+detection, then approach and confirm it exits frame near the ~0.68m boundary as
+predicted.
+
+**Motion and verification — same discipline as §4.** Commanded via
+`FollowJointTrajectory`; the known controller flakiness (§4) applies here too, with the
+same manual-relaunch contingency, not `.stop_ros.sh`. Verify the resulting pose against
+the camera image itself and `/joint_states`/TF together, not TF alone (§4's correction
+on why TF is not independent of `/joint_states`).
+
 ## 5. Architecture
 
 Four new components, additive only — no edits to `proximity_alert`, trial launch files,
@@ -737,9 +791,12 @@ complete.
 Tasks up to §8 prove the system works; they do not prove the camera helped. LiDAR alone
 already stops for obstacles. The A/B measurement compares fused against a LiDAR-only
 control config differing in exactly one line (`observation_sources`), across four
-obstacle classes at **0.6 m** (not 1 m — outside the camera's 0.94 m coverage ceiling
-at 40°, §4b, where the comparison would be LiDAR-vs-LiDAR by construction), 5 trials
-each:
+obstacle classes, 5 trials each. Classes 1, 2, and 4 run at **0.6 m** (not 1 m — outside
+the camera's 0.94 m coverage ceiling at 40°, §4b, where the comparison would be
+LiDAR-vs-LiDAR by construction) at the §4a operating pose. Class 3 runs at **1.0–1.5 m**
+at the separate §4d overhang-test pose, per its own visible-window protocol — the
+distances aren't comparable across classes because the poses and coverage geometry
+differ; each class's distance is chosen against its own pose's ceiling, not a shared one.
 
 1. **Tall box (~30cm)** — control. Both sensors should see it. At 0.6 m the camera sees
    roughly its bottom 9 cm (§4b), which is ample to mark.
@@ -747,12 +804,12 @@ each:
    within the camera's frame at 0.6 m. **This is the class that carries the POC at 40°.**
 3. **Overhanging object** — e.g. a pedestal-style form. The class that caused the real
    2026-07-22 collision and the strongest available motivation.
-   **⚠ Not testable at 40° pitch.** Nothing above the camera's 0.246 m height enters
-   the frame at any distance (§4b), so the depth camera cannot see an overhang either.
-   Running it anyway would produce a null result attributable entirely to pose, and
-   reporting that as "fusion does not help with overhangs" would be actively
-   misleading. **Deferred with the 20° pitch change (§4c); do not run it and do not
-   substitute a weaker proxy.**
+   **Not testable at the §4a operating pose** — nothing above the camera's 0.246m
+   height ever enters frame there (§4b). **Testable at the §4d overhang-test pose**
+   instead: run this one class at that pose (test object at 1.0–1.5m, per §4d's
+   visible-window protocol), with the arm returned to 40° immediately after. Do not
+   run classes 1/2/4 at the §4d pose — its near-field blind zone (§4d) would corrupt
+   those results, not the camera.
 4. **Thin vertical obstacle** — a chair leg. LiDAR's strength; included to check the
    camera path doesn't *degrade* anything.
 
@@ -763,10 +820,10 @@ more obstacles but also stops for phantoms is not obviously a win.
 classes is legitimate and publishable, and far better than a reviewer finding the gap
 later.
 
-**State the pose limitation as a limitation, not a silence.** Class 3 is the one with a
-documented real-world failure behind it, and this POC cannot address it at 40°. The
-writeup must say that the camera pose was left at the stock fall-prevention angle for
-the proof of concept, that this bounds coverage to ~0.94 m and to objects below 0.246 m,
-and that the overhang case therefore remains open pending the pitch change. Claiming
-fusion benefit while quietly omitting the class that motivated it is the failure mode to
-avoid here.
+**State the pose limitation as a limitation, not a silence.** The writeup must say that
+classes 1/2/4 run at the stock fall-prevention pose (§4a), which bounds their coverage
+to ~0.94m and to objects below 0.246m — and that class 3 required a second, test-only
+pose (§4d) to be observable at all, with its own narrower 0.68m–~2m visible window and a
+near-field blind zone that rules it out for general use. The overhang result is real but
+pose-specific, not evidence that the §4a operating pose sees overhangs. Claiming fusion
+benefit while quietly omitting that distinction is the failure mode to avoid here.
