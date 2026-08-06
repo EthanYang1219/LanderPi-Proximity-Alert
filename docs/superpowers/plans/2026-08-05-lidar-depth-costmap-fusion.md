@@ -74,6 +74,8 @@ Confirmed live on 2026-08-06. Do not re-derive; do re-check if something behaves
 | Scan topic | **`/scan_raw`** — **`/scan` does not exist**, and the reason is known (below) |
 | Scan rate | 9.87 Hz |
 | Depth image | `/ascamera/camera_publisher/depth0/image_raw`, 640×400, **14.7 Hz** |
+| Depth encoding | **`mono16`** — *not* `16UC1`. Must be relabelled before `depth_image_proc`, see Task 4 Step 1a |
+| Camera pose | ~**40°** below horizontal, 0.246 m above floor. Coverage ceiling ~**0.94 m**; nothing above 0.246 m ever in frame (Task 10) |
 | Depth camera frame | **`depth_camera_link`** (URDF also defines `depth_cam_link` — different frame, not the one topics use) |
 | `camera_info` | `/ascamera/camera_publisher/depth0/camera_info` — **valid** |
 | Driver cloud | `/ascamera/camera_publisher/depth0/points` — already published |
@@ -221,9 +223,30 @@ establishes the pitch-measurement procedure that Task 10 will use.
 
 - [ ] **Step 1: Create the `poc_fusion` package** in `/home/ubuntu/ros2_ws/src/`
       (`ament_python`), with the file structure above and empty config files.
-- [ ] **Step 2: Declare dependencies** in `package.xml`: `rclpy`, `sensor_msgs`,
-      `nav_msgs`, `geometry_msgs`, `std_msgs`, `cv_bridge`, `tf2_ros`,
-      `nav2_costmap_2d`, `nav2_lifecycle_manager`, `depth_image_proc`, `image_proc`.
+- [ ] **Step 2: Declare dependencies** in `package.xml` — **all of them, including the
+      ones installed by hand in Task 0.** Task 0's `apt-get` makes them present on
+      *this* container only; `package.xml` is what makes `rosdep install` reproduce the
+      environment when Dr. Mu or Haotian rebuild on a fresh container. A missing entry
+      is skipped silently and surfaces later as a runtime failure with no obvious cause.
+      ```xml
+      <exec_depend>rclpy</exec_depend>
+      <exec_depend>sensor_msgs</exec_depend>
+      <exec_depend>nav_msgs</exec_depend>
+      <exec_depend>geometry_msgs</exec_depend>
+      <exec_depend>std_msgs</exec_depend>
+      <exec_depend>visualization_msgs</exec_depend>
+      <exec_depend>cv_bridge</exec_depend>
+      <exec_depend>tf2_ros</exec_depend>
+      <exec_depend>nav2_costmap_2d</exec_depend>
+      <exec_depend>nav2_lifecycle_manager</exec_depend>
+      <exec_depend>depth_image_proc</exec_depend>
+      <exec_depend>image_proc</exec_depend>
+      <exec_depend>python3-scipy</exec_depend>
+      <exec_depend>python3-numpy</exec_depend>
+      ```
+- [ ] **Step 2a: Verify the declaration is actually complete** — `rosdep check
+      --from-paths src/poc_fusion` should report no missing keys. Do not treat "it runs
+      on my container" as evidence; that is exactly the case this step guards against.
 - [ ] **Step 3: Register entry points** in `setup.py`: `depth_preprocess_node`,
       `costmap_stop_monitor_node`, `latency_recorder_node`. Add `config/` and `launch/`
       to `data_files`.
@@ -282,8 +305,27 @@ Write and test these before touching hardware. Everything here is arrays and num
       time and Task 12's latency measurement depends on it surviving this node; the
       `frame_id` must remain `depth_camera_link` or the costmap transforms the cloud
       from the wrong frame.
-- [ ] **Step 2: Invalid-pixel masking.** Zero and NaN depth → invalid. Log the invalid
-      fraction periodically; a sudden jump is the first sign of a camera fault.
+- [ ] **Step 1a: Re-encode `mono16` → `16UC1`. This is a blocker, not a nicety.**
+      The driver publishes `encoding: mono16` (verified: 640×400, `step: 1280`, so
+      16-bit single channel). **`depth_image_proc::PointCloudXyzNode` accepts only
+      `16UC1` (millimetres) and `32FC1` (metres)** — it compares the encoding string
+      and throws "Depth image has unsupported encoding" on anything else. `mono16` is a
+      distinct string from `16UC1` even though the buffer layout is identical, so
+      feeding the driver topic through unchanged makes Task 5 fail immediately.
+      Since this node already republishes, set the outgoing `encoding` to `16UC1`.
+      No pixel data changes — it is a relabel of an identical buffer.
+      **Verify before moving on:** `ros2 topic echo /poc_fusion/depth_cleaned --no-arr`
+      shows `encoding: 16UC1`, and confirm the units really are millimetres by holding
+      an object at a tape-measured distance and reading the raw pixel value.
+- [ ] **Step 2: Invalid-pixel masking — integer semantics, no NaN check.**
+      `mono16` is an **unsigned integer** type, so NaN cannot occur; invalid pixels are
+      exactly **0**. An earlier revision of this step said "zero and NaN" — the NaN
+      branch is unreachable dead code for this encoding and must not be written as
+      though it guards anything. If the driver is ever reconfigured to `32FC1`, both
+      `0.0` and `NaN` become possible and this step changes: **assert the encoding at
+      startup and fail loudly rather than silently mis-masking.**
+      Log the invalid fraction periodically; a sudden jump is the first sign of a
+      camera fault.
 - [ ] **Step 3: Self-arm ROI masking from YAML.** Read the ROI from
       `config/depth_preprocess_params.yaml` — **not hard-coded**, because it must be
       re-derived whenever the arm pose changes (Task 10 changes it). Start with a
@@ -381,6 +423,10 @@ depth_image_proc` succeeds before starting.**
       `obstacle_detection.should_stop(...)`. Parameters from
       `config/stop_monitor_params.yaml`: `window_forward_m` (start 1.0),
       `window_half_width_m` (start 0.3), `lethal_threshold` (start 253),
+      Note `window_forward_m: 1.0` slightly exceeds the camera's 0.94 m ceiling, so the
+      far ~6 cm is LiDAR-only. Intentional — the window is sized against stopping
+      distance, not camera coverage — but record it so a trigger at ~1 m is never
+      written up as a camera detection.
       `min_occupancy_fraction` (start 0.30), `min_cluster_area_cm2` (start 100).
 - [ ] **Step 5: Publish `/costmap_app/obstacle_detected`** (`std_msgs/Bool`).
 - [ ] **Step 6: Publish the window as a `visualization_msgs/Marker`** — the four
@@ -409,120 +455,114 @@ depth_image_proc` succeeds before starting.**
 - [ ] **Step 2: Publish zero `Twist` to `/cmd_vel`** — topic name from config,
       defaulting to `/cmd_vel`. Never `/controller/cmd_vel`.
 - [ ] **Step 3: Require `motion_watchdog` in the loop and document it.** A single zero
-      `Twist` per costmap update (5 Hz) does not *hold* a stop on this robot. Use the
+      `Twist` per costmap update (10 Hz) does not *hold* a stop on this robot. Use the
       existing `proximity_alert` `motion_watchdog` node rather than reimplementing
       stop-hold here. Verify a stop actually persists before calling this task done.
 - [ ] **Step 4: No avoidance maneuver.** Stop only — consuming the costmap in
       `avoidance.py` is deferred to protect the trial dataset (design doc §11).
 
-## Task 10: Set the camera to 20° downward
+## Task 10: Record camera coverage bounds at the as-is 40° pose
 
-**Sequenced here deliberately.** It sits after the pipeline is built because the
-ground-plane tuning (Task 11) depends on the final pose, and because the arm control
-path is currently unreliable — making it an entry gate would have blocked everything
-behind it.
+**Decision (2026-08-06): the camera stays at its current ~40° pitch for this POC.**
+Re-pitching would mean pairing a phone to the robot for the WonderPi app (the ROS servo
+path being unreliable), and the robot is worked on over SSH. That is disproportionate
+effort for a proof of concept. This task no longer moves the arm — it records what the
+existing pose can and cannot see, so the validation tasks test reachable things.
 
-**Known blocker, read before starting.** On 2026-08-06 the `servo_controller` nodes
-(`arm_controller`, `gripper_controller`, `controller_manager`) dropped out of the ROS
-graph after a `FollowJointTrajectory` goal and had to be relaunched. Recovery command
-that worked:
+- [ ] **Step 1: Record the live pose.** `ros2 run tf2_ros tf2_echo base_footprint
+      depth_camera_link`. Expected: translation `[0.105, 0.021, 0.246]`, optical forward
+      axis (third column of the rotation matrix) `(0.766, −0.005, −0.642)` → **39.9°
+      below horizontal**, camera **0.246 m** above the floor. Re-check at the start of
+      every session; a drift beyond ±1° means the arm has sagged and prior measurements
+      need re-taking.
+- [ ] **Step 2: Record the derived coverage envelope** in the verification doc, from the
+      verified intrinsics (V-FOV 50.4°, H-FOV 74.1°) and the pose above:
+      - top ray **14.7°** below horizontal, bottom ray 65.1°
+      - **floor visible from 0.114 m to 0.938 m**
+      - heights in frame: 0.3 m → 0–0.167 m · 0.5 m → 0–0.115 m · 0.7 m → 0–0.062 m ·
+        0.9 m → 0–0.010 m · **≥1.0 m → nothing (entirely below floor level)**
+      **Two hard limits follow, and every later task depends on them:**
+      1. **Max camera range ≈ 0.94 m.** Tests at 1 m or 2 m measure the LiDAR only.
+      2. **Nothing above 0.246 m is ever in frame, at any distance** — the top ray
+         descends, so the highest visible point is at the camera itself. Floor-standing
+         objects are still detected via their base; true overhangs are not detectable
+         at all.
+- [ ] **Step 3: Verify the envelope empirically before trusting it.** Place an object at
+      0.5 m and at 1.2 m. Confirm the first produces cloud points and the second produces
+      none. If the 1.2 m object *does* appear, the pose or intrinsics assumption is wrong
+      and Step 2 must be recomputed before proceeding.
+- [ ] **Step 4: Confirm the self-arm ROI matches this pose.** The ROI in
+      `depth_preprocess_params.yaml` is pose-specific; since the pose is unchanged from
+      when it was measured, it stays valid. Re-derive it only if Step 1 shows sag.
+- [ ] **Step 5: Record the consequences for the A/B study** so they are not rediscovered
+      mid-experiment: Task 15 moves from 1 m to **0.6 m**, and **class 3 (overhanging
+      obstacle) is not runnable at this pitch** — see Task 15 Step 2.
 
-```bash
-docker exec -d -u ubuntu -e need_compile=False MentorPi bash -lc \
-  'source /opt/ros/humble/setup.bash && source /home/ubuntu/ros2_ws/install/setup.bash && \
-   ros2 launch servo_controller servo_controller.launch.py base_frame:=base_footprint'
-```
+### Deferred: 20° pitch change
 
-**Correction to an earlier revision of this task.** It stated that `/joint_states`
-reports all-zero after a restart and instructed "verify pose through TF, not
-`/joint_states`." Both halves were wrong:
+Not cancelled, and now with a quantified payoff: at 20° the top ray points 5.2° *above*
+horizontal, so the FOV stops terminating on the floor — both the 0.94 m ceiling and the
+0.246 m height limit disappear, which is what makes the overhang class testable.
 
-1. The all-zero reading was **transient**, not a standing property. Re-checked live,
-   `/joint_states` reports `joint2 = 0.9634`, `joint3 = −1.5499`, `joint4 = −1.6755` —
-   the correct physical pose.
-2. More importantly, **TF is not an independent check on `/joint_states`** —
-   `robot_state_publisher` computes TF *from* it. If `/joint_states` is stale or reset,
-   `tf2_echo` reports the pose of the zero configuration with full confidence while the
-   arm sits somewhere else, and nothing in the graph contradicts it. The original
-   instruction would have "verified" the command, not the hardware.
+When it is done, the following apply and were verified during this review:
 
-Independent checks that do work: **the camera image itself** (what is actually in
-frame), and true bus-servo feedback via `/ros_robot_controller/bus_servo/get_state`.
+- **Positioning route:** WonderPi app's Robot Control interface, bypassing the flaky
+  `FollowJointTrajectory` path. **Force-close the app afterwards** — left running in the
+  background it can keep broadcasting heartbeat/control commands to the STM32 board and
+  fight the POC's own velocity commands, producing a fault that looks like a ROS bug and
+  is not one.
+- **Do NOT run `.stop_ros.sh` to "lock" the arm.** It exists only inside the container
+  (`/home/ubuntu/.stop_ros.sh`, not on the host) and its entire contents are
+  `ps aux | grep ros | ... | kill -9` — an indiscriminate kill of every ROS process,
+  including `robot_state_publisher` (destroying the `base_link → depth_camera_link` TF
+  chain being verified), the Aurora driver, and the LiDAR driver. It also does not do
+  what it is assumed to: HX-06L bus servos hold position from their own internal loop
+  while powered and torque-enabled, regardless of ROS. Simply send no arm commands.
+- **Verification cannot rely on TF alone.** `robot_state_publisher` computes TF *from*
+  `/joint_states`, so they are one source, not two — if `/joint_states` goes stale after
+  app-driven motion (likely, since the app talks to the servo bus directly), `tf2_echo`
+  will confidently report the wrong pose. Cross-check against the camera image
+  (`http://localhost:8080/snapshot?topic=/ascamera/camera_publisher/rgb0/image`) and/or
+  `/ros_robot_controller/bus_servo/get_state`.
+- **Target:** optical forward-axis z-component `−0.342 ± 0.03` (18.3°–21.7° down).
+  Current baseline: `joint2 = 0.9634`, `joint3 = −1.5499`, `joint4 = −1.6755`. Determine
+  the correction sign with a ≤0.1 rad nudge; it is not known a priori.
+- **Afterwards:** re-derive the self-arm ROI, recompute the coverage envelope, and
+  re-run Task 11's sweep and Task 15's A/B at the longer ranges the new pose permits.
 
-- [ ] **Step 0: Confirm `/joint_states` is live before trusting anything downstream.**
-      Nudge a joint ≤0.05 rad and confirm both `/joint_states` **and**
-      `tf2_echo base_link depth_camera_link` change. If TF moves but the arm does not,
-      or `/joint_states` reads all-zero while the arm is visibly posed, the chain is
-      stale — relaunch `servo_controller` and re-check. Do not proceed on a stale chain.
-- [ ] **Step 1: Read the pose from TF, cross-checked against the camera image.**
-      `ros2 run tf2_ros tf2_echo base_link depth_camera_link` → the optical forward
-      axis is the **third column** of the rotation matrix; downward pitch = `asin(−z)`.
-      Cross-check every TF reading against a live snapshot
-      (`http://localhost:8080/snapshot?topic=/ascamera/camera_publisher/rgb0/image`):
-      at 40° the frame is nearly all floor with the gripper at the bottom edge; at 20°
-      noticeably more of the scene ahead should be visible. **Agreement between TF and
-      the image is the actual verification** — TF alone is not.
-- [ ] **Step 2: Determine the sign of the `joint4` correction empirically** with a
-      small nudge (≤0.1 rad) and re-read TF. The direction is not known a priori.
-      Baseline recorded 2026-08-06: `joint2 = 0.9634`, `joint3 = −1.5499`,
-      `joint4 = −1.6755` rad, giving 39.9° down.
-- [ ] **Step 3: Command the pose** so the optical forward axis z-component reads
-      **`−0.342 ± 0.03`** (18.3°–21.7° below horizontal). Move in small increments,
-      re-reading TF each time.
-- [ ] **Step 3a: Contingency if the ROS servo path keeps failing — use the WonderPi
-      app to position the arm, but do NOT kill ROS.**
-      The arm uses HX-06L serial bus servos; positioning it from the vendor mobile app's
-      Robot Control interface bypasses the flaky `FollowJointTrajectory` path entirely.
-      That part is sound and is the right fallback.
-
-      **Two corrections to the obvious version of this contingency, both verified:**
-
-      - **`~/.stop_ros.sh` is not on the host.** It exists only *inside* the container
-        (`/home/ubuntu/.stop_ros.sh`); running it from a host terminal fails. The host
-        has only `~/start.sh`, which is already known broken (it restarts
-        `start_node.service`, a unit that does not exist on this machine).
-      - **Do not run it.** Its entire contents are:
-        ```
-        ps aux | grep ros | grep -v grep | awk '{ print "kill -9", $2 }' | sh
-        ```
-        That is an indiscriminate `kill -9` of every ROS process — including
-        `robot_state_publisher`, the Aurora camera driver, and the LiDAR driver.
-        **This POC needs all three.** Killing ROS destroys the
-        `base_link → depth_camera_link` TF chain, which is the thing being verified,
-        and takes both observation sources with it. There would be nothing left to
-        launch the POC against.
-
-      It also does not do what stopping ROS is assumed to do: **bus servos hold
-      position from their own internal loop while torque-enabled and powered**, which
-      is independent of whether ROS is running. Simply not sending arm commands has the
-      same holding effect at none of the cost.
-
-      **So: position with the app, leave the ROS stack up, send no arm commands, and
-      verify with Step 1's TF + image cross-check.** If `/joint_states` has gone stale
-      after app-driven motion (likely — the app talks to the servo bus directly, and
-      `/joint_states` echoes ROS commands), then TF is stale too and the camera image
-      plus `/ros_robot_controller/bus_servo/get_state` are the only trustworthy
-      verification. Record which one was used.
-- [ ] **Step 4: Record the final joint values and TF output** in the verification doc.
-      This is the pose every subsequent run must be restored to; without true servo
-      feedback, the recorded numbers are the only reference.
-- [ ] **Step 5: Re-derive the self-arm ROI** (Task 4 Step 3) at the new pose and update
-      `depth_preprocess_params.yaml`. The old ROI is invalid — a stale mask either
-      blinds the camera or produces constant false triggers from the gripper.
-- [ ] **Step 6: Note in the doc that 20° is expected to change.** It is a compromise
-      (design doc §4a): level makes the camera redundant with the LiDAR, 40° buries the
-      frame in floor. Re-deriving it is a pose change plus a re-measured ROI, not a code
-      change.
 
 ## Task 11: Validation and tuning
 
-- [ ] **Step 1: Ground-plane check.** Bare floor ahead, robot stationary, at the Task 10
+- [ ] **Step 1: Ground-plane check.** Bare floor ahead, robot stationary, at the 40°
       pose. Confirm no cells marked occupied. Tune `min_obstacle_height` until clean.
       Record the final value and how many iterations it took.
+- [ ] **Step 1a: If floor false positives form a gradient toward the far edge, suspect
+      arm sag before touching `min_obstacle_height`.** The floor's projection into
+      `odom` depends entirely on the accuracy of the `depth_camera_link` pitch, so a
+      small physical sag lifts the apparent floor with distance and looks exactly like
+      a threshold that is set too low. Raising the threshold to compensate would blind
+      the camera to genuinely low obstacles — trading a cosmetic fix for the detection
+      class the POC exists to demonstrate.
+      **Diagnostic:** a *uniform* offset across the window is a threshold problem; a
+      *gradient growing with distance* is a pitch problem. Re-read Task 10 Step 1 and
+      compare against the recorded 39.9°.
+      Magnitudes at this pose (max floor range 0.94 m): **1° sag → 1.6 cm lift,
+      2° → 3.3 cm** — both under one 5 cm cell, so 40° is a forgiving pose for this.
+      It would matter far more after the 20° change, where the floor is visible to
+      several metres and the same 2° becomes ~7 cm at 2 m. Record the check either way.
 - [ ] **Step 2: Self-mask check.** Confirm the gripper is excluded and that real
       obstacles near frame edges are **not** over-masked.
-- [ ] **Step 3: Detection sweep.** Object at 30cm, 60cm, 1m, 2m; plus 1m at the left and
-      right horizontal FOV edges. Record detection outcome per position.
+- [ ] **Step 3: Detection sweep — ranges bounded by Task 10's coverage envelope.**
+      Object at **0.3 m, 0.5 m, 0.7 m, 0.9 m**, plus **0.6 m** at the left and right
+      horizontal FOV edges. Record detection outcome per position.
+      **Do not test at 1 m or 2 m.** At the 40° pose the FOV is entirely below floor
+      level beyond ~0.94 m, so those points are outside the camera's line of sight and
+      would record a geometric impossibility as a sensor miss.
+      Also record how much of the object's height is in frame at each distance
+      (0.3 m → 16.7 cm, 0.5 m → 11.5 cm, 0.7 m → 6.2 cm, 0.9 m → 1.0 cm). A mark built
+      from a 1 cm sliver at 0.9 m is a far weaker detection than one from 16.7 cm at
+      0.3 m, and `min_cluster_area_cm2` must accommodate the weakest case that still
+      needs to trigger — expect this to be the binding constraint in Step 6.
       **Target: >95% detection rate.**
 - [ ] **Step 4: False-positive count.** ≥10 stationary bare-floor samples.
       **Target: zero.**
@@ -600,11 +640,23 @@ already stops for obstacles.
 
 - [ ] **Step 1: Create a LiDAR-only control config** differing from the fused config in
       exactly one line (`observation_sources`). Diff the two files and confirm.
-- [ ] **Step 2: Run four obstacle classes at 1m, 5 trials each, both configs:**
-      1. **Tall box (~30cm)** — control; both sensors should see it.
-      2. **Low-profile object (~8–12cm)** — likely below the LD19 scan plane.
-      3. **Overhanging object** (pedestal-style form) — **the class that caused the real
-         2026-07-22 collision**, and the strongest available motivation.
+- [ ] **Step 2: Run the obstacle classes at 0.6 m, 5 trials each, both configs.**
+      **0.6 m, not 1 m** — 1 m is beyond the camera's 0.94 m coverage ceiling at the 40°
+      pose (Task 10 Step 2), so the "fused" and "LiDAR-only" configs would be comparing
+      LiDAR against LiDAR and the study would return a guaranteed null by construction.
+      1. **Tall box (~30cm)** — control; both sensors should see it. The camera sees its
+         bottom ~9 cm at 0.6 m, which is ample to mark.
+      2. **Low-profile object (~8–12cm)** — likely below the LD19 scan plane and fully
+         in frame at 0.6 m. **This class carries the POC at the 40° pose.**
+      3. **Overhanging object** (pedestal-style form) — the class that caused the real
+         2026-07-22 collision, and the strongest available motivation.
+         **⚠ NOT RUNNABLE at the 40° pose — skip it, do not substitute a proxy.**
+         Nothing above the camera's 0.246 m height enters the frame at any distance
+         (Task 10 Step 2), so the depth camera cannot see an overhang either. Running it
+         would yield a null result caused entirely by pose, and reporting that as
+         "fusion does not help with overhangs" would be a false negative published
+         against the project's own strongest motivating incident.
+         Deferred with the 20° pitch change (Task 10, "Deferred" section).
       4. **Thin vertical obstacle** (chair leg) — LiDAR's strength; included to check
          the camera path does not *degrade* anything.
 - [ ] **Step 3: Record false-positive counts per condition** over bare-floor runs.
@@ -612,12 +664,19 @@ already stops for obstacles.
 - [ ] **Step 4: Write up results honestly, including null results.** A class where
       fusion shows no benefit is legitimate and publishable, and far better than a
       reviewer finding the gap later.
+- [ ] **Step 5: State the pose limitation explicitly in the writeup.** Say that the
+      camera was left at the stock ~40° fall-prevention pitch for the POC, that this
+      bounds coverage to ~0.94 m and to objects below 0.246 m, and that the overhang
+      class therefore remains open pending the pitch change. Reporting a fusion benefit
+      while quietly dropping the class that motivated the work is the specific failure
+      mode to avoid.
 
 ## Task 16: Documentation
 
 - [ ] **Step 1: Finalize `docs/poc_fusion_verification.md`** with every measured value:
-      environment facts, TF chain, final camera pose and joint values, tuned thresholds,
-      sweep results, latency median/p95, CPU baseline vs fused, A/B results.
+      environment facts, TF chain, the as-is 40° pose with its derived coverage
+      envelope, tuned thresholds, sweep results, latency median/p95, CPU baseline vs
+      fused, A/B results, and the classes deferred with the 20° pitch change.
 - [ ] **Step 2: Write `poc_fusion/README.md`** — how to launch, what each config key
       does, the environment assumptions, and the two known approximations (unrectified
       depth; pipeline latency as a lower bound).

@@ -182,17 +182,75 @@ LiDAR alone misses is the deliverable; consuming it is the follow-on.
   narrow, pre-calibrated ground-plane ROIs — there is no existing general obstacle-marking
   or camera→costmap integration to build on.
 
-### 4a. Camera pose: 20° downward
+### 4a. Camera pose: 40° downward (as-is) — POC decision
+
+**Decision (2026-08-06): keep the current ~40° pose. Do not re-pitch for this POC.**
+The robot is accessed over SSH; the practical route to re-posing the arm (the WonderPi
+mobile app, given the flaky `servo_controller` path) means pairing a phone to it, which
+is disproportionate effort for a proof of concept. The pitch change is deferred, not
+cancelled — see §4c.
+
+This is a legitimate call, and the pipeline is pitch-independent: nothing in §5 changes.
+What *does* change is the volume the camera can observe, and that has to be stated
+rather than discovered during validation.
+
+### 4b. What 40° actually covers — measured, not assumed
+
+Computed from the verified intrinsics (`fy = 424.83` → **V-FOV 50.4°**, `fx = 423.92` →
+H-FOV 74.1°) and the live `base_footprint → depth_camera_link` transform (camera height
+**0.246 m** above the floor, optical axis 39.9° below horizontal):
+
+- Top ray: **14.7° below horizontal.** Bottom ray: 65.1°.
+- **Floor is visible from 0.114 m to 0.938 m.**
+
+| Distance ahead | Heights in frame |
+|---|---|
+| 0.3 m | 0 – 0.167 m |
+| 0.5 m | 0 – 0.115 m |
+| 0.7 m | 0 – 0.062 m |
+| 0.9 m | 0 – 0.010 m |
+| **≥ 1.0 m** | **entirely below floor level — nothing visible** |
+
+Two consequences that the validation plan must respect:
+
+1. **Maximum camera detection range is ~0.94 m.** Because the top ray descends, it
+   meets the floor at 0.94 m and there is no line of sight beyond that at or above
+   ground level. Any test at 1 m or 2 m measures the LiDAR only, and would have
+   recorded a camera "miss" that is geometric, not a sensor failure. §8's sweep and
+   §12's A/B distances are re-scoped accordingly.
+2. **Nothing above camera height (0.246 m) is ever in frame, at any distance.** The
+   highest point in the FOV is at the camera itself and decreases with distance.
+   Floor-standing objects are still detected — a tall box at 0.5 m is seen from 0 to
+   0.115 m, i.e. its base, which is enough to mark — but a genuine **overhang with no
+   visible support in the near field cannot be detected at this pitch**.
+
+**The second point costs the POC its strongest motivating case.** §12 class 3
+(overhanging obstacle, the pedestal-desk form that caused the real 2026-07-22 collision)
+is **not testable at 40°**. That class is the clearest demonstration of what fusion adds
+over the LD19, and at this pitch the depth camera cannot see it either. The POC can
+still demonstrate fusion working and can still show a benefit on low-profile obstacles
+in the near field — but the headline result is deferred with the pitch change, and the
+writeup must not imply otherwise.
+
+An upside worth recording: the shallow effective range makes the pose far less sensitive
+to arm sag than a level pose would be. A 2° sag lifts the apparent floor by only **3.3 cm**
+at maximum range (1° → 1.6 cm), i.e. under one 5 cm costmap cell. Floor-filtering at 40°
+is a comparatively forgiving problem.
+
+### 4c. Deferred: camera pose at 20° downward
 
 The camera's pitch is set by the arm and is the single biggest lever on this POC's
 false-positive rate.
 
-- **Measured current pose: ~40° below horizontal**, computed from live
-  `base_link → depth_camera_link` TF (optical forward axis in `base_link` =
-  `(0.766, -0.005, -0.642)`; downward pitch = `asin(0.642)` = 39.9°). At this pitch
-  the camera is looking almost entirely at the floor a short distance ahead — it is
-  the stock fall-prevention pose.
-- **Target pose: 20° below horizontal.** This is a deliberate compromise:
+Deferred for this POC (§4a), and the reason to revisit it is now quantified rather than
+aesthetic: at 20° the top ray points 5.2° *above* horizontal, so the FOV no longer
+terminates on the floor and both the ~0.94 m range ceiling and the "nothing above
+0.246 m" limit disappear. That is what unlocks §12's overhang class.
+
+- **Current pose: ~40° below horizontal** (optical forward axis in `base_link` =
+  `(0.766, -0.005, -0.642)`; downward pitch = `asin(0.642)` = 39.9°) — the stock
+  fall-prevention pose.
+- **Future target: 20° below horizontal.** A deliberate compromise:
   - Level (0°) maximizes range and minimizes floor returns, but the camera then sees
     roughly what the LiDAR already sees, which undercuts the whole point of §12's A/B
     measurement.
@@ -325,9 +383,13 @@ any turn. `odom` is both the Nav2 convention and the semantically correct choice
 The indexing problem the earlier recommendation was trying to solve is real, and is
 solved properly in §5.4 instead.
 
-**Dimensions:** a 3m × 3m rolling window at 0.05m resolution. Justified by the LD19's
-effective indoor range, the depth camera's usable window (30cm–3m), and the robot's
-estimated stopping distance (~0.4m) plus margin. 0.05m resolves small obstacles
+**Dimensions:** a 3m × 3m rolling window at 0.05m resolution. Sized by the LD19's
+effective indoor range and the robot's estimated stopping distance (~0.4m) plus margin.
+Note the camera contributes to only the near portion of it: the sensor's datasheet range
+is 30cm–3m, but at the 40° pose its *geometric* coverage is **0.114–0.938 m** (§4b), so
+beyond ~0.94 m the grid is LiDAR-only. That is expected, not a defect — but it means the
+fused and LiDAR-only costmaps are identical in the outer two thirds of the window, and
+any comparison drawn there is vacuous. 0.05m resolves small obstacles
 (chair/table legs) while keeping the grid at 60×60 cells.
 
 **Observation sources and rates:** LiDAR at 9.87Hz measured, camera-derived cloud at
@@ -424,6 +486,14 @@ condition fires `/costmap_app/obstacle_detected = True`:
 
 Both thresholds are tuned during validation against real sweep data.
 
+**On `window_forward_m`.** The starting value of 1.0 m slightly exceeds the camera's
+0.94 m coverage ceiling (§4b), so the far ~6 cm of the window is LiDAR-only. This is
+intentional — the window is a *stopping* window sized against stopping distance, not a
+camera-coverage window, and the LiDAR legitimately fills it. It is recorded here so that
+nobody later reads "camera detection at 1.0 m" into a trigger that fired from LiDAR
+marks. Worth noting the margin is thin: at ~0.4 m stopping distance, a camera-only
+detection at 0.6 m leaves roughly 0.2 m of slack, so demo runs should be at low speed.
+
 The demo response on trigger is a full stop plus buzzer — no avoidance maneuver, per §1a.
 
 **Velocity topic — resolved.** The robot has two distinct velocity paths:
@@ -505,16 +575,22 @@ is installed.
 
 1. **Point cloud sanity check** — in RViz2, with the arm locked, confirm a held object
    appears in the cloud at its true position relative to the robot.
-2. **Camera pose set to 20° down** (§4a) and verified via `tf2_echo`. Sequenced here,
-   not as an entry gate, because of the arm-control blocker in §4.
+2. **Camera pose left at ~40°** (§4a). Record the live `base_footprint →
+   depth_camera_link` transform at the start of each session so any drift or sag is
+   caught, and confirm the pitch still reads 39.9° ± 1°. No arm motion.
 3. **Self-mask verification** — confirm the mask excludes the robot's own gripper
    without excluding real obstacles near frame edges. Record measured ROI into config.
 4. **Ground-plane filtering** — confirm bare floor ahead is not marked occupied.
    Expect iteration on `min_obstacle_height`.
-5. **Detection sweep** — object at 30cm, 60cm, 1m, 2m; plus 1m at left and right edges
-   of the horizontal FOV (where structured-light illumination falls off and, separately,
-   where the §5.2 distortion approximation is worst). Record false-positive rate on
-   bare floor.
+5. **Detection sweep** — object at **0.3 m, 0.5 m, 0.7 m, 0.9 m**, plus **0.6 m** at
+   the left and right edges of the horizontal FOV (where structured-light illumination
+   falls off). Distances are bounded by the 0.94 m coverage ceiling derived in §4b —
+   the earlier 1 m and 2 m points are outside the camera's line of sight at 40° and
+   would have recorded geometric misses as sensor failures. Record false-positive rate
+   on bare floor.
+   Also record, at each distance, how much of the object's height is in frame (§4b
+   table) — a mark generated from a 1 cm sliver at 0.9 m is a much weaker detection
+   than one from 16 cm at 0.3 m, and the cluster-area threshold has to accommodate both.
 6. **Rotation correctness** — with an obstacle fixed in place, rotate the robot in
    place through ±90° and confirm the detection window tracks the robot body: detection
    goes True only while the obstacle is actually ahead. This directly exercises the
@@ -578,7 +654,7 @@ measurement misses it, the next lever is the median filter kernel, not the publi
 
 **Quantitative success criteria:**
 
-- Detection rate >95% across the step-5 sweep (30cm–2m, centre and both FOV edges).
+- Detection rate >95% across the step-5 sweep (0.3–0.9 m, centre and both FOV edges).
 - Zero floor false positives across at least 10 stationary bare-floor samples.
 - Rotation correctness (step 6) passes: no detection fires for an obstacle that is not
   ahead of the robot at any yaw tested.
@@ -587,7 +663,9 @@ measurement misses it, the next lever is the median filter kernel, not the publi
 - Zero ghosting false positives on metal and granite during the §8 step 6a slip test,
   with the persistence value justified against measured per-surface drift rather than
   chosen by feel.
-- No missed obstacle within 1m across all sweep/demo trials.
+- No missed obstacle within **0.9 m** across all sweep/demo trials (the camera's
+  coverage ceiling at 40°, §4b). Beyond that the LiDAR alone is responsible and the
+  fused system is expected to behave exactly as LiDAR-only.
 - Sustained average CPU below 80%, with baseline and fused figures recorded separately.
 - Graceful degradation verified: camera disconnected mid-run → LiDAR-only continues,
   watchdog logs it, reconnect restores fusion.
@@ -659,12 +737,22 @@ complete.
 Tasks up to §8 prove the system works; they do not prove the camera helped. LiDAR alone
 already stops for obstacles. The A/B measurement compares fused against a LiDAR-only
 control config differing in exactly one line (`observation_sources`), across four
-obstacle classes at 1m, 5 trials each:
+obstacle classes at **0.6 m** (not 1 m — outside the camera's 0.94 m coverage ceiling
+at 40°, §4b, where the comparison would be LiDAR-vs-LiDAR by construction), 5 trials
+each:
 
-1. **Tall box (~30cm)** — control. Both sensors should see it.
-2. **Low-profile object (~8–12cm)** — likely below the LD19 scan plane.
-3. **Overhanging object** — e.g. a pedestal-style form. This is the class that caused
-   the real 2026-07-22 collision and is the strongest available motivation.
+1. **Tall box (~30cm)** — control. Both sensors should see it. At 0.6 m the camera sees
+   roughly its bottom 9 cm (§4b), which is ample to mark.
+2. **Low-profile object (~8–12cm)** — likely below the LD19 scan plane, and fully
+   within the camera's frame at 0.6 m. **This is the class that carries the POC at 40°.**
+3. **Overhanging object** — e.g. a pedestal-style form. The class that caused the real
+   2026-07-22 collision and the strongest available motivation.
+   **⚠ Not testable at 40° pitch.** Nothing above the camera's 0.246 m height enters
+   the frame at any distance (§4b), so the depth camera cannot see an overhang either.
+   Running it anyway would produce a null result attributable entirely to pose, and
+   reporting that as "fusion does not help with overhangs" would be actively
+   misleading. **Deferred with the 20° pitch change (§4c); do not run it and do not
+   substitute a weaker proxy.**
 4. **Thin vertical obstacle** — a chair leg. LiDAR's strength; included to check the
    camera path doesn't *degrade* anything.
 
@@ -673,5 +761,12 @@ more obstacles but also stops for phantoms is not obviously a win.
 
 **Report honestly even if the benefit is small or absent.** A null result on some
 classes is legitimate and publishable, and far better than a reviewer finding the gap
-later. Given the pedestal-desk incident is already documented in the README, class 3 is
-the one with a real-world failure behind it.
+later.
+
+**State the pose limitation as a limitation, not a silence.** Class 3 is the one with a
+documented real-world failure behind it, and this POC cannot address it at 40°. The
+writeup must say that the camera pose was left at the stock fall-prevention angle for
+the proof of concept, that this bounds coverage to ~0.94 m and to objects below 0.246 m,
+and that the overhang case therefore remains open pending the pitch change. Claiming
+fusion benefit while quietly omitting the class that motivated it is the failure mode to
+avoid here.
