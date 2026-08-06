@@ -14,6 +14,37 @@ docker exec -u ubuntu MentorPi bash -lc '
 
 ---
 
+## Clock / timezone note (read before trusting any timestamp in this doc)
+
+**Host local timezone is HKT (UTC+8). The container and every ROS timestamp are UTC.**
+During a local-evening/early-morning session, container-generated filenames and
+`tf2_echo`'s `At time` stamps read **one calendar day earlier** than the local working
+date. Do not infer "stale data from yesterday" from a UTC-dated filename alone — convert
+it first.
+
+Evidence (captured 2026-08-07, during the Task 1 fix round):
+```
+$ date
+Fri Aug  7 03:12:32 AM HKT 2026
+
+$ date -u
+Thu Aug  6 07:12:32 PM UTC 2026
+
+$ docker exec -u ubuntu MentorPi date -u
+Thu Aug  6 19:12:32 UTC 2026
+
+$ timedatectl
+               Local time: Fri 2026-08-07 03:12:33 HKT
+           Universal time: Thu 2026-08-06 19:12:33 UTC
+                 Time zone: Asia/Hong_Kong (HKT, +0800)
+```
+So: local `Fri Aug 7 03:12 HKT` = UTC `Thu Aug 6 19:12`. A `view_frames` artifact or
+`tf2_echo` stamp reading `2026-08-06 19:0x` UTC during this session is genuinely **today**
+(2026-08-07 local) — it is not a leftover from the prior day's session. Every task after
+this one should convert before asserting "this is/isn't today's data."
+
+---
+
 ## Task 0: Environment preflight (2026-08-07)
 
 ### Step 1 — Baseline facts (as confirmed live 2026-08-06, per CONSTRAINTS.md)
@@ -301,11 +332,20 @@ camera's optical frame and establishes the pitch-measurement procedure that Task
 Task 10a) reuse each session. All commands below (`view_frames`, `tf2_echo`) are read-only
 per CONSTRAINTS.md — no `cmd_vel` publish, no arm command, no `.stop_ros.sh`.
 
-**What's freshly measured today vs. transcribed:** Steps 1–3 below are all live
-re-measurements taken today (2026-08-07), run from `/tmp` inside the container so no
-`view_frames` artifacts land in the vendor `ros2_ws`. The task-1 brief's own prior
-values (`(0.766, −0.005, −0.642)` → 39.9° down, verified 2026-08-06) are quoted only as
-the point of comparison in Step 3 — they are not what's reported as "today's number."
+**What's freshly measured today vs. transcribed:** Steps 1–3 below are live captures from
+this session, run from `/tmp` inside the container so no `view_frames` artifacts land in
+the vendor `ros2_ws`. Per the clock/timezone note above, the container timestamps them in
+UTC, which is one calendar day behind local — converted explicitly per step below so
+nobody has to take that on faith:
+- Step 1 (`view_frames`): captured at epoch ~1786043119–1786043124, i.e.
+  **UTC 2026-08-06 19:05:19–19:05:24 = local (HKT) 2026-08-07 03:05:19–03:05:24** — today,
+  local date.
+- Step 3 (`tf2_echo`): first clean sample at epoch 1786043135.72, i.e.
+  **UTC 2026-08-06 19:05:35 = local (HKT) 2026-08-07 03:05:35** — six minutes into the
+  same session as Step 1, same local calendar day.
+The task-1 brief's own prior values (`(0.766, −0.005, −0.642)` → 39.9° down, verified
+2026-08-06 per CONSTRAINTS.md) are quoted only as the point of comparison in Step 3 — they
+are not presented as this session's own measurement.
 
 ### Step 1 — The TF chain
 
@@ -362,9 +402,18 @@ these are more precise, not contradictions —
    frames matter for the fusion transform, but a reader chasing this chain by hand needs
    the intermediate frame name to match what `tf2_echo`/`view_frames` actually print.
 
-Artifacts (`frames_2026-08-07_*.gv` / `.pdf`) were written to
-`/tmp/view_frames_scratch` inside the container only — not committed to this repo, not
-written into `/home/ubuntu/ros2_ws`.
+Artifacts confirmed via `ls -la --time-style=full-iso /tmp/view_frames_scratch/`:
+```
+-rw-r--r-- 1 ubuntu ubuntu    5262 2026-08-06 19:05:24.330294132 +0000 frames_2026-08-06_19.05.24.gv
+-rw-r--r-- 1 ubuntu ubuntu   19688 2026-08-06 19:05:24.682296172 +0000 frames_2026-08-06_19.05.24.pdf
+```
+Only **one** `.gv`/`.pdf` pair exists — this run's own output. `view_frames` names its
+artifact from the container's (UTC) clock, so the filename reads `2026-08-06` even though,
+per the clock/timezone note above, the capture was taken during today's (2026-08-07 local)
+session — UTC `19:05:24` = HKT `03:05:24`. There is no second, earlier pair; an
+earlier draft of this section incorrectly asserted one (`frames_2026-08-07_*`) that was
+never captured — corrected here. Both files stayed in `/tmp/view_frames_scratch` inside
+the container only — not committed to this repo, not written into `/home/ubuntu/ros2_ws`.
 
 **The `depth_cam_link` vs `depth_camera_link` trap — the single most important thing in
 this section.** The URDF (`landerpi_description/urdf/arm.urdf.xacro`) defines
@@ -414,11 +463,47 @@ of any fusion run in this POC: any joint4 motion changes the camera pitch measur
 3 below, and nothing in the fusion pipeline re-measures it live — Task 10 re-checks it once
 per session as a manual gate, not continuously.
 
-`view_frames` corroborates this from the live graph: `link4`'s `rate: 13.137` /
-non-zero `buffer_length: 4.948` (Step 1 output above) shows it is being actively
+`view_frames` corroborates this from the live graph. Step 1's quoted `frame_yaml` was
+trimmed to `parent` only for readability; here are the **untrimmed** rows for the frames
+this claim rests on, straight from the same `view_frames` response quoted in Step 1:
+```
+link4:
+  parent: 'link3'
+  broadcaster: 'default_authority'
+  rate: 13.137
+  most_recent_transform: 1786043124.271770
+  oldest_transform: 1786043119.323946
+  buffer_length: 4.948
+
+camera_connect_link:
+  parent: 'link4'
+  broadcaster: 'default_authority'
+  rate: 10000.000
+  most_recent_transform: 0.000000
+  oldest_transform: 0.000000
+  buffer_length: 0.000
+
+depth_cam_link:
+  parent: 'camera_connect_link'
+  broadcaster: 'default_authority'
+  rate: 10000.000
+  most_recent_transform: 0.000000
+  oldest_transform: 0.000000
+  buffer_length: 0.000
+
+depth_camera_link:
+  parent: 'depth_cam_link'
+  broadcaster: 'default_authority'
+  rate: 10000.000
+  most_recent_transform: 0.000000
+  oldest_transform: 0.000000
+  buffer_length: 0.000
+```
+`link4`'s `rate: 13.137` and non-zero `buffer_length: 4.948` show it is being actively
 broadcast by `robot_state_publisher` from joint-state updates, unlike the `fixed`-joint
-downstream links which show `rate: 10000.000` / `buffer_length: 0.000` (static, published
-once, no joint-state dependency).
+downstream frames (`camera_connect_link`, `depth_cam_link`, `depth_camera_link`), which
+show `rate: 10000.000` / `buffer_length: 0.000` — TF2's convention for a static transform
+published once and held indefinitely, with no joint-state dependency of its own.
 
 ### Step 3 — Pitch-measurement procedure and today's value
 
@@ -447,10 +532,49 @@ At time 1786043135.721853992
  -1.000  0.002 -0.005  0.021
   0.002 -0.766 -0.642  0.192
   0.000  0.000  0.000  1.000
+At time 1786043136.671746518
+- Translation: [0.105, 0.021, 0.192]
+- Matrix:
+ -0.005 -0.642  0.766  0.105
+ -1.000  0.002 -0.005  0.021
+  0.002 -0.766 -0.642  0.192
+  0.000  0.000  0.000  1.000
+At time 1786043137.671757982
+- Translation: [0.105, 0.021, 0.192]
+- Matrix:
+ -0.005 -0.642  0.766  0.105
+ -1.000  0.002 -0.005  0.021
+  0.002 -0.766 -0.642  0.192
+  0.000  0.000  0.000  1.000
+At time 1786043138.723878323
+- Translation: [0.105, 0.021, 0.192]
+- Matrix:
+ -0.005 -0.642  0.766  0.105
+ -1.000  0.002 -0.005  0.021
+  0.002 -0.766 -0.642  0.192
+  0.000  0.000  0.000  1.000
+At time 1786043139.721786775
+- Translation: [0.105, 0.021, 0.192]
+- Matrix:
+ -0.005 -0.642  0.766  0.105
+ -1.000  0.002 -0.005  0.021
+  0.002 -0.766 -0.642  0.192
+  0.000  0.000  0.000  1.000
+At time 1786043140.721762554
+- Translation: [0.105, 0.021, 0.192]
+- Matrix:
+ -0.005 -0.642  0.766  0.105
+ -1.000  0.002 -0.005  0.021
+  0.002 -0.766 -0.642  0.192
+  0.000  0.000  0.000  1.000
+[INFO] [rclcpp]: signal_handler(signum=15)
 ```
-(Six further samples in the same run were byte-identical — arm was stationary throughout,
-consistent with Step 2's "must be locked" requirement being honored during this
-verification.)
+(RPY/Quaternion rows omitted from the repeated blocks above for brevity — the Matrix row,
+which is what Step 3's arithmetic uses, is pasted in full for every block. All six
+timestamped blocks after the first carry the identical translation and matrix shown
+above — arm was stationary throughout this ~5-second capture, consistent with Step 2's
+"must be locked" requirement being honored during this verification. The run was ended by
+the `timeout 8` wrapper, hence the `signal_handler` line.)
 
 **Procedure:** the 3×3 rotation block's **third column** is `depth_camera_link`'s optical
 z-axis (forward, per the optical convention x-right/y-down/z-forward established in Step
