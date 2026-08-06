@@ -609,3 +609,113 @@ Key findings for future tasks:
   z-component is expected to flip sign (to +0.094 per the brief).
 - Today's live re-measurement reproduced the brief's recorded value exactly: forward axis
   `(0.766, −0.005, −0.642)` → 39.9° down.
+
+---
+
+## Task 2: Package scaffolding (2026-08-07, ~03:20 HKT / 2026-08-06 ~19:20 UTC)
+
+Package authored and committed at
+`/home/pi/Desktop/LanderPi-Proximity-Alert/poc_fusion/` (host), mirroring
+`proximity_alert/`'s `ament_python` layout. `poc_fusion/config/costmap_params.yaml`
+(Task 0's `scan_topic: /scan_raw`) was left untouched — confirmed via
+`git diff -- poc_fusion/config/costmap_params.yaml` (no output) before committing.
+
+### Step 2a — `rosdep check`
+
+Run after deploying (Step 4), per the brief's own note that the check path is
+inside the container:
+```
+$ docker exec -u ubuntu MentorPi bash -lc '
+    source /opt/ros/humble/setup.bash
+    cd /home/ubuntu/ros2_ws
+    rosdep check --from-paths src/poc_fusion --ignore-src
+  '
+All system dependencies have been satisfied
+```
+`rosdep` was already initialised in the container (no `rosdep init`/`update` was run,
+as root or otherwise — none was needed). All 14 `package.xml` dependencies resolve.
+
+### Step 4 — Deploy script round-trip verification
+
+Deploy:
+```
+$ bash scripts/deploy_poc_fusion.sh
+Deploying /home/pi/Desktop/LanderPi-Proximity-Alert/poc_fusion -> MentorPi:/home/ubuntu/ros2_ws/src/poc_fusion
+No stale destination files to remove.
+Deploy complete.
+```
+
+Round-trip diff (fresh `docker cp` of the host tree into a scratch path, diffed
+against the deployed destination):
+```
+$ docker cp poc_fusion/. MentorPi:/tmp/poc_fusion_hostcopy
+$ docker exec -u ubuntu MentorPi diff -r /tmp/poc_fusion_hostcopy /home/ubuntu/ros2_ws/src/poc_fusion
+DIFF_EXIT=0
+```
+No differences.
+
+Prune behaviour verified directly: a stray `poc_fusion/poc_fusion/stale_module.py`
+and a `poc_fusion/poc_fusion/__pycache__/foo.pyc` were manually planted in the
+container destination, then the deploy script was re-run:
+```
+$ bash scripts/deploy_poc_fusion.sh
+Deploying /home/pi/Desktop/LanderPi-Proximity-Alert/poc_fusion -> MentorPi:/home/ubuntu/ros2_ws/src/poc_fusion
+Removing stale destination files (absent from host source):
+  poc_fusion/stale_module.py
+Deploy complete.
+```
+`stale_module.py` (absent from host source) was deleted; `__pycache__/foo.pyc` was
+left untouched, confirming the script deletes renamed/removed modules but leaves
+`build/`, `install/`, `log/`, and `__pycache__` alone. A second round-trip
+`diff -r --exclude=__pycache__` after this test again returned no differences
+(`DIFF_EXIT=0`). Ownership confirmed `ubuntu:ubuntu` throughout via
+`stat -c '%U:%G'` on the destination root and sampled files.
+
+### Step 5 — Build and executables
+
+```
+$ docker exec -u ubuntu MentorPi bash -lc '
+    source /opt/ros/humble/setup.bash
+    cd /home/ubuntu/ros2_ws
+    colcon build --packages-select poc_fusion
+  '
+Starting >>> poc_fusion
+--- stderr: poc_fusion
+(setuptools "setup.py install is deprecated" warning only — same warning
+proximity_alert's build already produces, not a poc_fusion-specific issue)
+---
+Finished <<< poc_fusion [3.75s]
+
+Summary: 1 package finished [5.47s]
+  1 package had stderr output: poc_fusion
+```
+
+```
+$ docker exec -u ubuntu MentorPi bash -lc '
+    source /opt/ros/humble/setup.bash
+    source /home/ubuntu/ros2_ws/install/setup.bash
+    ros2 pkg executables poc_fusion
+  '
+poc_fusion costmap_stop_monitor_node
+poc_fusion depth_preprocess_node
+poc_fusion latency_recorder_node
+```
+
+Build as `ubuntu` only, at every step (never root) — confirmed by the `-u ubuntu`
+flag on every `docker exec` above. `-u root` was used only for the deploy
+script's final `chown`.
+
+### Task 2 summary
+
+`poc_fusion` package created and committed at the host repo root (`ament_python`,
+mirroring `proximity_alert/`), with all 14 `package.xml` dependencies from the
+brief declared verbatim, three placeholder node entry points registered
+(`depth_preprocess_node`, `costmap_stop_monitor_node`, `latency_recorder_node`),
+and `scripts/deploy_poc_fusion.sh` written as the sole host→container path. Pure
+logic is not yet implemented — node modules are import-and-spin stubs only, per
+the brief; `lib/window_geometry.py` and `lib/obstacle_detection.py` deliberately
+not created (Task 3's TDD RED step). `rosdep check`, the deploy round-trip
+`diff -r`, and `colcon build --packages-select poc_fusion` (as `ubuntu`) all
+passed. No HARD SAFETY RULE was touched — no `cmd_vel` publish, no arm command,
+no `.stop_ros.sh`, no edits to `proximity_alert/` or hand-written files under
+`/home/ubuntu/ros2_ws/src/`.
