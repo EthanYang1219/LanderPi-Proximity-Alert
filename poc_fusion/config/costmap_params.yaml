@@ -1,0 +1,11 @@
+# poc_fusion costmap parameters.
+#
+# Task 0 (environment preflight) writes ONLY this key, verified live against the
+# robot on 2026-08-07 (see docs/poc_fusion_verification.md, Step 2). Task 6 fills
+# in the rest of the nav2_costmap_2d parameter set (plugins, layers, resolution,
+# global_frame, etc).
+#
+# This key is the single source of truth for the LiDAR scan topic. No other file
+# in this plan may hard-code /scan or /scan_raw as a literal — everything reads
+# it from here. If the topic ever changes, this is the only line that changes.
+scan_topic: /scan_raw
