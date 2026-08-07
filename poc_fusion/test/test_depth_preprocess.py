@@ -5,6 +5,7 @@ from poc_fusion.lib.depth_preprocess import (
     invalid_fraction,
     apply_roi_mask,
     median_filter_depth,
+    clean_depth,
 )
 
 
@@ -97,3 +98,41 @@ def test_median_filter_depth_preserves_shape():
     depth = np.full((7, 9), 600, dtype=np.uint16)
     filtered = median_filter_depth(depth, kernel_size=3)
     assert filtered.shape == (7, 9)
+
+
+# --- clean_depth ---------------------------------------------------------------
+#
+# Regression guard for the Task 4 review's Important 2 finding: a naive
+# "ROI-mask then median-filter" pipeline lets the median filter pull valid
+# neighbour values across the ROI boundary and partially un-mask the
+# self-arm box. clean_depth() is the single pure entry point the node calls
+# so the ROI mask is always the pipeline's final word, regardless of kernel
+# size or how many more filtering steps get added later.
+
+def test_clean_depth_roi_survives_median_filtering():
+    # A single-pixel ROI ("self-arm" box) sits in the middle of an otherwise
+    # fully valid frame. A 3x3 median filter centred on that pixel sees 8
+    # valid (700) neighbours and 1 masked (0) pixel -- the majority-vote
+    # median of that 3x3 window is 700, so a pipeline that masks *before*
+    # filtering and never re-masks will silently un-mask the arm pixel.
+    # This is exactly the bug: once Task 11 supplies a real (non-zero-width)
+    # ROI, the arm would intermittently reappear as valid depth, i.e. stop
+    # being reported as excluded.
+    depth = np.full((9, 9), 700, dtype=np.uint16)
+    roi = dict(row_min=4, row_max=5, col_min=4, col_max=5)  # single pixel
+    cleaned = clean_depth(depth, kernel_size=3, **roi)
+    assert cleaned[4, 4] == 0, (
+        "ROI pixel was un-masked by the median filter -- the ROI mask must "
+        "be the pipeline's final word, not just its first step"
+    )
+
+
+def test_clean_depth_still_denoises_outside_the_roi():
+    # The reapplied ROI mask must not come at the cost of Step 4's spatial
+    # denoising elsewhere in the frame: a spike outside the ROI is still
+    # smoothed away.
+    depth = np.full((9, 9), 600, dtype=np.uint16)
+    depth[1, 1] = 60000  # spike, well away from the ROI below
+    roi = dict(row_min=6, row_max=7, col_min=6, col_max=7)
+    cleaned = clean_depth(depth, kernel_size=3, **roi)
+    assert cleaned[1, 1] == 600

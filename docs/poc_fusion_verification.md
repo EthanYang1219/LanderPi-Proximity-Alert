@@ -1166,3 +1166,284 @@ explicitly deferred to a human-present session. `costmap_params.yaml` was
 not touched. No HARD SAFETY RULE was violated — no `cmd_vel`, no arm
 command, `.stop_ros.sh` never run, no edits to `proximity_alert/` or to
 files under `/home/ubuntu/ros2_ws/src/` outside the deploy script's target.
+
+---
+
+## Task 4 fix round — response to review (Important 1, Important 2, Item 3, Item 4)
+
+Captured 2026-08-07, **22:38 HKT / 14:38 UTC**:
+```
+$ date
+Fri Aug  7 10:38:58 PM HKT 2026
+$ date -u
+Fri Aug  7 02:38:58 PM UTC 2026
+```
+
+### Important 2 — ROI un-masked by median filter: RED then GREEN
+
+New pure function `poc_fusion/poc_fusion/lib/depth_preprocess.py:clean_depth()`
+replaces the node's separate `apply_roi_mask()` → `median_filter_depth()`
+calls. Written test-first: `test_clean_depth_roi_survives_median_filtering`
+placed a single-pixel ROI in the middle of an otherwise fully-valid frame
+and asserted the ROI pixel is still 0 after the full pipeline.
+
+RED, against the buggy "mask-then-filter, never re-mask" ordering
+(implemented deliberately first to reproduce the review's exact finding):
+
+```
+$ cd /home/pi/Desktop/LanderPi-Proximity-Alert/poc_fusion && python3 -m pytest test/test_depth_preprocess.py -q -k clean_depth
+F.                                                                       [100%]
+=================================== FAILURES ===================================
+________________ test_clean_depth_roi_survives_median_filtering ________________
+
+    def test_clean_depth_roi_survives_median_filtering():
+        ...
+        depth = np.full((9, 9), 700, dtype=np.uint16)
+        roi = dict(row_min=4, row_max=5, col_min=4, col_max=5)  # single pixel
+        cleaned = clean_depth(depth, kernel_size=3, **roi)
+>       assert cleaned[4, 4] == 0, (
+            "ROI pixel was un-masked by the median filter -- the ROI mask must "
+            "be the pipeline's final word, not just its first step"
+        )
+E       AssertionError: ROI pixel was un-masked by the median filter -- the ROI mask must be the pipeline's final word, not just its first step
+E       assert 700 == 0
+
+test/test_depth_preprocess.py:124: AssertionError
+=========================== short test summary info ============================
+FAILED test/test_depth_preprocess.py::test_clean_depth_roi_survives_median_filtering
+1 failed, 1 passed, 12 deselected in 0.25s
+```
+
+This exactly reproduces the review's Important 2 finding: the 3x3 median
+filter around the single masked pixel sees 8 valid (700) neighbours and 1
+zero pixel, so the majority-vote median un-masks it back to 700.
+
+GREEN, after adding a final `apply_roi_mask()` call at the end of
+`clean_depth()`:
+
+```
+$ cd /home/pi/Desktop/LanderPi-Proximity-Alert/poc_fusion && python3 -m pytest test/ -q
+.................................                                        [100%]
+33 passed in 0.25s
+```
+
+31 (previous total) + 2 new (`test_clean_depth_roi_survives_median_filtering`,
+`test_clean_depth_still_denoises_outside_the_roi`, the latter confirming the
+fix doesn't come at the cost of denoising elsewhere in the frame) = 33,
+all passing.
+
+`depth_preprocess_node.py`'s `_on_depth()` now calls `clean_depth(...)`
+directly instead of the two separate pure-function calls, so the
+mask-then-filter-then-remask ordering lives in exactly one place.
+
+### Important 1 — ROI-profile parameter declaration mismatch
+
+Confirmed the reviewer's finding: only `roi_profiles.default.*` is declared
+via `declare_parameter()`; `Node.__init__` does not pass
+`automatically_declare_parameters_from_overrides=True`, so selecting any
+`roi_profile` other than `default` would raise
+`ParameterNotDeclaredException`. Per the reviewer's steer (do not build a
+second profile; make code and prose agree, cheapest option), corrected the
+claim rather than adding infrastructure for a profile that doesn't exist
+yet:
+- `poc_fusion/config/depth_preprocess_params.yaml`'s comment now states
+  plainly that adding a second profile requires adding four more
+  `declare_parameter()` calls in the node — it is not YAML-only.
+- Added a matching inline comment in `depth_preprocess_node.py` at the ROI
+  parameter resolution site.
+- The Task 4 report's self-review claim ("the structure to add [a second
+  profile] without touching this node's code is in place") is corrected in
+  the report's fix-round addendum below.
+
+No functional code change here — this is a truth-in-comments fix, per the
+reviewer's explicit steer against building unused infrastructure.
+
+### Item 3 — missing `python3-opencv` dependency
+
+`depth_preprocess_node.py` imports `cv2` directly (`cv2.normalize`,
+`cv2.cvtColor`, `cv2.rectangle` for the Step 5 debug overlay) but
+`package.xml` only had it transitively through `cv_bridge`. Added
+`<exec_depend>python3-opencv</exec_depend>` and re-ran `rosdep check`:
+
+```
+$ docker exec -u ubuntu MentorPi bash -lc '
+    source /opt/ros/humble/setup.bash
+    cd /home/ubuntu/ros2_ws
+    rosdep check --from-paths src/poc_fusion --ignore-src
+  '
+All system dependencies have been satisfied
+```
+
+### Item 4 — debug_image rate gap: investigated, not a bug
+
+Re-deployed and rebuilt (see below), then re-ran the node and measured
+`/poc_fusion/depth_cleaned` and `/poc_fusion/debug_image` **simultaneously**
+over the same 10s window, one `ros2 topic hz` process per topic launched
+together:
+
+```
+$ docker exec -u ubuntu MentorPi bash -lc '
+    source /opt/ros/humble/setup.bash
+    source /home/ubuntu/ros2_ws/install/setup.bash
+    (timeout 10 ros2 topic hz /poc_fusion/depth_cleaned > /tmp/hz_cleaned.log 2>&1) &
+    (timeout 10 ros2 topic hz /poc_fusion/debug_image > /tmp/hz_debug.log 2>&1) &
+    wait
+    echo "=== depth_cleaned ==="; cat /tmp/hz_cleaned.log
+    echo "=== debug_image ==="; cat /tmp/hz_debug.log
+  '
+=== depth_cleaned ===
+average rate: 12.904 ... window: 14
+average rate: 14.081 ... window: 30
+average rate: 14.406 ... window: 46
+average rate: 14.489 ... window: 61
+average rate: 14.531 ... window: 76
+average rate: 14.569 ... window: 91
+average rate: 14.309 ... window: 104
+=== debug_image ===
+average rate: 9.780 ... window: 13
+average rate: 11.717 ... window: 28
+average rate: 10.983 ... window: 38
+average rate: 10.778 ... window: 49
+average rate: 10.419 ... window: 58
+average rate: 9.765 ... window: 65
+average rate: 10.300 ... window: 79
+```
+
+Even measured simultaneously over the identical 10s window, the two
+`ros2 topic hz` processes disagree (104 vs. 79 windowed messages) — this
+alone would suggest a genuine gap. But `_on_depth()` publishes both
+messages unconditionally, synchronously, in the same callback with no
+branch between them, so the two topics cannot structurally diverge in
+publish count. To settle it, a single rclpy process subscribed to **both**
+topics at once (removing the confound of two separate `ros2 topic hz`
+subprocesses competing with each other and with the node for CPU on the
+Pi 5) and counted messages directly:
+
+```
+$ docker exec -u ubuntu MentorPi bash -lc '
+    source /opt/ros/humble/setup.bash
+    source /home/ubuntu/ros2_ws/install/setup.bash
+    python3 /tmp/rate_check.py
+  '
+elapsed=10.04s
+cleaned_count=130 (12.95 Hz)
+debug_count=130 (12.95 Hz)
+```
+
+**Exact parity: 130 messages received on each topic in the same 10.04s
+window.** This confirms the two `ros2 topic hz` CLI processes measured
+against each other (and against the node) were the source of the earlier
+apparent gap — not a real 1:1-violating rate difference in the node. The
+Task 4 report's original explanation ("extra cv2 overhead") was wrong (as
+the reviewer flagged: a slow callback would throttle both publishes
+equally), but so would concluding this is a genuine bug — the corrected,
+evidence-backed conclusion is that both topics publish in lockstep at
+whatever rate the node's callback sustains (~13-14.7 Hz depending on
+concurrent CPU load), and the discrepancy in the two separate `ros2 topic
+hz` invocations was itself a measurement artifact of running two
+independent CPU-competing subscriber processes rather than a property of
+the node.
+
+### Redeploy + rebuild (as `ubuntu`, never root)
+
+```
+$ bash scripts/deploy_poc_fusion.sh
+Deploying /home/pi/Desktop/LanderPi-Proximity-Alert/poc_fusion -> MentorPi:/home/ubuntu/ros2_ws/src/poc_fusion
+No stale destination files to remove.
+Deploy complete.
+```
+
+```
+$ docker exec -u ubuntu MentorPi bash -lc '
+    source /opt/ros/humble/setup.bash
+    cd /home/ubuntu/ros2_ws
+    colcon build --packages-select poc_fusion
+  '
+Starting >>> poc_fusion
+Finished <<< poc_fusion [2.56s]
+--- stderr: poc_fusion
+[setup.py deprecation warning, same as before]
+---
+Summary: 1 package finished [4.52s]
+  1 package had stderr output: poc_fusion
+```
+
+### Re-verification after the pipeline reorder
+
+Node restarted; encoding and header still correct after the `clean_depth()`
+reorder:
+
+```
+$ docker exec -u ubuntu MentorPi bash -lc '
+    source /opt/ros/humble/setup.bash
+    source /home/ubuntu/ros2_ws/install/setup.bash
+    ros2 topic echo /poc_fusion/depth_cleaned --no-arr --once
+  '
+header:
+  stamp: {sec: 1786113517, nanosec: 460000000}
+  frame_id: depth_camera_link
+height: 400
+width: 640
+encoding: 16UC1
+is_bigendian: 0
+step: 1280
+data: '<sequence type: uint8, length: 512000>'
+---
+```
+
+Node log during this run showed no errors:
+```
+$ docker exec -u ubuntu MentorPi bash -lc 'tail -30 /tmp/depth_preprocess_node_v2.log'
+[INFO] [1786113432.873500819] [depth_preprocess_node]: depth_preprocess_node started: ...
+[INFO] [1786113432.976275043] [depth_preprocess_node]: invalid pixel fraction: 0.295
+[INFO] [1786113438.013522209] [depth_preprocess_node]: invalid pixel fraction: 0.294
+[INFO] [1786113443.053784794] [depth_preprocess_node]: invalid pixel fraction: 0.296
+[INFO] [1786113448.066105998] [depth_preprocess_node]: invalid pixel fraction: 0.295
+[INFO] [1786113453.076794724] [depth_preprocess_node]: invalid pixel fraction: 0.294
+[INFO] [1786113458.123093164] [depth_preprocess_node]: invalid pixel fraction: 0.291
+[INFO] [1786113463.151055201] [depth_preprocess_node]: invalid pixel fraction: 0.294
+[INFO] [1786113468.183694302] [depth_preprocess_node]: invalid pixel fraction: 0.294
+[INFO] [1786113473.233710232] [depth_preprocess_node]: invalid pixel fraction: 0.294
+```
+
+### Teardown
+
+```
+$ docker exec -u ubuntu MentorPi bash -lc '
+    source /opt/ros/humble/setup.bash
+    source /home/ubuntu/ros2_ws/install/setup.bash
+    kill 169172 2>/dev/null
+    sleep 1
+    ros2 node list | grep depth_preprocess || echo "node not in graph - confirmed stopped"
+  '
+node not in graph - confirmed stopped
+```
+
+No other node touched. No `cmd_vel` published, no arm command sent,
+`.stop_ros.sh` never invoked.
+
+### Host test suite — final
+
+```
+$ cd /home/pi/Desktop/LanderPi-Proximity-Alert/poc_fusion && python3 -m pytest test/ -q
+.................................                                        [100%]
+33 passed in 0.29s
+```
+
+### Fix round summary
+
+Fixed the review's Important 2 (ROI un-masked by median filter at its
+boundary) with a TDD RED/GREEN cycle producing `clean_depth()` and 2 new
+regression tests (33/33 total, pristine). Resolved Important 1 by
+correcting the YAML comment and node comment to state accurately that a
+second ROI profile requires a node code change, not just a YAML edit — no
+infrastructure was built for the unused profile, per explicit reviewer
+steer against that. Added the missing `python3-opencv` `package.xml`
+dependency (Item 3), confirmed via `rosdep check`. Investigated the
+debug_image rate gap (Item 4) and determined via a single-process
+simultaneous-subscription message count (130/130 exact parity) that it is
+a measurement artifact of running two independent `ros2 topic hz`
+processes, not a real defect in the node — corrected the report's earlier
+unsupported causal claim accordingly. Redeployed and rebuilt as `ubuntu`,
+re-verified `encoding: 16UC1` and header passthrough still hold after the
+pipeline reorder. No HARD SAFETY RULE was violated.

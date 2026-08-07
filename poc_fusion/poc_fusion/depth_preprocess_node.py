@@ -13,7 +13,10 @@ to consume. Pipeline, per the Task 4 brief:
      branch; see lib/depth_preprocess.py) and log the invalid fraction.
   4. Zero out the self-arm ROI box read from
      config/depth_preprocess_params.yaml.
-  5. Median-filter for spatial denoising, kernel size a parameter.
+  5. Median-filter for spatial denoising, kernel size a parameter, then
+     re-apply the ROI mask (the median filter can otherwise pull valid
+     neighbour values across the ROI boundary and partially un-mask the
+     arm's own box -- see lib/depth_preprocess.clean_depth()).
   6. Publish a debug overlay image showing the masked ROI.
 
 All array logic lives in poc_fusion.lib.depth_preprocess (pure, dependency-
@@ -27,9 +30,8 @@ from rclpy.node import Node
 from sensor_msgs.msg import Image
 
 from poc_fusion.lib.depth_preprocess import (
-    apply_roi_mask,
+    clean_depth,
     invalid_fraction,
-    median_filter_depth,
 )
 
 EXPECTED_ENCODING = 'mono16'
@@ -58,6 +60,11 @@ class DepthPreprocessNode(Node):
         self._expected_encoding = self.get_parameter('expected_encoding').value
         self._median_kernel_size = self.get_parameter('median_kernel_size').value
 
+        # Only `roi_profiles.default.*` is declared above. Selecting any
+        # other `roi_profile` value will raise ParameterNotDeclaredException
+        # here -- adding a second profile (Task 10a) requires adding four
+        # more declare_parameter() calls above, it is not YAML-only. See
+        # config/depth_preprocess_params.yaml's comment.
         profile = self.get_parameter('roi_profile').value
         prefix = f'roi_profiles.{profile}'
         self._roi_row_min = self.get_parameter(f'{prefix}.row_min').value
@@ -109,13 +116,17 @@ class DepthPreprocessNode(Node):
         self.get_logger().info(
             f'invalid pixel fraction: {frac:.3f}', throttle_duration_sec=5.0)
 
-        roi_masked = apply_roi_mask(
+        # clean_depth() re-applies the ROI mask after the median filter, not
+        # just before it -- see lib/depth_preprocess.py's docstring. Doing
+        # the mask-then-filter-then-remask as one pure call keeps the
+        # ordering guarantee in one place rather than risking a future edit
+        # here re-introducing the review's Important 2 bug.
+        cleaned = clean_depth(
             depth,
             row_min=self._roi_row_min, row_max=self._roi_row_max,
             col_min=self._roi_col_min, col_max=self._roi_col_max,
+            kernel_size=self._median_kernel_size,
         )
-
-        cleaned = median_filter_depth(roi_masked, self._median_kernel_size)
 
         out_msg = self._bridge.cv2_to_imgmsg(cleaned, encoding=OUTGOING_ENCODING)
         out_msg.header = msg.header  # stamp and frame_id preserved verbatim

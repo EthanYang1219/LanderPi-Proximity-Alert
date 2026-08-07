@@ -52,3 +52,18 @@ def median_filter_depth(depth, kernel_size):
     depth = np.asarray(depth)
     filtered = ndimage.median_filter(depth, size=kernel_size)
     return filtered.astype(depth.dtype)
+
+
+def clean_depth(depth, row_min, row_max, col_min, col_max, kernel_size):
+    """Full Step 3+4 pipeline: ROI-mask, median-filter, ROI-mask again.
+
+    The median filter can pull valid neighbour values across the ROI
+    boundary and partially un-mask the self-arm box at its edges (Task 4
+    review, Important 2). Reapplying the mask after filtering makes the ROI
+    mask the pipeline's final word regardless of kernel size, so the arm is
+    never reported as an obstacle once Task 11 supplies a real (non-zero-
+    width) box.
+    """
+    masked = apply_roi_mask(depth, row_min, row_max, col_min, col_max)
+    filtered = median_filter_depth(masked, kernel_size)
+    return apply_roi_mask(filtered, row_min, row_max, col_min, col_max)
