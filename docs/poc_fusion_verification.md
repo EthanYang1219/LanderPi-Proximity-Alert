@@ -2468,3 +2468,749 @@ identical before and after by direct `diff`. No HARD SAFETY RULE was
 touched — no `cmd_vel` publish, no arm command, `.stop_ros.sh` never run,
 no edits to `proximity_alert/` or to files under `/home/ubuntu/ros2_ws/src/`
 outside the deploy script's target.
+
+---
+
+## Task 6: Costmap configuration (2026-08-08 HKT / 2026-08-07 UTC)
+
+Standalone `nav2_costmap_2d` node, autostarted by `nav2_lifecycle_manager`, wired
+into `poc_fusion/launch/poc_fusion.launch.py`. No planner, controller, BT
+navigator, map server, or AMCL — scope is exactly the obstacle layer with two
+observation sources (LiDAR scan + `/poc_fusion/points`).
+
+### Step 0: determining the real node name/namespace BEFORE writing config
+
+Ran the bare executable with no name/namespace override to see what
+`nav2_costmap_2d` actually calls itself, rather than assuming:
+
+```
+$ docker exec -u ubuntu MentorPi bash -lc '
+source /opt/ros/humble/setup.bash
+source /home/ubuntu/ros2_ws/install/setup.bash 2>/dev/null
+timeout 4 ros2 run nav2_costmap_2d nav2_costmap_2d &
+sleep 2
+ros2 node list
+sleep 3
+'
+[INFO] [1786128210.865705706] [costmap.costmap]: 
+	costmap lifecycle node launched. 
+	Waiting on external lifecycle transitions to activate
+	See https://design.ros2.org/articles/node_lifecycle.html for more information.
+[INFO] [1786128210.897223378] [costmap.costmap]: Creating Costmap
+/LD19
+/ar_app
+/arm_controller
+/aurora/aurora
+/controller_manager
+/costmap/costmap
+/ekf_filter_node
+/gripper_controller
+/hand_gesture
+/hand_trajectory
+/imu_calib
+/imu_filter
+/init_pose
+/joint_state_publisher
+/joy_node
+/joystick_control
+/lidar_app
+/line_following
+/object_tracking
+/odom_publisher
+/robot_state_publisher
+/ros_robot_controller
+/rosapi
+/rosapi_params
+/rosbridge_websocket
+/servo_manager
+/static_transform_publisher_xjZs1QyCV0ckvKkj
+/transform_listener_impl_5555ad8bf7e0
+/web_video_server
+[INFO] [1786128213.786406018] [rclcpp]: signal_handler(signum=15)
+[INFO] [1786128213.786589168] [costmap.costmap]: Running Nav2 LifecycleNode rcl preshutdown (costmap)
+[INFO] [1786128213.786681465] [costmap.costmap]: Destroying bond (costmap) to lifecycle manager.
+[INFO] [1786128213.789300539] [costmap.costmap]: Destroying
+```
+
+Default is namespace `costmap`, name `costmap` → fully-qualified `/costmap/costmap`,
+matching nav2_bringup's own `local_costmap/local_costmap` double-nesting convention.
+`poc_fusion.launch.py`'s costmap `Node` action deliberately passes no `name=`/
+`namespace=` override, and `costmap_params.yaml`'s key path is
+`costmap: costmap: ros__parameters:` to match.
+
+### Bug 1: raw `costmap_params.yaml` cannot be passed directly as `--params-file`
+
+First attempt passed `costmap_params_path` straight through to the costmap
+`Node`'s `parameters=`. Standard ROS 2 params-file YAML only permits node-name
+(or wildcard) keys at the top level; `costmap_params.yaml`'s top-level
+`scan_topic` key (required so the file stays the single source of truth for the
+scan topic) breaks that:
+
+```
+[nav2_costmap_2d-3] [ERROR] [1786128429.091567544] [rcl]: Failed to parse global arguments
+[nav2_costmap_2d-3] terminate called after throwing an instance of 'rclcpp::exceptions::RCLInvalidROSArgsError'
+[nav2_costmap_2d-3]   what():  failed to initialize rcl: Couldn't parse params file: '--params-file /home/ubuntu/ros2_ws/install/poc_fusion/share/poc_fusion/config/costmap_params.yaml'. Error: Cannot have a value before ros__parameters at line 16, at ./src/parse.c:793, at ./src/rcl/arguments.c:406
+[ERROR] [nav2_costmap_2d-3]: process has died [pid 53220, exit code -6, cmd '/opt/ros/humble/lib/nav2_costmap_2d/nav2_costmap_2d --ros-args --params-file /home/ubuntu/ros2_ws/install/poc_fusion/share/poc_fusion/config/costmap_params.yaml --params-file /tmp/launch_params_89rm_d7v'].
+```
+
+Fix: `poc_fusion.launch.py` now `yaml.safe_load()`s the whole file at
+launch-description-generation time, reads `scan_topic` from it, extracts only
+the `costmap.costmap.ros__parameters` sub-tree, and passes THAT sub-tree as an
+in-memory dict (plus the `obstacle_layer.scan.topic` override) to the `Node`
+action — `launch_ros` writes it back out to a well-formed temp params file for
+the node. `costmap_params.yaml` is unchanged by this fix; only how the launch
+file consumes it changed.
+
+### Bug 2: `bond_timeout` — standalone `nav2_costmap_2d` never creates a bond
+
+With the params-file bug fixed, the costmap node itself reached `active`
+(confirmed by its own log and a direct `ros2 lifecycle get`), but
+`nav2_lifecycle_manager` separately reported a bond failure every time,
+first at `bond_timeout: 4.0`:
+
+```
+[nav2_costmap_2d-3] [INFO] [1786128552.115271291] [costmap.costmap]: Subscribed to Topics: scan pointcloud
+[nav2_costmap_2d-3] [INFO] [1786128552.269548712] [costmap.costmap]: Initialized plugin "obstacle_layer"
+[depth_preprocess_node-1] [INFO] [1786128552.430477886] [depth_preprocess_node]: invalid pixel fraction: 0.300
+[lifecycle_manager-4] [INFO] [1786128552.470555702] [lifecycle_manager_costmap]: Activating costmap/costmap
+[nav2_costmap_2d-3] [INFO] [1786128552.471021073] [costmap.costmap]: Activating
+[nav2_costmap_2d-3] [INFO] [1786128552.471057425] [costmap.costmap]: Checking transform
+[nav2_costmap_2d-3] [INFO] [1786128552.471166018] [costmap.costmap]: start
+[lifecycle_manager-4] [ERROR] [1786128554.624574629] [lifecycle_manager_costmap]: Server costmap/costmap was unable to be reached after 4.00s by bond. This server may be misconfigured.
+[lifecycle_manager-4] [ERROR] [1786128554.624636444] [lifecycle_manager_costmap]: Failed to bring up all requested nodes. Aborting bringup.
+[lifecycle_manager-4] terminate called after throwing an instance of 'statemap::TransitionUndefinedException'
+[lifecycle_manager-4]   what():  no such transition in current state
+[ERROR] [lifecycle_manager-4]: process has died [pid 60072, exit code -6, cmd '/opt/ros/humble/lib/nav2_lifecycle_manager/lifecycle_manager --ros-args -r __node:=lifecycle_manager_costmap --params-file /tmp/launch_params_vpfi5j_o'].
+```
+
+At `bond_timeout: 4.0` this actually crashed `lifecycle_manager` outright
+(uncaught `statemap::TransitionUndefinedException`). Raised to `bond_timeout:
+10.0` — still failed, same error, no crash this time:
+
+```
+[lifecycle_manager-4] [ERROR] [1786128612.798575537] [lifecycle_manager_costmap]: Server costmap/costmap was unable to be reached after 10.00s by bond. This server may be misconfigured.
+[lifecycle_manager-4] [ERROR] [1786128612.798803667] [lifecycle_manager_costmap]: Failed to bring up all requested nodes. Aborting bringup.
+```
+
+Diagnosed by inspecting who actually publishes/subscribes `/bond` during that
+run:
+
+```
+$ docker exec -u ubuntu MentorPi bash -lc '
+source /opt/ros/humble/setup.bash
+source /home/ubuntu/ros2_ws/install/setup.bash
+ros2 topic info /bond -v
+echo "---node list---"
+ros2 node list | grep -Ei "costmap|lifecycle"
+echo "---lifecycle get---"
+ros2 lifecycle get /costmap/costmap
+'
+Type: bond/msg/Status
+
+Publisher count: 1
+
+Node name: lifecycle_manager_costmap
+Node namespace: /
+Topic type: bond/msg/Status
+Endpoint type: PUBLISHER
+GID: 01.0f.12.1c.7b.f7.e0.d7.01.00.00.00.00.00.1b.03.00.00.00.00.00.00.00.00
+QoS profile:
+  Reliability: RELIABLE
+  History (Depth): UNKNOWN
+  Durability: VOLATILE
+  Lifespan: Infinite
+  Deadline: Infinite
+  Liveliness: AUTOMATIC
+  Liveliness lease duration: Infinite
+
+Subscription count: 1
+
+Node name: lifecycle_manager_costmap
+Node namespace: /
+Topic type: bond/msg/Status
+Endpoint type: SUBSCRIPTION
+GID: 01.0f.12.1c.7b.f7.e0.d7.01.00.00.00.00.00.1c.04.00.00.00.00.00.00.00.00
+QoS profile:
+  Reliability: RELIABLE
+  History (Depth): UNKNOWN
+  Durability: VOLATILE
+  Lifespan: Infinite
+  Deadline: Infinite
+  Liveliness: AUTOMATIC
+  Liveliness lease duration: Infinite
+
+---node list---
+/costmap/costmap
+/lifecycle_manager_costmap
+---lifecycle get---
+active [3]
+```
+
+Both the publisher AND subscriber on `/bond` are `lifecycle_manager_costmap`
+itself — the costmap node is not a party to `/bond` at all. The standalone
+`nav2_costmap_2d` executable's `Costmap2DROS` never calls `createBond()` the
+way the full servers embedded in a real Nav2 bringup (`controller_server`,
+`planner_server`) do, so there is no peer for the manager to bond with, at
+any timeout value. Meanwhile `ros2 lifecycle get /costmap/costmap` independently
+confirms the node itself really is `active [3]` — the bond failure is a
+missing-peer condition on the manager's side, not evidence the node failed
+to activate.
+
+Fix: `bond_timeout: 0.0` (a standard, documented `nav2_lifecycle_manager`
+parameter that disables the post-activation bond liveliness check — not
+custom code). Re-launched with this change:
+
+```
+$ docker exec -u ubuntu MentorPi bash -lc '
+source /opt/ros/humble/setup.bash
+source /home/ubuntu/ros2_ws/install/setup.bash
+date -u +"UTC %Y-%m-%d %H:%M:%S"
+TZ=Asia/Hong_Kong date +"HKT %Y-%m-%d %H:%M:%S"
+nohup ros2 launch poc_fusion poc_fusion.launch.py > /tmp/task6_launch4.log 2>&1 &
+disown
+echo "LAUNCH_PID=$!"
+sleep 14
+tail -n 40 /tmp/task6_launch4.log
+'
+UTC 2026-08-07 18:54:02
+HKT 2026-08-08 02:54:02
+LAUNCH_PID=75997
+[INFO] [launch]: All log files can be found below /home/ubuntu/.ros/log/2026-08-07-18-54-03-221369-raspberrypi-75997
+[INFO] [launch]: Default logging verbosity is set to INFO
+[INFO] [depth_preprocess_node-1]: process started with pid [76010]
+[INFO] [component_container-2]: process started with pid [76012]
+[INFO] [nav2_costmap_2d-3]: process started with pid [76014]
+[INFO] [lifecycle_manager-4]: process started with pid [76016]
+[nav2_costmap_2d-3] [INFO] [1786128844.150280731] [costmap.costmap]: 
+	costmap lifecycle node launched. 
+	Waiting on external lifecycle transitions to activate
+	See https://design.ros2.org/articles/node_lifecycle.html for more information.
+[nav2_costmap_2d-3] [INFO] [1786128844.155837984] [costmap.costmap]: Creating Costmap
+[lifecycle_manager-4] [INFO] [1786128844.342655006] [lifecycle_manager_costmap]: Creating
+[lifecycle_manager-4] [INFO] [1786128844.359808006] [lifecycle_manager_costmap]: Creating and initializing lifecycle service clients
+[lifecycle_manager-4] [INFO] [1786128844.405770274] [lifecycle_manager_costmap]: Starting managed nodes bringup...
+[lifecycle_manager-4] [INFO] [1786128844.405834645] [lifecycle_manager_costmap]: Configuring costmap/costmap
+[nav2_costmap_2d-3] [INFO] [1786128844.409645579] [costmap.costmap]: Configuring
+[nav2_costmap_2d-3] [INFO] [1786128844.516120128] [costmap.costmap]: Using plugin "obstacle_layer"
+[nav2_costmap_2d-3] [INFO] [1786128844.553717544] [costmap.costmap]: Subscribed to Topics: scan pointcloud
+[nav2_costmap_2d-3] [INFO] [1786128844.624668163] [costmap.costmap]: Initialized plugin "obstacle_layer"
+[component_container-2] [INFO] [1786128844.666326736] [poc_fusion.poc_fusion_container]: Load Library: /opt/ros/humble/lib/librectify.so
+[lifecycle_manager-4] [INFO] [1786128844.668671204] [lifecycle_manager_costmap]: Activating costmap/costmap
+[nav2_costmap_2d-3] [INFO] [1786128844.669235798] [costmap.costmap]: Activating
+[nav2_costmap_2d-3] [INFO] [1786128844.669280131] [costmap.costmap]: Checking transform
+[nav2_costmap_2d-3] [INFO] [1786128844.669326779] [costmap.costmap]: Timed out waiting for transform from base_link to odom to become available, tf error: Invalid frame ID "odom" passed to canTransform argument target_frame - frame does not exist
+[component_container-2] [INFO] [1786128844.800257252] [poc_fusion.poc_fusion_container]: Found class: rclcpp_components::NodeFactoryTemplate<image_proc::RectifyNode>
+[component_container-2] [INFO] [1786128844.800333104] [poc_fusion.poc_fusion_container]: Instantiate class: rclcpp_components::NodeFactoryTemplate<image_proc::RectifyNode>
+[nav2_costmap_2d-3] [INFO] [1786128845.171600790] [costmap.costmap]: start
+[INFO] [launch_ros.actions.load_composable_nodes]: Loaded node '/poc_fusion/depth_rectify_node' in container '/poc_fusion/poc_fusion_container'
+[component_container-2] [INFO] [1786128845.279023767] [poc_fusion.poc_fusion_container]: Load Library: /opt/ros/humble/lib/libdepth_image_proc.so
+[component_container-2] [INFO] [1786128845.288590936] [poc_fusion.poc_fusion_container]: Found class: rclcpp_components::NodeFactoryTemplate<depth_image_proc::ConvertMetricNode>
+[component_container-2] [INFO] [1786128845.288670621] [poc_fusion.poc_fusion_container]: Found class: rclcpp_components::NodeFactoryTemplate<depth_image_proc::CropForemostNode>
+[component_container-2] [INFO] [1786128845.288685918] [poc_fusion.poc_fusion_container]: Found class: rclcpp_components::NodeFactoryTemplate<depth_image_proc::DisparityNode>
+[component_container-2] [INFO] [1786128845.288697677] [poc_fusion.poc_fusion_container]: Found class: rclcpp_components::NodeFactoryTemplate<depth_image_proc::PointCloudXyzNode>
+[component_container-2] [INFO] [1786128845.288711214] [poc_fusion.poc_fusion_container]: Instantiate class: rclcpp_components::NodeFactoryTemplate<depth_image_proc::PointCloudXyzNode>
+[lifecycle_manager-4] [INFO] [1786128845.310826300] [lifecycle_manager_costmap]: Managed nodes are active
+[INFO] [launch_ros.actions.load_composable_nodes]: Loaded node '/poc_fusion/point_cloud_xyz_node' in container '/poc_fusion/poc_fusion_container'
+[depth_preprocess_node-1] [INFO] [1786128845.527873480] [depth_preprocess_node]: depth_preprocess_node started: /ascamera/camera_publisher/depth0/image_raw -> /poc_fusion/depth_cleaned (expected encoding=mono16, roi_profile=default, median_kernel_size=3)
+[depth_preprocess_node-1] [INFO] [1786128845.530570875] [depth_preprocess_node]: invalid pixel fraction: 0.298
+```
+
+`lifecycle_manager_costmap` now logs `Managed nodes are active` with no
+bond error. The one-time `Timed out waiting for transform ... odom` line at
+`1786128844.669` is a startup transient (queried before the first `/tf`
+message arrived) — `tf2_echo odom base_link` moments later in this same
+session resolves cleanly (see Step 4 below) and the costmap proceeds past
+it to `start` within ~0.5s regardless.
+
+### Step 4: proving the node name, parameters, and lifecycle state
+
+```
+$ docker exec -u ubuntu MentorPi bash -lc '
+source /opt/ros/humble/setup.bash
+source /home/ubuntu/ros2_ws/install/setup.bash
+echo "=== ros2 node list ==="
+ros2 node list
+echo
+echo "=== ros2 lifecycle get /costmap/costmap ==="
+ros2 lifecycle get /costmap/costmap
+'
+=== ros2 node list ===
+/LD19
+/ar_app
+/arm_controller
+/aurora/aurora
+/controller_manager
+/costmap/costmap
+/depth_preprocess_node
+/ekf_filter_node
+/gripper_controller
+/hand_gesture
+/hand_trajectory
+/imu_calib
+/imu_filter
+/init_pose
+/joint_state_publisher
+/joy_node
+/joystick_control
+/launch_ros_75997
+/lidar_app
+/lifecycle_manager_costmap
+/line_following
+/object_tracking
+/odom_publisher
+/poc_fusion/depth_rectify_node
+/poc_fusion/poc_fusion_container
+/poc_fusion/point_cloud_xyz_node
+/robot_state_publisher
+/ros_robot_controller
+/rosapi
+/rosapi_params
+/rosbridge_websocket
+/servo_manager
+/static_transform_publisher_xjZs1QyCV0ckvKkj
+/transform_listener_impl_5555ad8bf7e0
+/transform_listener_impl_5555d4961fb0
+/web_video_server
+
+=== ros2 lifecycle get /costmap/costmap ===
+active [3]
+```
+
+`ros2 param get` readbacks proving the parameters actually took (not just
+that they were written to the YAML file — this is the exact key path
+`/costmap/costmap`, matching the verified node name):
+
+```
+$ docker exec -u ubuntu MentorPi bash -lc '
+source /opt/ros/humble/setup.bash
+source /home/ubuntu/ros2_ws/install/setup.bash
+echo "=== ros2 param get /costmap/costmap global_frame ==="
+ros2 param get /costmap/costmap global_frame
+echo "=== ros2 param get /costmap/costmap robot_base_frame ==="
+ros2 param get /costmap/costmap robot_base_frame
+echo "=== ros2 param get /costmap/costmap resolution ==="
+ros2 param get /costmap/costmap resolution
+echo "=== ros2 param get /costmap/costmap width ==="
+ros2 param get /costmap/costmap width
+echo "=== ros2 param get /costmap/costmap height ==="
+ros2 param get /costmap/costmap height
+echo "=== ros2 param get /costmap/costmap update_frequency ==="
+ros2 param get /costmap/costmap update_frequency
+echo "=== ros2 param get /costmap/costmap publish_frequency ==="
+ros2 param get /costmap/costmap publish_frequency
+echo "=== ros2 param get /costmap/costmap transform_tolerance ==="
+ros2 param get /costmap/costmap transform_tolerance
+echo "=== ros2 param get /costmap/costmap rolling_window ==="
+ros2 param get /costmap/costmap rolling_window
+'
+=== ros2 param get /costmap/costmap global_frame ===
+String value is: odom
+=== ros2 param get /costmap/costmap robot_base_frame ===
+String value is: base_link
+=== ros2 param get /costmap/costmap resolution ===
+Double value is: 0.05
+=== ros2 param get /costmap/costmap width ===
+Integer value is: 3
+=== ros2 param get /costmap/costmap height ===
+Integer value is: 3
+=== ros2 param get /costmap/costmap update_frequency ===
+Double value is: 10.0
+=== ros2 param get /costmap/costmap publish_frequency ===
+Double value is: 10.0
+=== ros2 param get /costmap/costmap transform_tolerance ===
+Double value is: 0.3
+=== ros2 param get /costmap/costmap rolling_window ===
+Boolean value is: True
+```
+
+(The command above ran together with the two observation-source `param get`
+calls below in one invocation; it was moved to a background task by the
+harness after 120s because one of the calls in that combined batch stalled.
+The batch was re-run split into two commands to isolate that — both are
+pasted below exactly as returned.)
+
+```
+$ docker exec -u ubuntu MentorPi bash -lc '
+source /opt/ros/humble/setup.bash
+source /home/ubuntu/ros2_ws/install/setup.bash
+echo "=== obstacle_layer.scan.topic ==="
+timeout 10 ros2 param get /costmap/costmap obstacle_layer.scan.topic
+echo "=== obstacle_layer.pointcloud.topic ==="
+timeout 10 ros2 param get /costmap/costmap obstacle_layer.pointcloud.topic
+echo "=== obstacle_layer.pointcloud.observation_persistence ==="
+timeout 10 ros2 param get /costmap/costmap obstacle_layer.pointcloud.observation_persistence
+echo "=== obstacle_layer.scan.observation_persistence ==="
+timeout 10 ros2 param get /costmap/costmap obstacle_layer.scan.observation_persistence
+echo "=== obstacle_layer.pointcloud.min_obstacle_height ==="
+timeout 10 ros2 param get /costmap/costmap obstacle_layer.pointcloud.min_obstacle_height
+echo "=== obstacle_layer.pointcloud.max_obstacle_height ==="
+timeout 10 ros2 param get /costmap/costmap obstacle_layer.pointcloud.max_obstacle_height
+echo "=== observation_sources ==="
+timeout 10 ros2 param get /costmap/costmap observation_sources
+'
+=== obstacle_layer.scan.topic ===
+String value is: /scan_raw
+=== obstacle_layer.pointcloud.topic ===
+String value is: /poc_fusion/points
+=== obstacle_layer.pointcloud.observation_persistence ===
+Double value is: 0.3
+=== obstacle_layer.scan.observation_persistence ===
+Double value is: 0.0
+=== obstacle_layer.pointcloud.min_obstacle_height ===
+Double value is: 0.03
+=== obstacle_layer.pointcloud.max_obstacle_height ===
+Double value is: 0.94
+=== observation_sources ===
+String value is: 
+```
+
+(`observation_sources` at the top level of the costmap is a separate,
+unused Costmap2DROS-level parameter that this config never sets — it is
+NOT the same parameter as `obstacle_layer.observation_sources`, which is
+what `ObstacleLayer` actually reads. Checked directly below.)
+
+```
+$ docker exec -u ubuntu MentorPi bash -lc '
+source /opt/ros/humble/setup.bash
+source /home/ubuntu/ros2_ws/install/setup.bash
+echo "=== obstacle_layer.observation_sources ==="
+timeout 10 ros2 param get /costmap/costmap obstacle_layer.observation_sources
+echo "=== plugins ==="
+timeout 10 ros2 param get /costmap/costmap plugins
+'
+=== obstacle_layer.observation_sources ===
+String value is: scan pointcloud
+=== plugins ===
+String values are: ['obstacle_layer']
+```
+
+`obstacle_layer.scan.topic` reading back as `/scan_raw` proves the launch
+file's runtime injection from `costmap_params.yaml`'s `scan_topic` key
+actually reached the node — this value appears nowhere as a literal in
+`poc_fusion.launch.py`.
+
+### Step 4b: proving both observation sources are actually subscribed
+
+```
+$ docker exec -u ubuntu MentorPi bash -lc '
+source /opt/ros/humble/setup.bash
+source /home/ubuntu/ros2_ws/install/setup.bash
+echo "=== ros2 node info /costmap/costmap ==="
+timeout 15 ros2 node info /costmap/costmap
+'
+=== ros2 node info /costmap/costmap ===
+/costmap/costmap
+  Subscribers:
+    /costmap/footprint: geometry_msgs/msg/Polygon
+    /parameter_events: rcl_interfaces/msg/ParameterEvent
+    /poc_fusion/points: sensor_msgs/msg/PointCloud2
+    /scan_raw: sensor_msgs/msg/LaserScan
+  Publishers:
+    /costmap/costmap: nav_msgs/msg/OccupancyGrid
+    /costmap/costmap/transition_event: lifecycle_msgs/msg/TransitionEvent
+    /costmap/costmap_raw: nav2_msgs/msg/Costmap
+    /costmap/costmap_updates: map_msgs/msg/OccupancyGridUpdate
+    /costmap/published_footprint: geometry_msgs/msg/PolygonStamped
+    /parameter_events: rcl_interfaces/msg/ParameterEvent
+    /rosout: rcl_interfaces/msg/Log
+  Service Servers:
+    /costmap/clear_around_costmap: nav2_msgs/srv/ClearCostmapAroundRobot
+    /costmap/clear_entirely_costmap: nav2_msgs/srv/ClearEntireCostmap
+    /costmap/clear_except_costmap: nav2_msgs/srv/ClearCostmapExceptRegion
+    /costmap/costmap/change_state: lifecycle_msgs/srv/ChangeState
+    /costmap/costmap/describe_parameters: rcl_interfaces/srv/DescribeParameters
+    /costmap/costmap/get_available_states: lifecycle_msgs/srv/GetAvailableStates
+    /costmap/costmap/get_available_transitions: lifecycle_msgs/srv/GetAvailableTransitions
+    /costmap/costmap/get_parameter_types: rcl_interfaces/srv/GetParameterTypes
+    /costmap/costmap/get_parameters: rcl_interfaces/srv/GetParameters
+    /costmap/costmap/get_state: lifecycle_msgs/srv/GetState
+    /costmap/costmap/get_transition_graph: lifecycle_msgs/srv/GetAvailableTransitions
+    /costmap/costmap/list_parameters: rcl_interfaces/srv/ListParameters
+    /costmap/costmap/set_parameters: rcl_interfaces/srv/SetParameters
+    /costmap/costmap/set_parameters_atomically: rcl_interfaces/srv/SetParametersAtomically
+    /costmap/get_costmap: nav2_msgs/srv/GetCostmap
+  Service Clients:
+
+  Action Servers:
+
+  Action Clients:
+```
+
+Confirms `/costmap/costmap` node subscribes to BOTH `/scan_raw` (LiDAR) and
+`/poc_fusion/points` (depth-derived point cloud).
+
+### Step 4c: publish rate and message content
+
+```
+$ docker exec -u ubuntu MentorPi bash -lc '
+source /opt/ros/humble/setup.bash
+source /home/ubuntu/ros2_ws/install/setup.bash
+echo "=== ros2 topic hz /costmap/costmap ==="
+timeout 15 ros2 topic hz /costmap/costmap
+'
+=== ros2 topic hz /costmap/costmap ===
+WARNING: topic [/costmap/costmap] does not appear to be published yet
+```
+
+`/costmap/costmap` (the full `OccupancyGrid`) is QoS `TRANSIENT_LOCAL` and is
+only republished in full occasionally (Nav2's costmap design: the routine
+update-rate traffic goes to `/costmap/costmap_updates`, an incremental
+`OccupancyGridUpdate` diff topic, not the full grid) — confirmed this is the
+right topic to check for the configured rate, not a sign the costmap is
+stuck:
+
+```
+$ docker exec -u ubuntu MentorPi bash -lc '
+source /opt/ros/humble/setup.bash
+source /home/ubuntu/ros2_ws/install/setup.bash
+echo "=== ros2 topic hz /costmap/costmap_updates ==="
+timeout 15 ros2 topic hz /costmap/costmap_updates
+'
+=== ros2 topic hz /costmap/costmap_updates ===
+WARNING: topic [/costmap/costmap_updates] does not appear to be published yet
+average rate: 5.735
+	min: 0.100s max: 0.305s std dev: 0.06754s window: 7
+average rate: 6.051
+	min: 0.100s max: 0.305s std dev: 0.05796s window: 14
+average rate: 6.430
+	min: 0.100s max: 0.305s std dev: 0.05248s window: 22
+average rate: 6.167
+	min: 0.100s max: 0.305s std dev: 0.05028s window: 28
+average rate: 6.116
+	min: 0.100s max: 0.305s std dev: 0.04801s window: 34
+average rate: 6.077
+	min: 0.100s max: 0.305s std dev: 0.04406s window: 41
+average rate: 6.029
+	min: 0.100s max: 0.305s std dev: 0.04406s window: 47
+average rate: 6.154
+	min: 0.100s max: 0.305s std dev: 0.04522s window: 55
+average rate: 6.137
+	min: 0.100s max: 0.305s std dev: 0.04470s window: 61
+average rate: 6.246
+	min: 0.100s max: 0.305s std dev: 0.04499s window: 69
+average rate: 6.272
+	min: 0.100s max: 0.305s std dev: 0.04483s window: 76
+average rate: 6.251
+	min: 0.100s max: 0.305s std dev: 0.04406s window: 82
+```
+
+The `min: 0.100s` bound matches the configured 10 Hz `update_frequency`/
+`publish_frequency` exactly (100ms is the fastest possible interval at
+10Hz); the *average* rate (~6 Hz, not 10 Hz) is measured, not derived, and
+its cause is NOT ISOLATED in this task — no new mechanism is proposed for
+it here. It is consistent with, but not shown to be caused by, the same
+kind of system-wide CPU contention already documented in Task 5 (load
+average ~5-6 on 4 cores at the time of these measurements). Flagged
+forward alongside the existing `/poc_fusion/points` rate question for
+Task 12/16 rather than chased here.
+
+Full-grid message content, proving `resolution`, `width`, `height`, and
+`frame_id` match the configured 3m×3m / 0.05 resolution / `odom` frame:
+
+```
+$ docker exec -u ubuntu MentorPi bash -lc '
+source /opt/ros/humble/setup.bash
+source /home/ubuntu/ros2_ws/install/setup.bash
+echo "=== ros2 topic echo /costmap/costmap --once (info fields only via --no-arr) ==="
+timeout 10 ros2 topic echo /costmap/costmap --once --no-arr
+'
+=== ros2 topic echo /costmap/costmap --once (info fields only via --no-arr) ===
+header:
+  stamp:
+    sec: 1786129072
+    nanosec: 792686462
+  frame_id: odom
+info:
+  map_load_time:
+    sec: 0
+    nanosec: 0
+  resolution: 0.05000000074505806
+  width: 60
+  height: 60
+  origin:
+    position:
+      x: -1.4500000003725293
+      y: -1.4500000003725293
+      z: 0.0
+    orientation:
+      x: 0.0
+      y: 0.0
+      z: 0.0
+      w: 1.0
+data: '<sequence type: int8, length: 3600>'
+---
+```
+
+`width: 60`, `height: 60` at `resolution: 0.05` = 3.0m × 3.0m, matching the
+configured size exactly (60 × 0.05 = 3). `frame_id: odom` matches
+`global_frame`. `data` length 3600 = 60×60, consistent.
+
+### Step 5 — HUMAN-PRESENT, explicitly NOT attempted
+
+Brief Step 5 ("wave a hand in front of the camera only, outside the LiDAR
+plane, confirm marks appear in RViz") requires a display and a human. Per
+instruction this run has no display and no human, so it is DEFERRED to a
+human-present session. The machine-checkable substitute evidence above
+(publish rate, message content, dual-subscription, active lifecycle state)
+proves the costmap plumbing is correctly wired and running — it does NOT
+prove fusion is doing anything useful. **Fusion is not verified working.**
+Whether the depth camera actually contributes marks the LiDAR alone would
+miss remains unconfirmed until the RViz hand-wave happens with a human
+present.
+
+### Teardown
+
+```
+$ docker exec -u ubuntu MentorPi bash -lc '
+ps aux | grep -E "poc_fusion|nav2_costmap|lifecycle_manager|depth_preprocess|component_container|launch_ros" | grep -v grep
+'
+ubuntu     40688  0.0  0.0      0     0 ?        Z    18:43   0:00 [nav2_costmap_2d] <defunct>
+ubuntu     60070  0.8  0.0      0     0 ?        Z    18:49   0:05 [nav2_costmap_2d] <defunct>
+ubuntu     63353  7.5  0.0      0     0 ?        Z    18:50   0:44 [nav2_costmap_2d] <defunct>
+ubuntu     75997  0.7  0.6 1133680 56976 ?       Sl   18:54   0:02 /usr/bin/python3 /opt/ros/humble/bin/ros2 launch poc_fusion poc_fusion.launch.py
+ubuntu     76010 35.7  1.7 1303552 147056 ?      Rl   18:54   2:05 /usr/bin/python3 /home/ubuntu/ros2_ws/install/poc_fusion/lib/poc_fusion/depth_preprocess_node --ros-args -r __node:=depth_preprocess_node --params-file /home/ubuntu/ros2_ws/install/poc_fusion/share/poc_fusion/config/depth_preprocess_params.yaml
+ubuntu     76012 13.2  1.0 991680 89536 ?        Sl   18:54   0:46 /opt/ros/humble/lib/rclcpp_components/component_container --ros-args -r __node:=poc_fusion_container -r __ns:=/poc_fusion
+ubuntu     76014 24.3  1.0 820112 89792 ?        Sl   18:54   1:25 /opt/ros/humble/lib/nav2_costmap_2d/nav2_costmap_2d --ros-args --params-file /tmp/launch_params_l9pjhrvn --params-file /tmp/launch_params_cnegn0wb
+ubuntu     76016  0.5  0.3 735232 32880 ?        Sl   18:54   0:01 /opt/ros/humble/lib/nav2_lifecycle_manager/lifecycle_manager --ros-args -r __node:=lifecycle_manager_costmap --params-file /tmp/launch_params_4whex1kw
+```
+
+`kill -TERM` on the `ros2 launch` parent PID (75997) alone left the four
+child processes (76010/76012/76014/76016) running as orphans, so they were
+killed individually by PID:
+
+```
+$ docker exec -u ubuntu MentorPi bash -lc '
+kill -TERM 76010 76012 76014 76016
+sleep 4
+ps aux | grep -E "poc_fusion|nav2_costmap|lifecycle_manager|depth_preprocess|component_container|launch_ros" | grep -v grep
+'
+ubuntu     40688  0.0  0.0      0     0 ?        Z    18:43   0:00 [nav2_costmap_2d] <defunct>
+ubuntu     60070  0.8  0.0      0     0 ?        Z    18:49   0:05 [nav2_costmap_2d] <defunct>
+ubuntu     63353  7.3  0.0      0     0 ?        Z    18:50   0:44 [nav2_costmap_2d] <defunct>
+ubuntu     76014 24.3  0.0      0     0 ?        Z    18:54   1:29 [nav2_costmap_2d] <defunct>
+```
+
+Only zombie (`<defunct>`) entries remain, which are just unreaped exit
+statuses of already-dead processes, not live processes. `ros2 node list`
+still showed the just-killed nodes immediately after (the same DDS
+discovery propagation delay documented in earlier tasks), resolved after
+waiting:
+
+```
+$ docker exec -u ubuntu MentorPi bash -lc '
+source /opt/ros/humble/setup.bash
+source /home/ubuntu/ros2_ws/install/setup.bash
+sleep 15
+ros2 node list
+'
+/LD19
+/ar_app
+/arm_controller
+/aurora/aurora
+/controller_manager
+/ekf_filter_node
+/gripper_controller
+/hand_gesture
+/hand_trajectory
+/imu_calib
+/imu_filter
+/init_pose
+/joint_state_publisher
+/joy_node
+/joystick_control
+/lidar_app
+/line_following
+/object_tracking
+/odom_publisher
+/robot_state_publisher
+/ros_robot_controller
+/rosapi
+/rosapi_params
+/rosbridge_websocket
+/servo_manager
+/static_transform_publisher_xjZs1QyCV0ckvKkj
+/transform_listener_impl_5555ad8bf7e0
+/web_video_server
+```
+
+No `/poc_fusion*` or `/costmap*` entries remain — the pre-existing vendor
+stack (`/LD19`, `/aurora/aurora`, `/joystick_control`, arm/gripper
+controllers, etc.) is present and unchanged from before this task's
+launch.
+
+Host test suite re-run after the task, immediately before committing:
+
+```
+$ cd /home/pi/Desktop/LanderPi-Proximity-Alert/poc_fusion && python3 -m pytest test/ -q
+.....................................                                    [100%]
+37 passed in 0.31s
+```
+
+37/37, unchanged from before this task — Task 6 is configuration and launch
+wiring only, introducing no new pure logic and therefore no new tests (per
+CONSTRAINTS.md, "Configuration is not exempt from verification, only from
+unit testing").
+
+### Task 6 summary
+
+Wrote the full `nav2_costmap_2d` parameter set into
+`poc_fusion/config/costmap_params.yaml` (`global_frame: odom`,
+`robot_base_frame: base_link`, `rolling_window: true`, 3m×3m at
+`resolution: 0.05`, `update_frequency`/`publish_frequency: 10.0`,
+`transform_tolerance: 0.3`, a single `obstacle_layer` plugin with two
+observation sources — `scan` at `observation_persistence: 0.0` and
+`pointcloud` on `/poc_fusion/points` at `observation_persistence: 0.3` with
+a `min_obstacle_height`/`max_obstacle_height` ground-return filter of
+0.03m/0.94m). `scan_topic` stays the file's original single-source-of-truth
+key; the node's actual scan topic is injected at launch time from that key,
+never hard-coded a second time. Extended `poc_fusion/launch/poc_fusion.launch.py`
+at the Task 6 insertion point Task 5 pre-labelled: a standalone `nav2_costmap_2d`
+`Node` plus a `nav2_lifecycle_manager` `Node` (`autostart: true`,
+`node_names: ['costmap/costmap']`, `bond_timeout: 0.0`). Added
+`python3-yaml` to `package.xml` (needed by the launch file's `yaml.safe_load`
+call).
+
+Two real bugs were found and fixed during verification, both documented
+above with real pasted output: (1) the raw params file cannot be passed
+directly to the node because of the top-level `scan_topic` key — fixed by
+extracting and passing the `costmap.costmap.ros__parameters` sub-tree as an
+in-memory dict instead; (2) `nav2_lifecycle_manager`'s bond liveliness check
+can never succeed against a standalone `nav2_costmap_2d` node because it
+never creates a bond — fixed by setting `bond_timeout: 0.0`, a documented
+parameter for exactly this case, not custom code.
+
+Verified live: node name/namespace (`/costmap/costmap`) matches the
+`costmap_params.yaml` key path — proven, not assumed, by running the bare
+executable first and reading `ros2 node list`. All Step-1/2/3 parameters
+read back correctly via `ros2 param get`, including the launch-time-injected
+`obstacle_layer.scan.topic` resolving to `/scan_raw` with the literal
+appearing nowhere in the launch file's Python source. `ros2 node info`
+confirms both observation sources (`/scan_raw`, `/poc_fusion/points`) are
+subscribed. `ros2 lifecycle get` confirms `active [3]`.
+`/costmap/costmap_updates` publishes at a measured average ~6 Hz (min
+interval 0.1s matches the configured 10 Hz exactly; the average-rate gap is
+measured and flagged forward, not explained). `/costmap/costmap`'s one-time
+transient-local full grid has `resolution: 0.05`, `width: 60`, `height: 60`
+(=3m×3m), `frame_id: odom` — all matching configuration.
+
+Step 5 (RViz hand-wave) is explicitly DEFERRED to a human-present session
+and NOT claimed as verified. The machine-checkable substitute evidence
+above proves the costmap is correctly wired, active, and consuming both
+sources — it does not prove the fusion is doing anything useful yet.
+
+**Dataset-provenance observation (report only, not implemented):** once a
+`LaserScan` mark and a `PointCloud2` mark both land in the same
+`ObstacleLayer` grid cell, they become a single occupancy value — the
+costmap format has no per-cell field for which observation source(s)
+contributed it. Confirmed by inspecting the actual message content above:
+`/costmap/costmap` (`nav_msgs/OccupancyGrid`) and `/costmap/costmap_updates`
+(`map_msgs/OccupancyGridUpdate`) carry only cost values, no source
+attribution. This means the costmap itself, once built, is NOT a place the
+"which sensor triggered this" dataset gap (flagged at the coordinator level)
+can be recovered from downstream — the two sources are irreversibly merged
+at this layer. If provenance is wanted, it has to be captured UPSTREAM of
+the costmap, e.g. a small additive `poc_fusion` node/topic that logs,
+per-detection, whether the triggering costmap cells were touched by the
+`scan` or `pointcloud` observation buffer (or both) before they are marked
+into the shared grid — noted as a recommendation only, not built here, and
+explicitly not a fix to `proximity_alert/`'s frozen CSV schema.
