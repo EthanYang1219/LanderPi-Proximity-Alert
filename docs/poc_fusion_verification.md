@@ -719,3 +719,450 @@ not created (Task 3's TDD RED step). `rosdep check`, the deploy round-trip
 passed. No HARD SAFETY RULE was touched — no `cmd_vel` publish, no arm command,
 no `.stop_ros.sh`, no edits to `proximity_alert/` or hand-written files under
 `/home/ubuntu/ros2_ws/src/`.
+
+---
+
+## Task 4 — Depth preprocessing node
+
+Captured 2026-08-07, **22:24 HKT / 14:24 UTC** (host `date` / `date -u` re-run just
+before this section, per the timezone note above):
+```
+$ date
+Fri Aug  7 10:24:49 PM HKT 2026
+$ date -u
+Fri Aug  7 02:24:49 PM UTC 2026
+```
+
+### Host test suite — before
+
+```
+$ cd /home/pi/Desktop/LanderPi-Proximity-Alert/poc_fusion && python3 -m pytest test/ -q
+...................                                                      [100%]
+19 passed in 0.22s
+```
+
+### TDD: `poc_fusion/poc_fusion/lib/depth_preprocess.py`
+
+RED (module does not exist yet; `test/test_depth_preprocess.py` written first,
+covering `invalid_pixel_mask`, `invalid_fraction`, `apply_roi_mask`,
+`median_filter_depth`):
+
+```
+$ cd /home/pi/Desktop/LanderPi-Proximity-Alert/poc_fusion && python3 -m pytest test/test_depth_preprocess.py -q
+==================================== ERRORS ====================================
+________________ ERROR collecting test/test_depth_preprocess.py ________________
+ImportError while importing test module '/home/pi/Desktop/LanderPi-Proximity-Alert/poc_fusion/test/test_depth_preprocess.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+/usr/lib/python3.11/importlib/__init__.py:126: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+test/test_depth_preprocess.py:3: in <module>
+    from poc_fusion.lib.depth_preprocess import (
+E   ModuleNotFoundError: No module named 'poc_fusion.lib.depth_preprocess'
+=========================== short test summary info ============================
+ERROR test/test_depth_preprocess.py
+!!!!!!!!!!!!!!!!!!!! Interrupted: 1 error during collection !!!!!!!!!!!!!!!!!!!!
+1 error in 0.18s
+```
+
+This is a collection-level failure covering every function in the module at
+once (the whole file fails to import), which is the correct RED signal for a
+module that does not exist yet — there is no way to fail per-function before
+the module exists to import.
+
+GREEN, after writing `poc_fusion/poc_fusion/lib/depth_preprocess.py`
+(`invalid_pixel_mask`, `invalid_fraction`, `apply_roi_mask`,
+`median_filter_depth`):
+
+```
+$ cd /home/pi/Desktop/LanderPi-Proximity-Alert/poc_fusion && python3 -m pytest test/ -q
+...............................                                          [100%]
+31 passed in 0.25s
+```
+
+12 new tests (19 pre-existing + 12 = 31), covering:
+- `invalid_pixel_mask`: exact-zero flagging, all-valid case.
+- `invalid_fraction`: all-zero (1.0), all-valid (0.0), partial (0.25).
+- `apply_roi_mask`: zeros the box, leaves pixels outside untouched, does not
+  mutate the input array, and a zero-width box (the actual Task 4 config
+  placeholder) masks nothing — pinning the "start permissive" decision.
+- `median_filter_depth`: removes a single-pixel spike, preserves dtype
+  (`uint16`), preserves shape.
+
+One test was renamed mid-implementation
+(`test_apply_roi_mask_full_frame_box_is_permissive_placeholder` →
+`test_apply_roi_mask_zero_width_box_masks_nothing`) because the original name
+described the wrong placeholder shape (a full-frame box masks *everything*,
+which is the opposite of permissive); the config actually ships a zero-width
+box. Re-ran the full suite after the rename — still 31/31 green.
+
+### Node implementation
+
+`poc_fusion/poc_fusion/depth_preprocess_node.py` — ROS plumbing only, per the
+Task 4 brief's design decisions:
+- Subscribes to `depth_image_topic` (param, default
+  `/ascamera/camera_publisher/depth0/image_raw`), `cv_bridge`s to numpy with
+  `passthrough` (so no implicit encoding conversion happens before our own
+  check runs).
+- Step 1a: asserts `msg.encoding == expected_encoding` (`mono16`) on the
+  first message received; `RuntimeError` + `get_logger().fatal(...)` if not.
+  The check is on the first *message*, not literally at process startup,
+  because the encoding is only known once a message arrives — there is no
+  earlier point at which it could be verified.
+- Republishes cleaned depth on `/poc_fusion/depth_cleaned` with
+  `encoding='16UC1'` (Step 1a re-encode) and `out_msg.header = msg.header`
+  (verbatim passthrough of stamp + `frame_id`).
+- Step 2: `invalid_fraction()` logged every 5s (`throttle_duration_sec=5.0`).
+- Step 3: `apply_roi_mask()` using the `roi_profile`-selected bounds from
+  `config/depth_preprocess_params.yaml`.
+- Step 4: `median_filter_depth()`, kernel size from the `median_kernel_size`
+  parameter.
+- Step 5: `/poc_fusion/debug_image` (`bgr8`), an 8-bit normalized view with a
+  red rectangle drawn over the active ROI box (skipped when the box is
+  zero-width, i.e. the current placeholder).
+
+`poc_fusion/config/depth_preprocess_params.yaml` — new file, holds topic
+names, `expected_encoding: mono16`, `median_kernel_size: 3`, and
+`roi_profiles.default` with all four bounds at 0 (zero-width → masks
+nothing). Comments record that Task 11 replaces the bounds and Task 10a adds
+a second named profile later (not built now — YAGNI). `costmap_params.yaml`
+was not touched.
+
+### Deploy + build (as `ubuntu`, never root)
+
+```
+$ bash scripts/deploy_poc_fusion.sh
+Deploying /home/pi/Desktop/LanderPi-Proximity-Alert/poc_fusion -> MentorPi:/home/ubuntu/ros2_ws/src/poc_fusion
+No stale destination files to remove.
+Deploy complete.
+```
+
+```
+$ docker exec -u ubuntu MentorPi bash -lc '
+    source /opt/ros/humble/setup.bash
+    cd /home/ubuntu/ros2_ws
+    colcon build --packages-select poc_fusion
+  '
+Starting >>> poc_fusion
+--- stderr: poc_fusion
+/home/ubuntu/.local/lib/python3.10/site-packages/setuptools/_distutils/cmd.py:66: SetuptoolsDeprecationWarning: setup.py install is deprecated.
+[... same benign setup.py warning as Task 2 ...]
+---
+Finished <<< poc_fusion [3.72s]
+
+Summary: 1 package finished [5.74s]
+  1 package had stderr output: poc_fusion
+```
+
+### Source topic sanity check (pre-existing driver, not our node)
+
+```
+$ docker exec -u ubuntu MentorPi bash -lc '
+    source /opt/ros/humble/setup.bash
+    source /home/ubuntu/ros2_ws/install/setup.bash
+    timeout 3 ros2 topic hz /ascamera/camera_publisher/depth0/image_raw
+  '
+WARNING: topic [/ascamera/camera_publisher/depth0/image_raw] does not appear to be published yet
+average rate: 14.806
+	min: 0.054s max: 0.077s std dev: 0.00535s window: 16
+```
+
+### Step 6: run the node, verify rate and topic list
+
+```
+$ docker exec -u ubuntu MentorPi bash -lc '
+    source /opt/ros/humble/setup.bash
+    source /home/ubuntu/ros2_ws/install/setup.bash
+    nohup ros2 run poc_fusion depth_preprocess_node --ros-args --params-file /home/ubuntu/ros2_ws/install/poc_fusion/share/poc_fusion/config/depth_preprocess_params.yaml > /tmp/depth_preprocess_node.log 2>&1 &
+    disown
+    sleep 3
+    cat /tmp/depth_preprocess_node.log
+  '
+[INFO] [1786112528.279438216] [depth_preprocess_node]: depth_preprocess_node started: /ascamera/camera_publisher/depth0/image_raw -> /poc_fusion/depth_cleaned (expected encoding=mono16, roi_profile=default, median_kernel_size=3)
+[INFO] [1786112529.873685361] [depth_preprocess_node]: invalid pixel fraction: 0.294
+```
+
+```
+$ docker exec -u ubuntu MentorPi bash -lc '
+    source /opt/ros/humble/setup.bash
+    source /home/ubuntu/ros2_ws/install/setup.bash
+    ros2 node list
+  '
+/LD19
+/ar_app
+/arm_controller
+/aurora/aurora
+/controller_manager
+/depth_preprocess_node
+/ekf_filter_node
+/gripper_controller
+/hand_gesture
+/hand_trajectory
+/imu_calib
+/imu_filter
+/init_pose
+/joint_state_publisher
+/joy_node
+/joystick_control
+/lidar_app
+/line_following
+/object_tracking
+/odom_publisher
+/robot_state_publisher
+/ros_robot_controller
+/rosapi
+/rosapi_params
+/rosbridge_websocket
+/servo_manager
+/static_transform_publisher_zk7CPAMfFWiFWQsu
+/transform_listener_impl_55561e029580
+/web_video_server
+```
+
+`/depth_preprocess_node` is running alongside the full pre-existing stack
+(camera driver `/aurora/aurora`, `/LD19`, arm/gripper controllers, etc.) — no
+other node was touched or restarted.
+
+```
+$ docker exec -u ubuntu MentorPi bash -lc '
+    source /opt/ros/humble/setup.bash
+    source /home/ubuntu/ros2_ws/install/setup.bash
+    timeout 10 ros2 topic hz /poc_fusion/depth_cleaned
+  '
+WARNING: topic [/poc_fusion/depth_cleaned] does not appear to be published yet
+average rate: 14.743
+	min: 0.058s max: 0.081s std dev: 0.00568s window: 16
+average rate: 14.752
+	min: 0.058s max: 0.081s std dev: 0.00467s window: 31
+average rate: 14.728
+	min: 0.058s max: 0.081s std dev: 0.00444s window: 46
+average rate: 14.691
+	min: 0.058s max: 0.083s std dev: 0.00524s window: 61
+average rate: 14.654
+	min: 0.058s max: 0.090s std dev: 0.00607s window: 76
+average rate: 14.696
+	min: 0.052s max: 0.090s std dev: 0.00625s window: 91
+```
+
+~14.7 Hz sustained over 10s, matching the source topic's rate (the
+`WARNING` line is `ros2 topic hz`'s own startup boilerplate before its first
+window closes, not a fault).
+
+### Step 1a: encoding relabel, verified live
+
+```
+$ docker exec -u ubuntu MentorPi bash -lc '
+    source /opt/ros/humble/setup.bash
+    source /home/ubuntu/ros2_ws/install/setup.bash
+    timeout 3 ros2 topic echo /poc_fusion/depth_cleaned --no-arr
+  '
+header:
+  stamp:
+    sec: 1786112568
+    nanosec: 356000000
+  frame_id: depth_camera_link
+height: 400
+width: 640
+encoding: 16UC1
+is_bigendian: 0
+step: 1280
+data: '<sequence type: uint8, length: 512000>'
+---
+[... 7 more identical-shape messages, all encoding: 16UC1, elided ...]
+```
+
+`encoding: 16UC1` confirmed on the live outgoing topic (source is `mono16`,
+verified separately below). `frame_id: depth_camera_link` preserved, matching
+the brief's requirement.
+
+### Step 1 / Step 6: header stamp passthrough, verified exactly (not just eyeballed)
+
+Rather than compare two single-shot `ros2 topic echo --once` calls (too
+loosely correlated in time to prove anything), a small in-container script
+subscribed to both topics simultaneously for 3s and diffed the collected
+`(sec, nanosec)` stamp tuples:
+
+```
+$ docker exec -u ubuntu MentorPi bash -lc '
+    source /opt/ros/humble/setup.bash
+    source /home/ubuntu/ros2_ws/install/setup.bash
+    python3 /tmp/stamp_check.py
+  '
+SRC: [(1786112618, 621000000), (1786112618, 716000000), (1786112618, 849000000), (1786112618, 912000000), (1786112618, 982000000)]
+CLEAN: [(1786112618, 621000000), (1786112618, 716000000), (1786112618, 849000000), (1786112618, 912000000), (1786112618, 982000000)]
+MATCHING STAMP COUNT: 44
+SRC COUNT: 44 CLEAN COUNT: 44
+```
+
+All 44 stamps collected on the source topic during the 3s window appear
+exactly (44/44) in the cleaned topic's stamps — the header stamp survives
+this node byte-for-byte, confirming the Step 1 requirement Task 12's latency
+measurement depends on.
+
+Separately, a single-shot echo of each topic (different real times, not
+correlated to each other) confirms `frame_id` matches independently of the
+stamp-matching script:
+
+```
+$ docker exec -u ubuntu MentorPi bash -lc '
+    source /opt/ros/humble/setup.bash
+    source /home/ubuntu/ros2_ws/install/setup.bash
+    ros2 topic echo /ascamera/camera_publisher/depth0/image_raw --no-arr --once
+  '
+header:
+  stamp:
+    sec: 1786112586
+    nanosec: 977000000
+  frame_id: depth_camera_link
+height: 400
+width: 640
+encoding: mono16
+is_bigendian: 0
+step: 1280
+data: '<sequence type: uint8, length: 512000>'
+---
+```
+
+### Step 1a: units sanity check (machine-checkable half only — see note below)
+
+A second in-container script subscribed to `/poc_fusion/depth_cleaned`, read
+one frame via `cv_bridge`, and reported the raw pixel-value distribution:
+
+```
+$ docker exec -u ubuntu MentorPi bash -lc '
+    source /opt/ros/humble/setup.bash
+    source /home/ubuntu/ros2_ws/install/setup.bash
+    python3 /tmp/units_check.py
+  '
+dtype: uint16 shape: (400, 640)
+min/max valid: 223 1984
+mean valid: 349.0038670528203
+percentiles 5/50/95: [233. 301. 649.]
+center row sample (every 40th px): [  0   0 302 303 303 304 304 305 304 305 304 306 306 306 306 306]
+```
+
+Reasoning: valid (nonzero) pixels range 223–1984 with a median of 301 and a
+95th percentile of 649. If these were metres, floor returns 0.25 m from a
+camera mounted 0.246 m above the floor at ~40° below horizontal would be
+physically impossible (the camera itself is only 0.246 m up); read as
+millimetres, 223–649 mm for near/floor-ish returns and up to ~1984 mm for
+the furthest visible surfaces is exactly the "hundreds-to-low-thousands mm"
+band predicted from that camera pose, and the median (301 mm) sits inside
+the predicted 300–1000 mm floor-return band. This confirms the buffer is in
+millimetres without requiring anyone to place an object at a tape-measured
+distance.
+
+**Deferred to the human-present phase:** the brief's stronger confirmation —
+holding an object at a tape-measured distance and reading the exact raw
+pixel value against it — requires a second person and is explicitly out of
+scope for this (unattended) run. Not done here; flagging it for the next
+human-present session, most naturally alongside Task 11's ROI measurement.
+
+### Step 5: debug image also publishes
+
+```
+$ docker exec -u ubuntu MentorPi bash -lc '
+    source /opt/ros/humble/setup.bash
+    source /home/ubuntu/ros2_ws/install/setup.bash
+    ros2 topic list | grep poc_fusion
+    ros2 topic info /poc_fusion/debug_image
+  '
+/poc_fusion/debug_image
+/poc_fusion/depth_cleaned
+Type: sensor_msgs/msg/Image
+Publisher count: 1
+Subscription count: 0
+```
+
+```
+$ docker exec -u ubuntu MentorPi bash -lc '
+    source /opt/ros/humble/setup.bash
+    source /home/ubuntu/ros2_ws/install/setup.bash
+    timeout 5 ros2 topic hz /poc_fusion/debug_image
+  '
+average rate: 12.382
+	min: 0.030s max: 0.194s std dev: 0.04375s window: 14
+average rate: 11.163
+	min: 0.030s max: 0.203s std dev: 0.05017s window: 24
+average rate: 11.418
+	min: 0.030s max: 0.220s std dev: 0.04912s window: 36
+```
+
+Publishes at ~11–12 Hz (slower than `depth_cleaned` due to the extra
+`cv2.normalize`/color-convert/rectangle-draw work). The brief does not set a
+rate requirement for the debug topic (only Step 6's `depth_cleaned` rate is
+gated), so this is recorded as-is, not treated as a defect.
+
+### Node log during the run (invalid-fraction throttled logging, Step 2)
+
+```
+$ docker exec -u ubuntu MentorPi bash -lc 'tail -20 /tmp/depth_preprocess_node.log'
+[INFO] [1786112575.252600348] [depth_preprocess_node]: invalid pixel fraction: 0.297
+[INFO] [1786112580.266635436] [depth_preprocess_node]: invalid pixel fraction: 0.297
+[INFO] [1786112585.296534812] [depth_preprocess_node]: invalid pixel fraction: 0.292
+[INFO] [1786112590.322456129] [depth_preprocess_node]: invalid pixel fraction: 0.294
+[INFO] [1786112595.336818666] [depth_preprocess_node]: invalid pixel fraction: 0.294
+[INFO] [1786112600.379359407] [depth_preprocess_node]: invalid pixel fraction: 0.295
+[INFO] [1786112605.407483743] [depth_preprocess_node]: invalid pixel fraction: 0.292
+[INFO] [1786112610.435641107] [depth_preprocess_node]: invalid pixel fraction: 0.294
+[INFO] [1786112615.466283047] [depth_preprocess_node]: invalid pixel fraction: 0.293
+[INFO] [1786112620.495350815] [depth_preprocess_node]: invalid pixel fraction: 0.292
+[INFO] [1786112625.538693597] [depth_preprocess_node]: invalid pixel fraction: 0.294
+[INFO] [1786112630.581447000] [depth_preprocess_node]: invalid pixel fraction: 0.291
+[INFO] [1786112635.583790799] [depth_preprocess_node]: invalid pixel fraction: 0.295
+[INFO] [1786112640.623128654] [depth_preprocess_node]: invalid pixel fraction: 0.297
+[INFO] [1786112645.631706107] [depth_preprocess_node]: invalid pixel fraction: 0.295
+[INFO] [1786112650.668577488] [depth_preprocess_node]: invalid pixel fraction: 0.293
+[INFO] [1786112655.701561220] [depth_preprocess_node]: invalid pixel fraction: 0.296
+[INFO] [1786112660.727152257] [depth_preprocess_node]: invalid pixel fraction: 0.293
+[INFO] [1786112665.757473868] [depth_preprocess_node]: invalid pixel fraction: 0.292
+[INFO] [1786112670.817617386] [depth_preprocess_node]: invalid pixel fraction: 0.292
+```
+
+Stable at ~0.29–0.30 throughout the run; no jumps, no error/warn lines.
+
+### Teardown
+
+Node stopped by killing its own two PIDs (the `ros2 run` wrapper and its
+child) — not `.stop_ros.sh` — and confirmed absent from the ROS graph
+afterward:
+
+```
+$ docker exec -u ubuntu MentorPi bash -lc 'kill 117773 117775 2>/dev/null; sleep 1'
+$ docker exec -u ubuntu MentorPi bash -lc '
+    source /opt/ros/humble/setup.bash
+    source /home/ubuntu/ros2_ws/install/setup.bash
+    ros2 node list | grep depth_preprocess || echo "node not in graph - confirmed stopped"
+  '
+node not in graph - confirmed stopped
+```
+
+No other running node (`/aurora/aurora`, `/LD19`, arm/gripper controllers,
+etc.) was touched. No `cmd_vel` published, no arm command sent, `.stop_ros.sh`
+never invoked.
+
+### Host test suite — after (final)
+
+```
+$ cd /home/pi/Desktop/LanderPi-Proximity-Alert/poc_fusion && python3 -m pytest test/ -q
+...............................                                          [100%]
+31 passed in 0.34s
+```
+
+### Task 4 summary
+
+Implemented `poc_fusion/poc_fusion/lib/depth_preprocess.py` (TDD, RED then
+GREEN, 12 new tests, 31/31 total) and
+`poc_fusion/poc_fusion/depth_preprocess_node.py` (real implementation
+replacing the Task 2 stub), plus the new
+`poc_fusion/config/depth_preprocess_params.yaml`. Deployed via
+`scripts/deploy_poc_fusion.sh`, built as `ubuntu` (never root), and verified
+live: `/poc_fusion/depth_cleaned` publishes at ~14.7 Hz with `encoding:
+16UC1`, `frame_id: depth_camera_link`, and header stamps that match the
+source topic's exactly (44/44 in a 3s window). The units sanity check
+(pixel values 223–1984, median 301, consistent with a 0.246 m/40°-below-
+horizontal camera pose) is recorded; the tape-measured confirmation is
+explicitly deferred to a human-present session. `costmap_params.yaml` was
+not touched. No HARD SAFETY RULE was violated — no `cmd_vel`, no arm
+command, `.stop_ros.sh` never run, no edits to `proximity_alert/` or to
+files under `/home/ubuntu/ros2_ws/src/` outside the deploy script's target.
