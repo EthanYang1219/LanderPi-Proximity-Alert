@@ -2217,10 +2217,11 @@ Final readings: `depth_cleaned` 14.709 Hz, `depth_rect` 14.819 Hz,
 ```
 $ docker exec -u ubuntu MentorPi bash -lc \
   'grep -n "do not appear to be synchronized" /tmp/poc_fusion_baseline2.log; grep -c "do not appear to be synchronized" /tmp/poc_fusion_baseline2.log'
-count:
 0
 ```
-(No synchronizer-warning lines at all in this run's log — 0 occurrences,
+(`grep -n` printed nothing — no matching lines — so the only output is
+`grep -c`'s count of `0`. No synchronizer-warning lines at all in this
+run's log — 0 occurrences,
 different from the 1 occurrence recorded in the original, now-superseded
 measurement. Both are consistent with "no sustained sync-drop"; the exact
 count is noisy run to run because it depends on exact startup timing.)
@@ -2311,14 +2312,14 @@ Final readings: `depth_cleaned` 14.189 Hz, `depth_rect` 13.850 Hz,
 `points` 3.302 Hz.
 ```
 $ docker exec -u ubuntu MentorPi bash -lc \
-  'grep -n "do not appear to be synchronized" /tmp/poc_fusion_mt2.log; grep -c "..." /tmp/poc_fusion_mt2.log'
+  'grep -n "do not appear to be synchronized" /tmp/poc_fusion_mt2.log; grep -c "do not appear to be synchronized" /tmp/poc_fusion_mt2.log'
 16:[component_container_mt-2] [WARN] [1786121571.459595375] [poc_fusion.depth_rectify_node]: [image_transport] Topics '/poc_fusion/depth_cleaned' and '/poc_fusion/camera_info' do not appear to be synchronized. In the last 10s:
 20:[component_container_mt-2] [WARN] [1786121571.529645662] [poc_fusion.point_cloud_xyz_node]: [image_transport] Topics '/poc_fusion/depth_rect' and '/poc_fusion/camera_info' do not appear to be synchronized. In the last 10s:
 25:[component_container_mt-2] [WARN] [1786121572.459800013] [poc_fusion.depth_rectify_node]: [image_transport] Topics '/poc_fusion/depth_cleaned' and '/poc_fusion/camera_info' do not appear to be synchronized. In the last 10s:
 29:[component_container_mt-2] [WARN] [1786121572.529635317] [poc_fusion.point_cloud_xyz_node]: [image_transport] Topics '/poc_fusion/depth_rect' and '/poc_fusion/camera_info' do not appear to be synchronized. In the last 10s:
 33:[component_container_mt-2] [WARN] [1786121573.459667576] [poc_fusion.depth_rectify_node]: [image_transport] Topics '/poc_fusion/depth_cleaned' and '/poc_fusion/camera_info' do not appear to be synchronized. In the last 10s:
-37:[component_container_mt-2] [WARN] [1786121573.529427736] [poc_fusion.point_cloud_xyz_node]: [image_transport] Topics '/poc_fusion/depth_rect' and '/poc_fusion/camera_info' do not appear to be synchronized. In the last 10s:
-count: 6
+37:[component_container_mt-2] [WARN] [1786121573.530427736] [poc_fusion.point_cloud_xyz_node]: [image_transport] Topics '/poc_fusion/depth_rect' and '/poc_fusion/camera_info' do not appear to be synchronized. In the last 10s:
+6
 ```
 6 occurrences (3 pairs, one per node, ~1s apart), all timestamped
 1786121571–1786121573. The log's last line (`invalid pixel fraction`
