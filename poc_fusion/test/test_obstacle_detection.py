@@ -84,14 +84,21 @@ def test_should_stop_triggers_on_diagonal_cluster_area_alone():
     # occupancy fraction stays tiny (5/400 = 1.25%, well under 0.30) so this
     # can only trigger via the cluster-area condition, and only because the
     # 5 diagonal cells are counted as one 8-connected cluster.
+    #
+    # resolution=0.1 -> one cell = 100 cm^2. min_cluster_area_cm2=250 -> the
+    # threshold is 2.5 cells: a single isolated lethal cell (100 cm^2, what
+    # a buggy 4-connectivity implementation would see as the largest
+    # fragment of this diagonal chain) does NOT meet it, but the 5-cell
+    # 8-connected cluster (500 cm^2) does. This is what makes the test
+    # actually discriminate the connectivity choice, not just pass under
+    # either connectivity because a single cell already clears the bar.
     grid = np.zeros((20, 20), dtype=np.int16)
     mask = np.ones((20, 20), dtype=bool)  # 400 cells
     for i in range(5):
         grid[i, i] = LETHAL
-    # resolution=0.1 -> cell area = 100 cm^2; 5-cell cluster = 500 cm^2 >= 100
     assert should_stop(grid, mask, resolution=0.1, lethal_threshold=LETHAL,
                         min_occupancy_fraction=0.30,
-                        min_cluster_area_cm2=100) is True
+                        min_cluster_area_cm2=250) is True
 
 
 def test_should_stop_subthreshold_speckle_is_false():
