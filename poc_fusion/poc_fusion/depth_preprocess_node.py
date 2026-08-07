@@ -27,8 +27,9 @@ import numpy as np
 import rclpy
 from cv_bridge import CvBridge
 from rclpy.node import Node
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import CameraInfo, Image
 
+from poc_fusion.lib.camera_info_watchdog import should_warn
 from poc_fusion.lib.depth_preprocess import (
     clean_depth,
     invalid_fraction,
@@ -36,6 +37,8 @@ from poc_fusion.lib.depth_preprocess import (
 
 EXPECTED_ENCODING = 'mono16'
 OUTGOING_ENCODING = '16UC1'
+CAMERA_INFO_TOPIC = '/ascamera/camera_publisher/depth0/camera_info'
+CAMERA_INFO_WARN_TIMEOUT_SEC = 5.0
 
 
 class DepthPreprocessNode(Node):
@@ -78,6 +81,19 @@ class DepthPreprocessNode(Node):
         self._cleaned_pub = self.create_publisher(Image, depth_cleaned_topic, 10)
         self._debug_pub = self.create_publisher(Image, debug_image_topic, 10)
         self.create_subscription(Image, depth_image_topic, self._on_depth, 10)
+
+        # Step 4 (Task 5): camera_info watchdog. point_cloud_xyz's failure
+        # mode when camera_info never arrives is silent -- no points, no
+        # error, costmap quietly runs LiDAR-only -- so this is the only
+        # place left to surface it. One-shot timer, cancelled the moment a
+        # camera_info message arrives; see lib/camera_info_watchdog.py for
+        # the pure decision this delegates to.
+        self._camera_info_received = False
+        self._camera_info_start_time = self.get_clock().now()
+        self.create_subscription(
+            CameraInfo, CAMERA_INFO_TOPIC, self._on_camera_info, 10)
+        self._camera_info_watchdog_timer = self.create_timer(
+            CAMERA_INFO_WARN_TIMEOUT_SEC, self._check_camera_info_watchdog)
 
         self.get_logger().info(
             f'depth_preprocess_node started: {depth_image_topic} -> '
@@ -133,6 +149,37 @@ class DepthPreprocessNode(Node):
         self._cleaned_pub.publish(out_msg)
 
         self._publish_debug_image(cleaned, msg.header)
+
+    def _on_camera_info(self, msg):
+        self._camera_info_received = True
+        # No further work needed here beyond flagging arrival; the timer
+        # callback checks this flag and cancels itself once it observes
+        # `received=True` (belt-and-braces even though the flag alone
+        # already makes should_warn() return False from then on).
+        if self._camera_info_watchdog_timer is not None:
+            self._camera_info_watchdog_timer.cancel()
+            self._camera_info_watchdog_timer = None
+
+    def _check_camera_info_watchdog(self):
+        elapsed_sec = (
+            (self.get_clock().now() - self._camera_info_start_time).nanoseconds
+            / 1e9
+        )
+        if should_warn(
+            received=self._camera_info_received,
+            elapsed_sec=elapsed_sec,
+            timeout_sec=CAMERA_INFO_WARN_TIMEOUT_SEC,
+        ):
+            self.get_logger().warn(
+                f'No message received on {CAMERA_INFO_TOPIC} within '
+                f'{CAMERA_INFO_WARN_TIMEOUT_SEC:.0f}s of startup. '
+                f'depth_image_proc::PointCloudXyzNode requires camera_info '
+                f'to produce points -- without it, the fused costmap will '
+                f'silently run LiDAR-only with no other error.'
+            )
+        if self._camera_info_watchdog_timer is not None:
+            self._camera_info_watchdog_timer.cancel()
+            self._camera_info_watchdog_timer = None
 
     def _publish_debug_image(self, cleaned, header):
         """Step 5: 8-bit visualisation with the masked ROI box drawn on it."""

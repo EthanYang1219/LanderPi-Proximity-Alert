@@ -1447,3 +1447,695 @@ processes, not a real defect in the node — corrected the report's earlier
 unsupported causal claim accordingly. Redeployed and rebuilt as `ubuntu`,
 re-verified `encoding: 16UC1` and header passthrough still hold after the
 pipeline reorder. No HARD SAFETY RULE was violated.
+
+---
+
+## Task 5: Point cloud generation
+
+Captured **2026-08-08, 00:17 HKT / 2026-08-07 16:17 UTC**:
+```
+$ date
+Sat Aug  8 12:17:30 AM HKT 2026
+$ date -u
+Fri Aug  7 04:17:30 PM UTC 2026
+```
+
+### Step 0 — Dependency preflight (re-confirmation)
+
+```
+$ docker exec -u ubuntu MentorPi bash -lc '
+    source /opt/ros/humble/setup.bash
+    source /home/ubuntu/ros2_ws/install/setup.bash
+    ros2 pkg prefix depth_image_proc
+    ros2 pkg prefix image_proc
+  '
+/opt/ros/humble
+/opt/ros/humble
+```
+Both present, unchanged from Task 0's install. Also confirmed the specific
+composable-node classes and executables this task needs exist:
+```
+$ ros2 component types | grep -A11 '^image_proc$'
+image_proc
+  image_proc::RectifyNode
+  image_proc::DebayerNode
+  image_proc::ResizeNode
+  image_proc::CropDecimateNode
+  image_proc::CropNonZeroNode
+
+$ ros2 component types | grep -A10 '^depth_image_proc$'
+depth_image_proc
+  depth_image_proc::ConvertMetricNode
+  depth_image_proc::CropForemostNode
+  depth_image_proc::DisparityNode
+  depth_image_proc::PointCloudXyzNode
+  ...
+```
+`image_proc::RectifyNode` and `depth_image_proc::PointCloudXyzNode` both
+present — no BLOCKED condition.
+
+### Host test suite — before
+
+```
+$ cd /home/pi/Desktop/LanderPi-Proximity-Alert/poc_fusion && python3 -m pytest test/ -q
+.....................................                                    [100%]
+37 passed in 1.81s
+```
+(37 = 33 carried over from the Task 4 fix round + the 4 new
+`camera_info_watchdog` tests written for this task, below, before this
+"before" run — the RED/GREEN cycle for those tests is shown in the next
+section and was run prior to this snapshot; it is quoted separately because
+`pytest` at this snapshot already includes them.)
+
+### TDD: `poc_fusion/poc_fusion/lib/camera_info_watchdog.py`
+
+Step 4 of the brief says to log a visible warning if
+`/ascamera/camera_publisher/depth0/camera_info` is not received within 5s of
+startup, since `depth_image_proc::PointCloudXyzNode` (a vendor C++ node,
+off-limits under the additive-only constraint) fails silently (no points,
+no error) without it. The only piece of this that is pure, testable logic
+is the decision "given whether camera_info has been received and how much
+time has elapsed, should the node warn right now" — extracted into
+`should_warn(received, elapsed_sec, timeout_sec)`.
+
+RED (module does not exist yet):
+```
+$ cd /home/pi/Desktop/LanderPi-Proximity-Alert/poc_fusion && python3 -m pytest test/test_camera_info_watchdog.py -q
+==================================== ERRORS ====================================
+______________ ERROR collecting test/test_camera_info_watchdog.py ______________
+ImportError while importing test module '/home/pi/Desktop/LanderPi-Proximity-Alert/poc_fusion/test/test_camera_info_watchdog.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+/usr/lib/python3.11/importlib/__init__.py:126: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+test/test_camera_info_watchdog.py:1: in <module>
+    from poc_fusion.lib.camera_info_watchdog import should_warn
+E   ModuleNotFoundError: No module named 'poc_fusion.lib.camera_info_watchdog'
+=========================== short test summary info ============================
+ERROR test/test_camera_info_watchdog.py
+!!!!!!!!!!!!!!!!!!!! Interrupted: 1 error during collection !!!!!!!!!!!!!!!!!!!!
+1 error in 0.07s
+```
+
+GREEN, after writing `poc_fusion/poc_fusion/lib/camera_info_watchdog.py`:
+```
+$ cd /home/pi/Desktop/LanderPi-Proximity-Alert/poc_fusion && python3 -m pytest test/ -q
+.....................................                                    [100%]
+37 passed in 0.29s
+```
+4 new tests (33 + 4 = 37): not-received-past-timeout warns; received
+before timeout does not warn; not-received-but-before-timeout does not warn
+(guards against a misconfigured early-firing timer); received-even-past-
+timeout does not warn (pins the "lateness is moot once received" case for a
+callback that races against arrival on the same tick). Each test targets a
+distinct branch/boundary in `should_warn()` and would fail if that branch's
+logic were wrong or reversed — e.g. flipping the `received` short-circuit
+would fail `test_does_not_warn_when_received_even_past_timeout`, and an
+off-by-one on the `>=` comparison would fail
+`test_does_not_warn_before_timeout_elapses`.
+
+### Node wiring: `depth_preprocess_node.py`
+
+Added (ROS plumbing only, delegating the decision to `should_warn()`):
+- A `CameraInfo` subscription to
+  `/ascamera/camera_publisher/depth0/camera_info` (module constant
+  `CAMERA_INFO_TOPIC`, not a declared parameter — this topic name is fixed
+  by the driver, unlike `depth_image_topic` which is a legitimate
+  operator-facing knob) that sets `self._camera_info_received = True` and
+  cancels the watchdog timer.
+- A one-shot-in-effect `create_timer(5.0, ...)` that calls
+  `should_warn(received, elapsed_sec, timeout_sec=5.0)`; if it returns
+  `True`, logs `get_logger().warn(...)`. The timer cancels *itself* on its
+  first firing (rclpy's `create_timer` is periodic by default; humble does
+  not expose a native one-shot flag on the Python API used here), so the
+  check runs exactly once regardless of whether camera_info showed up.
+
+No approximate-intrinsics fallback was added, per the brief's explicit
+instruction — the watchdog only logs; it never substitutes a value.
+
+### Launch file: `poc_fusion/launch/poc_fusion.launch.py` (new)
+
+Structure, matching the brief's Decision 1:
+- `depth_preprocess_node` (Task 4, plain `Node` action — not composable;
+  rclpy's composable-node support doesn't justify force-fitting an already-
+  shipped standalone node into the container).
+- `poc_fusion_container` (`rclcpp_components::component_container`,
+  namespace `/poc_fusion`) holding two composable nodes:
+  - `image_proc::RectifyNode` (name `depth_rectify_node`), `interpolation: 0`
+    parameter override (Step 2 — nearest-neighbour), remapped
+    `image ← /poc_fusion/depth_cleaned`,
+    `camera_info ← /ascamera/camera_publisher/depth0/camera_info`,
+    `image_rect → /poc_fusion/depth_rect`.
+  - `depth_image_proc::PointCloudXyzNode` (name `point_cloud_xyz_node`),
+    remapped `image_rect ← /poc_fusion/depth_rect`,
+    `camera_info ← /ascamera/camera_publisher/depth0/camera_info`,
+    `points → /poc_fusion/points`.
+- Comments mark exactly where Task 6's costmap composable node(s) and Task
+  8's lifecycle-manager wiring belong, so those additions are additive to
+  this same file rather than requiring a restructure. Neither was built
+  here.
+
+`package.xml` gained `launch`, `launch_ros`, `rclcpp_components`, and
+`ament_index_python` exec_depends (needed by the launch file itself; not
+previously declared since no launch file existed before this task).
+`poc_fusion/config/costmap_params.yaml` was not touched — confirmed by
+inspection, it still holds only `scan_topic: /scan_raw`.
+
+### Deploy + build (as `ubuntu`, never root)
+
+```
+$ bash scripts/deploy_poc_fusion.sh
+Deploying /home/pi/Desktop/LanderPi-Proximity-Alert/poc_fusion -> MentorPi:/home/ubuntu/ros2_ws/src/poc_fusion
+Removing stale destination files (absent from host source):
+  launch/.gitkeep
+Deploy complete.
+```
+(`launch/.gitkeep` removed from the host tree once a real launch file
+existed to keep the directory non-empty in git; the deploy script correctly
+pruned the now-stale copy from the container destination.)
+
+```
+$ docker exec -u ubuntu MentorPi bash -lc '
+    source /opt/ros/humble/setup.bash
+    cd /home/ubuntu/ros2_ws
+    rosdep check --from-paths src/poc_fusion --ignore-src
+  '
+All system dependencies have been satisfied
+
+$ docker exec -u ubuntu MentorPi bash -lc '
+    source /opt/ros/humble/setup.bash
+    cd /home/ubuntu/ros2_ws
+    colcon build --packages-select poc_fusion
+  '
+Starting >>> poc_fusion
+Finished <<< poc_fusion [3.34s]
+--- stderr: poc_fusion
+[same benign setup.py deprecation warning as Tasks 2/4]
+---
+Summary: 1 package finished [5.14s]
+  1 package had stderr output: poc_fusion
+```
+
+### Baseline node list (before launching our pipeline)
+
+```
+$ docker exec -u ubuntu MentorPi bash -lc '
+    source /opt/ros/humble/setup.bash
+    source /home/ubuntu/ros2_ws/install/setup.bash
+    ros2 node list
+  '
+/LD19
+/ar_app
+/arm_controller
+/aurora/aurora
+/controller_manager
+/ekf_filter_node
+/gripper_controller
+/hand_gesture
+/hand_trajectory
+/imu_calib
+/imu_filter
+/init_pose
+/joint_state_publisher
+/joy_node
+/joystick_control
+/lidar_app
+/line_following
+/object_tracking
+/odom_publisher
+/robot_state_publisher
+/ros_robot_controller
+/rosapi
+/rosapi_params
+/rosbridge_websocket
+/servo_manager
+/static_transform_publisher_bXOTCq6Rcx20Hpr7
+/transform_listener_impl_5555df8f5580
+/web_video_server
+```
+
+### Launch, and confirm all our nodes came up
+
+```
+$ docker exec -u ubuntu MentorPi bash -lc '
+    source /opt/ros/humble/setup.bash
+    source /home/ubuntu/ros2_ws/install/setup.bash
+    nohup ros2 launch poc_fusion poc_fusion.launch.py > /tmp/poc_fusion_launch.log 2>&1 &
+    disown
+    sleep 6
+    cat /tmp/poc_fusion_launch.log
+  '
+[INFO] [launch]: All log files can be found below /home/ubuntu/.ros/log/2026-08-07-16-07-37-155778-raspberrypi-23364
+[INFO] [launch]: Default logging verbosity is set to INFO
+[INFO] [depth_preprocess_node-1]: process started with pid [23377]
+[INFO] [component_container-2]: process started with pid [23379]
+[component_container-2] [INFO] [1786118857.553532156] [poc_fusion.poc_fusion_container]: Load Library: /opt/ros/humble/lib/librectify.so
+[component_container-2] [INFO] [1786118858.421200951] [poc_fusion.poc_fusion_container]: Found class: rclcpp_components::NodeFactoryTemplate<image_proc::RectifyNode>
+[component_container-2] [INFO] [1786118858.421256988] [poc_fusion.poc_fusion_container]: Instantiate class: rclcpp_components::NodeFactoryTemplate<image_proc::RectifyNode>
+[INFO] [launch_ros.actions.load_composable_nodes]: Loaded node '/poc_fusion/depth_rectify_node' in container '/poc_fusion/poc_fusion_container'
+[component_container-2] [INFO] [1786118858.623458777] [poc_fusion.poc_fusion_container]: Load Library: /opt/ros/humble/lib/libdepth_image_proc.so
+[component_container-2] [INFO] [1786118858.813659673] [poc_fusion.poc_fusion_container]: Found class: rclcpp_components::NodeFactoryTemplate<depth_image_proc::ConvertMetricNode>
+[component_container-2] [INFO] [1786118858.813735821] [poc_fusion.poc_fusion_container]: Found class: rclcpp_components::NodeFactoryTemplate<depth_image_proc::CropForemostNode>
+[component_container-2] [INFO] [1786118858.813749265] [poc_fusion.poc_fusion_container]: Found class: rclcpp_components::NodeFactoryTemplate<depth_image_proc::DisparityNode>
+[component_container-2] [INFO] [1786118858.813757784] [poc_fusion.poc_fusion_container]: Found class: rclcpp_components::NodeFactoryTemplate<depth_image_proc::PointCloudXyzNode>
+[component_container-2] [INFO] [1786118858.813766673] [poc_fusion.poc_fusion_container]: Instantiate class: rclcpp_components::NodeFactoryTemplate<depth_image_proc::PointCloudXyzNode>
+[INFO] [launch_ros.actions.load_composable_nodes]: Loaded node '/poc_fusion/point_cloud_xyz_node' in container '/poc_fusion/poc_fusion_container'
+[depth_preprocess_node-1] [INFO] [1786118859.419062336] [depth_preprocess_node]: depth_preprocess_node started: /ascamera/camera_publisher/depth0/image_raw -> /poc_fusion/depth_cleaned (expected encoding=mono16, roi_profile=default, median_kernel_size=3)
+[depth_preprocess_node-1] [INFO] [1786118859.422962394] [depth_preprocess_node]: invalid pixel fraction: 0.285
+[component_container-2] [WARN] [1786118859.588614241] [poc_fusion.depth_rectify_node]: [image_transport] Topics '/poc_fusion/depth_cleaned' and '/poc_fusion/camera_info' do not appear to be synchronized. In the last 10s:
+[component_container-2] 	Image messages received:      0
+[component_container-2] 	CameraInfo messages received: 9
+[component_container-2] 	Synchronized pairs:           0
+```
+The `[image_transport] ... do not appear to be synchronized` WARN is
+`image_transport::CameraSubscriber`'s own startup boilerplate reporting on
+its first (empty) 10s window — at the moment it logged, the container had
+been up ~35ms and no image had yet round-tripped through
+`depth_preprocess_node`. It is a transient, not a misconfiguration; see the
+remapping check immediately below, which shows the actual subscribed topics
+are correct.
+
+### Step 3: remappings verified via `ros2 node info` (not by eye)
+
+```
+$ docker exec -u ubuntu MentorPi bash -lc '
+    source /opt/ros/humble/setup.bash
+    source /home/ubuntu/ros2_ws/install/setup.bash
+    ros2 node info /poc_fusion/depth_rectify_node
+  '
+/poc_fusion/depth_rectify_node
+  Subscribers:
+    /ascamera/camera_publisher/depth0/camera_info: sensor_msgs/msg/CameraInfo
+    /parameter_events: rcl_interfaces/msg/ParameterEvent
+    /poc_fusion/depth_cleaned: sensor_msgs/msg/Image
+  Publishers:
+    /parameter_events: rcl_interfaces/msg/ParameterEvent
+    /poc_fusion/depth_rect: sensor_msgs/msg/Image
+    /poc_fusion/image_rect/compressed: sensor_msgs/msg/CompressedImage
+    /poc_fusion/image_rect/compressedDepth: sensor_msgs/msg/CompressedImage
+    /poc_fusion/image_rect/theora: theora_image_transport/msg/Packet
+    /rosout: rcl_interfaces/msg/Log
+  [service server/client sections omitted -- none relevant]
+
+$ docker exec -u ubuntu MentorPi bash -lc '
+    source /opt/ros/humble/setup.bash
+    source /home/ubuntu/ros2_ws/install/setup.bash
+    ros2 node info /poc_fusion/point_cloud_xyz_node
+  '
+/poc_fusion/point_cloud_xyz_node
+  Subscribers:
+    /ascamera/camera_publisher/depth0/camera_info: sensor_msgs/msg/CameraInfo
+    /parameter_events: rcl_interfaces/msg/ParameterEvent
+    /poc_fusion/depth_rect: sensor_msgs/msg/Image
+  Publishers:
+    /parameter_events: rcl_interfaces/msg/ParameterEvent
+    /poc_fusion/points: sensor_msgs/msg/PointCloud2
+    /rosout: rcl_interfaces/msg/Log
+
+$ docker exec -u ubuntu MentorPi bash -lc '
+    source /opt/ros/humble/setup.bash
+    source /home/ubuntu/ros2_ws/install/setup.bash
+    ros2 topic list | grep poc_fusion
+  '
+/poc_fusion/debug_image
+/poc_fusion/depth_cleaned
+/poc_fusion/depth_rect
+/poc_fusion/image_rect/compressed
+/poc_fusion/image_rect/compressedDepth
+/poc_fusion/image_rect/theora
+/poc_fusion/points
+```
+Exactly the remap targets the brief specifies: rectify subscribes
+`/poc_fusion/depth_cleaned` + `/ascamera/camera_publisher/depth0/camera_info`
+and publishes `/poc_fusion/depth_rect`; point_cloud_xyz subscribes
+`/poc_fusion/depth_rect` + the same camera_info topic and publishes
+`/poc_fusion/points`. (The extra `image_rect/compressed*`/`theora` topics
+are `image_transport`'s automatic alternate-transport publishers, not
+something this launch file requested — harmless, standard image_transport
+behaviour, not evidence of a wiring error.)
+
+### Step 2: nearest-neighbour interpolation, verified by parameter readback
+
+```
+$ docker exec -u ubuntu MentorPi bash -lc '
+    source /opt/ros/humble/setup.bash
+    source /home/ubuntu/ros2_ws/install/setup.bash
+    ros2 param list /poc_fusion/depth_rectify_node
+  '
+  .image_rect.format
+  .image_rect.jpeg_quality
+  .image_rect.png_level
+  .image_rect.tiff.res_unit
+  .image_rect.tiff.xdpi
+  .image_rect.tiff.ydpi
+  interpolation
+  qos_overrides./parameter_events.publisher.depth
+  qos_overrides./parameter_events.publisher.durability
+  qos_overrides./parameter_events.publisher.history
+  qos_overrides./parameter_events.publisher.reliability
+  queue_size
+  use_sim_time
+
+$ docker exec -u ubuntu MentorPi bash -lc '
+    source /opt/ros/humble/setup.bash
+    source /home/ubuntu/ros2_ws/install/setup.bash
+    ros2 param get /poc_fusion/depth_rectify_node interpolation
+  '
+Integer value is: 0
+```
+The parameter's real name on Humble's `image_proc::RectifyNode` is
+`interpolation` (a plain top-level param, confirmed via the live
+`ros2 param list` above rather than assumed), and it takes an OpenCV
+interpolation-flag integer. `0 == cv2.INTER_NEAREST` — confirmed nearest-
+neighbour, not the linear default (`1 == cv2.INTER_LINEAR`), matches the
+`{'interpolation': 0}` override set in the launch file.
+
+### Step 4: camera_info watchdog, verified both ways live
+
+**Negative path (camera_info present — no false warning):** the full launch
+log above and its later portions were grepped for the warning text; only
+the transient image_transport sync WARN appears, no watchdog warning fired
+across the whole run, matching the fact that
+`/ascamera/camera_publisher/depth0/camera_info` is actively published by
+the live driver.
+
+**Positive path (camera_info withheld — warning does fire):** rather than
+disturb the live `/ascamera/aurora` driver (which also serves RGB and other
+topics, and stopping it would violate the additive-only constraint), a
+second, fully isolated instance of `depth_preprocess_node` was launched
+with only its `camera_info` subscription remapped to a topic nobody
+publishes, and its `depth_cleaned`/`debug_image` outputs remapped to private
+test topics so it could not collide with the live one:
+```
+$ docker exec -u ubuntu MentorPi bash -lc '
+    source /opt/ros/humble/setup.bash
+    source /home/ubuntu/ros2_ws/install/setup.bash
+    nohup ros2 run poc_fusion depth_preprocess_node --ros-args \
+      -r __node:=depth_preprocess_watchdog_test \
+      -r /ascamera/camera_publisher/depth0/camera_info:=/poc_fusion/test_camera_info_never_published \
+      -r /poc_fusion/depth_cleaned:=/poc_fusion/test_depth_cleaned \
+      -r /poc_fusion/debug_image:=/poc_fusion/test_debug_image \
+      > /tmp/watchdog_test.log 2>&1 &
+    disown
+    sleep 8
+    cat /tmp/watchdog_test.log
+  '
+[INFO] [1786119283.046358618] [depth_preprocess_watchdog_test]: depth_preprocess_node started: /ascamera/camera_publisher/depth0/image_raw -> /poc_fusion/depth_cleaned (expected encoding=mono16, roi_profile=default, median_kernel_size=3)
+[INFO] [1786119284.712780432] [depth_preprocess_watchdog_test]: invalid pixel fraction: 0.287
+[WARN] [1786119288.012239417] [depth_preprocess_watchdog_test]: No message received on /ascamera/camera_publisher/depth0/camera_info within 5s of startup. depth_image_proc::PointCloudXyzNode requires camera_info to produce points -- without it, the fused costmap will silently run LiDAR-only with no other error.
+```
+Warning fired at `1786119288.012 − 1786119283.046 = 4.966s` after startup —
+matches the 5s bar (the small undershoot is the timer's first tick landing
+slightly before the 5.000s mark, expected `create_timer` jitter, not a bug).
+Test instance torn down immediately after (see Teardown section below); its
+depth image subscription (to the real, unremapped
+`/ascamera/camera_publisher/depth0/image_raw`) was read-only and never
+published anything the live stack consumes.
+
+### Step 5 substitutes (machine-checkable, per Decision 4 — RViz is out of scope)
+
+**Frame ID:**
+```
+$ docker exec -u ubuntu MentorPi bash -lc '
+    source /opt/ros/humble/setup.bash
+    source /home/ubuntu/ros2_ws/install/setup.bash
+    timeout 3 ros2 topic echo /poc_fusion/points --no-arr --once
+  '
+header:
+  stamp: {sec: 1786118984, nanosec: 59000000}
+  frame_id: depth_camera_link
+height: 400
+width: 640
+fields: '<sequence type: sensor_msgs/msg/PointField, length: 3>'
+is_bigendian: false
+point_step: 16
+row_step: 10240
+data: '<sequence type: uint8, length: 4096000>'
+is_dense: false
+---
+```
+`frame_id: depth_camera_link` — the correct optical frame per Task 1's
+finding, not `depth_cam_link`.
+
+**Rate — measured, and the surprising number chased to its cause rather
+than explained away:**
+```
+$ docker exec -u ubuntu MentorPi bash -lc '
+    source /opt/ros/humble/setup.bash
+    source /home/ubuntu/ros2_ws/install/setup.bash
+    timeout 10 ros2 topic hz /poc_fusion/points
+  '
+average rate: 3.622  ... window: 5
+average rate: 3.534  ... window: 9
+average rate: 2.622  ... window: 10
+average rate: 3.316  ... window: 16
+average rate: 3.514  ... window: 21
+average rate: 4.718  ... window: 33
+average rate: 4.462  ... window: 37
+```
+This is well below the source's ~14.7 Hz and below `/poc_fusion/depth_cleaned`'s
+own ~14.7 Hz. Rather than assert a cause, three further measurements
+isolated it:
+
+1. System load at the time:
+```
+$ docker exec -u ubuntu MentorPi bash -lc 'top -bn1 | head -12'
+top - 16:09:30 up 9 min, load average: 6.01, 4.82, 2.72
+%Cpu(s): 56.1 us, 9.1 sy, 0.0 ni, 33.3 id, ...
+    PID USER  %CPU COMMAND
+   2029 ubuntu 93.8 joystick_control   <- pre-existing vendor process, not started by this task
+   1980 ubuntu 50.0 aurora9+           <- pre-existing camera driver
+  23377 ubuntu 43.8 depth_p+           <- our node
+  23379 ubuntu 12.5 compone+           <- our container (rectify + point_cloud_xyz)
+```
+`nproc` confirms 4 cores; `load average: 6.01` on 4 cores means the CPU is
+oversubscribed even before our pipeline runs — `joystick_control` alone
+(a vendor node present in the baseline node list before this task started
+anything) was already consuming ~94% of a core throughout this session.
+
+2. To isolate whether the slowdown originates upstream (image
+   preprocessing/rectify) or in the point-cloud projection itself, all
+   three stage topics were measured **simultaneously** in one command:
+```
+$ docker exec -u ubuntu MentorPi bash -lc '
+    source /opt/ros/humble/setup.bash
+    source /home/ubuntu/ros2_ws/install/setup.bash
+    timeout 10 ros2 topic hz /poc_fusion/depth_cleaned &
+    timeout 10 ros2 topic hz /poc_fusion/depth_rect &
+    timeout 10 ros2 topic hz /poc_fusion/points &
+    wait
+  '
+[/poc_fusion/depth_cleaned, final window] average rate: 14.533  window: 121
+[/poc_fusion/depth_rect,    final window] average rate: 14.492  window: 75
+[/poc_fusion/points,        final window] average rate: 3.271   window: 19
+```
+`depth_cleaned` (source-rate passthrough + median filter) and `depth_rect`
+(rectify) both sustain ~14.5 Hz — essentially the full source rate. Only
+`points`, downstream of `depth_image_proc::PointCloudXyzNode`, drops to
+~3 Hz. This isolates the bottleneck to that node's per-pixel XYZ
+unprojection (denser per-pixel floating-point math than a remap-based
+rectify), compounded by the pre-existing CPU contention measured in (1) —
+not a wiring defect in this task's launch file or remappings, which are
+independently confirmed correct via `ros2 node info` above.
+
+3. Point count and finite fraction tracked against Task 4's own
+   concurrently-logged invalid-pixel fraction (see next subsection) confirm
+   the low rate is a throughput/CPU-time property, not a partial-failure
+   (e.g. crashing/restarting) property — the node produces full, valid
+   messages, just fewer of them per second than the source.
+
+**Recorded as-is, not gated:** the brief's Decision 4 asks for "a sane
+rate," not a specific number. ~3–7 Hz (it varied across trials with
+concurrent system load) is far above zero and every message was complete
+and valid (below); the measured cause is CPU contention on a 4-core Pi
+already carrying a ~94%-of-a-core vendor process, not a defect in this
+task's code. Task 12 (latency) and Task 16 (end-to-end) are better placed
+to decide whether this rate is acceptable for the stop-trigger's timing
+budget — flagging it forward rather than declaring it a pass or fail here.
+
+**Point count and geometry — non-zero, finite, and physically plausible:**
+An ad hoc in-container script (`/tmp/points_check.py`, not committed —
+scratch verification tooling only) subscribed to `/poc_fusion/points` with
+`qos_profile_sensor_data` (the default `ros2 topic hz`/reliable QoS is
+incompatible with this publisher's best-effort QoS — first attempt failed
+with an explicit `RELIABILITY` incompatibility WARN, corrected by using the
+sensor-data QoS profile) and reported per-message stats:
+```
+$ docker exec -u ubuntu MentorPi bash -lc '
+    source /opt/ros/humble/setup.bash
+    source /home/ubuntu/ros2_ws/install/setup.bash
+    timeout 15 python3 /tmp/points_check.py
+  '
+msg 0: stamp=(1786119233,501000000) w=640 h=400 total_rows=256000 finite=180315 finite_frac=0.7044 x_range=(-0.32291722297668457, 0.2615756094455719) y_range=(-0.35424816608428955, 0.09392822533845901) z_range=(0.22300000488758087, 0.8230000138282776)
+msg 1: stamp=(1786119234,526000000) w=640 h=400 total_rows=256000 finite=180461 finite_frac=0.7049 x_range=(-0.32221826910972595, 0.2615756094455719) y_range=(-0.35123515129089355, 0.09392822533845901) z_range=(0.22300000488758087, 0.8160000443458557)
+msg 2: stamp=(1786119234,622000000) w=640 h=400 total_rows=256000 finite=180443 finite_frac=0.7049 x_range=(-0.32641199231147766, 0.2615756094455719) y_range=(-0.35166558623313904, 0.09392822533845901) z_range=(0.22300000488758087, 0.8170000314712524)
+msg 3: stamp=(1786119235,8000000) w=640 h=400 total_rows=256000 finite=180300 finite_frac=0.7043 x_range=(-0.32113081216812134, 0.2615756094455719) y_range=(-0.36156558990478516, 0.09392822533845901) z_range=(0.22300000488758087, 0.8400000333786011)
+msg 4: stamp=(1786119235,76000000) w=640 h=400 total_rows=256000 finite=180138 finite_frac=0.7037 x_range=(-0.32291722297668457, 0.2608780860900879) y_range=(-0.3581221103668213, 0.09392822533845901) z_range=(0.22300000488758087, 0.8320000171661377)
+```
+- All 5 messages have 180,138–180,461 finite points out of 256,000 rows
+  (`is_dense: false`, invalid pixels are `NaN`, not omitted rows) — always
+  non-zero, well above 0.
+- All returned `(x, y, z)` values checked finite via `np.isfinite` (no
+  inf/NaN leaking through as a "finite" point).
+- **z** (optical-frame forward/depth axis) ranges 0.223–0.840 m across the
+  5 messages. Expected band: a camera 0.246 m above the floor tilted ~40°
+  below horizontal, per Task 0/Task 1's measured pose, has a floor-return
+  range around `0.246 / sin(40°) ≈ 0.38 m` at the image's vertical centre,
+  extending out to the previously-measured coverage ceiling of ~0.94 m for
+  the furthest visible surfaces. 0.223–0.840 m falls inside that band (the
+  0.223 m minimum matches Task 4's own `units_check.py` raw-pixel finding
+  of 223 mm minimum valid depth, now expressed in metres after
+  `PointCloudXyzNode`'s mm→m conversion — consistent across both
+  verifications).
+- **x** (right) ranges roughly −0.33 to +0.26 m, **y** (down) ranges
+  roughly −0.36 to +0.09 m — both are the kind of narrow, off-axis spread
+  expected from a camera with a modest FOV at these ranges, and neither
+  blows past what geometry allows (e.g. no y value anywhere near −2 m,
+  which would indicate a broken projection).
+
+**Point count tracks the valid-pixel fraction:** at the same wall-clock
+window, `depth_preprocess_node`'s own throttled log showed:
+```
+[depth_preprocess_node-1] [INFO] [1786119231.815989755] [depth_preprocess_node]: invalid pixel fraction: 0.285
+[depth_preprocess_node-1] [INFO] [1786119236.875398347] [depth_preprocess_node]: invalid pixel fraction: 0.286
+```
+i.e. valid fraction ≈ 1 − 0.285…0.286 = **0.714–0.715**. The point cloud's
+own finite fraction across the 5 sampled messages was **0.7037–0.7049** —
+within about 1 percentage point, tracking as expected (not identical,
+because the ROI/median-filter pass and the rectify/reprojection step each
+touch a handful of additional border pixels, but the two numbers move
+together, not independently).
+
+### Step 3: rectification distortion figures (for the record, not re-derived)
+
+Per the brief: worst-case distortion is **0.64 cm at 1 m** at the
+horizontal edge (2.71 px), against a **5 cm** costmap cell — roughly ⅛ of a
+cell, far below quantization. This was never large enough to invalidate an
+edge result on its own; rectifying (this task) removes the *argument* that
+an edge miss might be attributable to lens distortion rather than
+structured-light falloff, which is the expected dominant effect. Not
+re-derived here, per the brief's explicit instruction.
+
+### Self-arm ROI check: vacuous, not a pass
+
+The brief's Step 5 asks to confirm "the self-arm region is absent" from the
+cloud. Task 4's `roi_profiles.default` ships with `row_min == row_max` and
+`col_min == col_max` (zero-width box) — a deliberate "start permissive"
+placeholder that masks nothing, per Task 4's own documentation; Task 11
+measures and installs the real arm-occlusion box later. So this check is
+**currently vacuous**: there is no ROI mask active for the cloud to
+exclude, and "the self-arm region is absent" cannot be meaningfully
+evaluated until Task 11 supplies real bounds. Recording this explicitly
+rather than claiming the check passed.
+
+### Deferred to the human-present phase
+
+Per Decision 4, the following are explicitly **not done** in this
+unattended session and are deferred:
+- Visual RViz confirmation that the cloud appears in `depth_camera_link`
+  and its geometry matches the physical scene.
+- Before/after visual comparison of speckle at depth edges with linear vs.
+  nearest-neighbour interpolation (the parameter-readback check above
+  confirms the *setting*, not the *visual artifact* it prevents).
+- A screenshot reference for Step 5.
+No RViz session was attempted (no display, no human available), consistent
+with CONSTRAINTS.md.
+
+### Teardown
+
+```
+$ docker exec -u ubuntu MentorPi bash -lc 'ps aux | grep -E "poc_fusion|depth_preprocess_node|ros2 launch poc_fusion" | grep -v grep'
+ubuntu     23364  ...  /usr/bin/python3 /opt/ros/humble/bin/ros2 launch poc_fusion poc_fusion.launch.py
+ubuntu     23377  ...  /usr/bin/python3 .../depth_preprocess_node --ros-args -r __node:=depth_preprocess_node ...
+ubuntu     23379  ...  /opt/ros/humble/lib/rclcpp_components/component_container --ros-args -r __node:=poc_fusion_container -r __ns:=/poc_fusion
+
+$ docker exec -u ubuntu MentorPi bash -lc 'kill -TERM 23364 23377 23379; sleep 3; ps aux | grep -E "poc_fusion|depth_preprocess_node" | grep -v grep || echo "all our processes gone"'
+all our processes gone
+```
+(An initial `kill -INT` on the launch PID alone did not bring the children
+down within ~9s of waiting, so all three PIDs we started — the `ros2
+launch` process and its two children — were killed directly by PID. The
+earlier isolated watchdog-test instance, a separate PID not part of this
+set, had already been stopped via `pkill -f depth_preprocess_watchdog_test`
+immediately after its own check, and its exit code 143 is `pkill`'s own
+normal SIGTERM-delivered exit, not a failure.)
+
+Node-list diff, before vs. after (DDS discovery briefly still showed our
+nodes ~immediately after the kill — expected propagation delay, resolved
+after a 5s wait before re-querying):
+```
+$ diff <(sort nodelist_after_teardown.txt) <(sort nodelist_before_teardown.txt)
+4a5
+> /depth_preprocess_node
+14a16
+> /launch_ros_23364
+19a22,24
+> /poc_fusion/depth_rectify_node
+> /poc_fusion/poc_fusion_container
+> /poc_fusion/point_cloud_xyz_node
+```
+Only the four nodes this task's own launch added are the difference; every
+pre-existing node (`/LD19`, `/aurora/aurora`, `/joystick_control`, arm and
+gripper controllers, etc.) is present in both listings, confirming the
+pre-existing stack was undisturbed.
+
+### Host test suite — final
+
+```
+$ cd /home/pi/Desktop/LanderPi-Proximity-Alert/poc_fusion && python3 -m pytest test/ -q
+.....................................                                    [100%]
+37 passed in 0.23s
+```
+
+### Task 5 summary
+
+Implemented `poc_fusion/poc_fusion/lib/camera_info_watchdog.py` (TDD,
+RED/GREEN, 4 new tests, 37/37 total), wired it into
+`depth_preprocess_node.py` as a self-cancelling one-shot timer, and wrote
+`poc_fusion/launch/poc_fusion.launch.py`: `depth_preprocess_node` (plain
+`Node`) plus a `poc_fusion_container` (`rclcpp_components`) holding
+`image_proc::RectifyNode` (nearest-neighbour, `interpolation: 0`, confirmed
+by live `ros2 param get`) and `depth_image_proc::PointCloudXyzNode`,
+remapped exactly per the brief. `package.xml` gained the four exec_depends
+the launch file itself needs (`launch`, `launch_ros`, `rclcpp_components`,
+`ament_index_python`); `costmap_params.yaml` untouched.
+
+Deployed, built, and launched on-robot as `ubuntu`. Verified live:
+remappings correct (`ros2 node info`), interpolation is nearest-neighbour
+(`ros2 param get`), `/poc_fusion/points` publishes at `depth_camera_link`
+with non-zero finite point counts (180k+/256k per message) whose finite
+fraction (0.704–0.705) tracks Task 4's independently-logged valid-pixel
+fraction (0.714–0.715) to within ~1 point, and whose x/y/z ranges are
+consistent with the camera's known 0.246 m/40°-below-horizontal pose. The
+camera_info watchdog was verified in both directions live: no false warning
+while camera_info is live, and a genuine warning at ~4.97s (against the 5s
+bar) when an isolated test instance had its camera_info subscription
+remapped to a silent topic.
+
+One real finding, chased to ground rather than asserted: `/poc_fusion/points`
+publishes at only ~3–7 Hz, well below the ~14.5 Hz sustained by both
+upstream stages (`depth_cleaned`, `depth_rect`, both measured
+simultaneously with `points` in the same command). This isolates the
+slowdown to `depth_image_proc::PointCloudXyzNode`'s per-pixel projection
+under this session's CPU contention (load average 6.0 on 4 cores, with a
+pre-existing vendor `joystick_control` process alone consuming ~94% of a
+core) rather than to this task's wiring, which is independently confirmed
+correct. Flagged forward to Task 12/16 rather than gated here, since the
+brief only requires "a sane rate," not a specific number.
+
+The self-arm-ROI absence check is recorded as currently vacuous (Task 4's
+ROI is a zero-width placeholder; there is nothing yet for the cloud to
+exclude) rather than claimed as a pass. RViz visual confirmation,
+speckle-at-edges before/after comparison, and the Step 5 screenshot are
+explicitly deferred to a human-present session — none was attempted.
+Step 3's distortion figures (0.64 cm at 1 m / 2.71 px worst case, ⅛ of the
+5 cm costmap cell) are recorded per the brief, not re-derived.
+
+Teardown confirmed only this task's own nodes (`depth_preprocess_node`,
+`poc_fusion_container` and its two composable nodes, `launch_ros_23364`)
+were added and removed; the full pre-existing stack (`/LD19`,
+`/aurora/aurora`, `/joystick_control`, arm/gripper controllers, etc.) is
+identical before and after by direct `diff`. No HARD SAFETY RULE was
+touched — no `cmd_vel` publish, no arm command, `.stop_ros.sh` never run,
+no edits to `proximity_alert/` or to files under `/home/ubuntu/ros2_ws/src/`
+outside the deploy script's target.
