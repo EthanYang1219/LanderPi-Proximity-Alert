@@ -1932,11 +1932,21 @@ $ docker exec -u ubuntu MentorPi bash -lc '
 `depth_cleaned` (source-rate passthrough + median filter) and `depth_rect`
 (rectify) both sustain ~14.5 Hz — essentially the full source rate. Only
 `points`, downstream of `depth_image_proc::PointCloudXyzNode`, drops to
-~3 Hz. This isolates the bottleneck to that node's per-pixel XYZ
-unprojection (denser per-pixel floating-point math than a remap-based
-rectify), compounded by the pre-existing CPU contention measured in (1) —
-not a wiring defect in this task's launch file or remappings, which are
-independently confirmed correct via `ros2 node info` above.
+~3 Hz.
+
+**Correction (fix round, see "Task 5 review fix round" subsection below):**
+the original text here asserted this "isolates the bottleneck to that
+node's per-pixel XYZ unprojection ... not a wiring defect." That claim
+overreached the evidence above — (1) alone shows CPU contention exists but
+not that it specifically bottlenecks `PointCloudXyzNode` rather than, say,
+single-threaded executor serialization inside the shared container, or a
+message-synchronizer drop between `image_rect` and `camera_info`. Both of
+those alternative mechanisms were tested directly in the fix round below.
+Neither one explains the sustained low rate either. **The true cause of
+`PointCloudXyzNode`'s low throughput is not isolated by any measurement
+taken in this task.** What is confirmed: the wiring/remappings are correct
+(via `ros2 node info`, independent of rate), and the low rate is not a
+partial-failure/crash-loop symptom (point 3 below still holds).
 
 3. Point count and finite fraction tracked against Task 4's own
    concurrently-logged invalid-pixel fraction (see next subsection) confirm
@@ -1947,9 +1957,10 @@ independently confirmed correct via `ros2 node info` above.
 **Recorded as-is, not gated:** the brief's Decision 4 asks for "a sane
 rate," not a specific number. ~3–7 Hz (it varied across trials with
 concurrent system load) is far above zero and every message was complete
-and valid (below); the measured cause is CPU contention on a 4-core Pi
-already carrying a ~94%-of-a-core vendor process, not a defect in this
-task's code. Task 12 (latency) and Task 16 (end-to-end) are better placed
+and valid (below). The specific mechanism behind the rate is **not
+isolated** (see correction and fix round below) — only that the pipeline
+is CPU-contended in general and produces complete, valid messages at a
+reduced rate. Task 12 (latency) and Task 16 (end-to-end) are better placed
 to decide whether this rate is acceptable for the stop-trigger's timing
 budget — flagging it forward rather than declaring it a pass or fail here.
 
@@ -2087,6 +2098,141 @@ $ cd /home/pi/Desktop/LanderPi-Proximity-Alert/poc_fusion && python3 -m pytest t
 37 passed in 0.23s
 ```
 
+### Task 5 review fix round (2026-08-08)
+
+Timestamps: HKT (UTC+8, host) / UTC (container, ROS `top`/log clocks).
+
+A code reviewer flagged that the "Rate" subsection above overreached: it
+asserted the low `/poc_fusion/points` rate "isolates cleanly" to
+`PointCloudXyzNode`'s per-pixel projection cost, but the pasted
+`component_container` CPU figure (12.5%) is inconsistent with that node
+being compute-bound. Two untested alternative mechanisms were named:
+single-threaded executor serialization inside the shared container, and a
+message-synchronizer drop between `image_rect` and `camera_info`. Both were
+tested directly below, with the explicit instruction that an honest "not
+isolated" outcome is acceptable and preferred over asserting a second,
+still-unproven mechanism.
+
+**Check 1 — swap `component_container` → `component_container_mt`, re-measure
+simultaneously, same command shape as the original measurement.**
+
+Before (single-threaded `component_container`, HKT 2026-08-08 ~15:52 /
+container UTC ~07:52):
+```
+$ docker exec -u ubuntu MentorPi bash -lc '
+    source /opt/ros/humble/setup.bash
+    source /home/ubuntu/ros2_ws/install/setup.bash
+    timeout 10 ros2 topic hz /poc_fusion/depth_cleaned &
+    timeout 10 ros2 topic hz /poc_fusion/depth_rect &
+    timeout 10 ros2 topic hz /poc_fusion/points &
+    wait
+  '
+[/poc_fusion/depth_cleaned, final window] average rate: 14.705  min: 0.058s max: 0.077s std dev: 0.00519s window: 121
+[/poc_fusion/depth_rect,    final window] average rate: 14.528  min: 0.058s max: 0.081s std dev: 0.00612s window: 75
+[/poc_fusion/points,        final window] average rate: 3.990   min: 0.132s max: 1.113s std dev: 0.28901s window: 19
+```
+```
+$ docker exec -u ubuntu MentorPi bash -lc 'top -bn1 | head -12'
+top - 07:52:xx up ... , load average: 5.33, 4.20, 3.85
+    PID USER  %CPU COMMAND
+        ubuntu 100.0 joystick_control    <- pre-existing vendor process
+ 100680 ubuntu  11.7 component_container <- our container (rectify + point_cloud_xyz)
+```
+```
+$ docker exec -u ubuntu MentorPi bash -lc \
+  'grep -c "do not appear to be synchronized" /tmp/poc_fusion_before.log'
+1
+```
+(That one occurrence was `point_cloud_xyz_node`'s own synchronizer warning
+at startup: "Image messages received: 0, CameraInfo messages received: 13,
+Synchronized pairs: 0" — a startup transient before the first depth frame
+arrived, not a sustained drop.)
+
+After (`component_container_mt`, HKT ~16:05 / UTC ~08:05):
+```
+$ docker exec -u ubuntu MentorPi bash -lc '
+    source /opt/ros/humble/setup.bash
+    source /home/ubuntu/ros2_ws/install/setup.bash
+    timeout 10 ros2 topic hz /poc_fusion/depth_cleaned &
+    timeout 10 ros2 topic hz /poc_fusion/depth_rect &
+    timeout 10 ros2 topic hz /poc_fusion/points &
+    wait
+  '
+[/poc_fusion/depth_cleaned, final window] average rate: 14.014  min: 0.059s max: 0.084s std dev: 0.00701s window: 116
+[/poc_fusion/depth_rect,    final window] average rate: 13.855  min: 0.059s max: 0.089s std dev: 0.00788s window: 72
+[/poc_fusion/points,        final window] average rate: 4.272   min: 0.135s max: 1.784s std dev: 0.34215s window: 20
+```
+```
+$ docker exec -u ubuntu MentorPi bash -lc 'top -bn1 | head -12'
+top - 08:05:xx up ... , load average: 5.6x, 4.5x, 3.9x
+    PID USER  %CPU COMMAND
+        ubuntu 100.0 joystick_control
+  <pid> ubuntu  11.7 component_container_mt
+```
+```
+$ docker exec -u ubuntu MentorPi bash -lc \
+  'grep -c "do not appear to be synchronized" /tmp/poc_fusion_after.log'
+4
+```
+(4 occurrences, clustered as 2 pairs ~1s apart, both still in the startup
+window before steady-state locked in — the same transient pattern as the
+"before" run, not a new or sustained behaviour.)
+
+**Result:** `_mt` gave no material rate recovery (3.990 → 4.272 Hz, a ~7%
+change consistent with run-to-run noise given the concurrent
+`joystick_control` load), CPU utilization on the container process was
+identical (11.7% in both runs), and max latency actually got *worse*
+(1.113s → 1.784s). This does not support keeping `_mt`. Per the decision
+tree, **the launch file was reverted to `component_container`** (see
+`poc_fusion/launch/poc_fusion.launch.py`, `executable='component_container'`
+— unchanged from the originally committed value).
+
+**Check 2 — grep `point_cloud_xyz_node`'s own log for synchronizer warnings
+(not just the depth_preprocess_node watchdog's text).** Done as part of
+Check 1 above: 1 occurrence before, 4 after, both confined to the
+startup transient window (first few seconds before the synchronizer locks
+onto a steady stream), not a sustained pattern in either configuration.
+This rules out a persistent sync-drop as the explanation for the sustained
+~3–7 Hz rate.
+
+**Conclusion — corrected, not re-asserted with a new story:** neither
+alternative mechanism (single-threaded serialization; sync-drop) explains
+the sustained low rate. Combined with Check 1's CPU figures (11.7%,
+essentially unchanged either way — not saturated, not compute-bound in any
+way the measurements here can show), the honest conclusion is that
+**the mechanism behind `PointCloudXyzNode`'s low throughput is not
+isolated.** What is ruled out: (1) a wiring/remapping defect (confirmed
+correct independently via `ros2 node info`); (2) `image_proc::RectifyNode`
+as the bottleneck (it and `depth_cleaned` both sustain ~14–14.7 Hz); (3)
+single-threaded executor serialization as the sole or primary cause (no
+material change under `_mt`); (4) a persistent message-synchronizer drop
+(warnings are brief startup transients only, in both configurations). What
+remains unknown: the specific mechanism inside `PointCloudXyzNode` (or its
+interaction with system-wide CPU contention) that yields ~3–7 Hz. This is
+recorded honestly as an open question, flagged forward to Task 12/16 as
+before, rather than closed with an unproven explanation.
+
+Launch file: reverted to the original committed state (`executable=
+'component_container'`), confirmed via `git diff` showing no changes to
+`poc_fusion/launch/poc_fusion.launch.py` after the revert. Redeployed and
+did a final sanity launch confirming `/poc_fusion/points` and the other
+topics are present and publishing after the revert, then torn down the
+same way as the main run (`kill -TERM` on all three PIDs, `ros2 node list`
+diff confirming only this task's own nodes were the difference).
+
+Host test suite re-run after the fix round, immediately before committing:
+```
+$ cd /home/pi/Desktop/LanderPi-Proximity-Alert/poc_fusion && python3 -m pytest test/ -q
+.....................................                                    [100%]
+37 passed in 0.24s
+```
+
+Two Minors raised by the same review (duplicated `camera_info` topic
+string literal across `depth_preprocess_node.py` and
+`poc_fusion.launch.py`; `_camera_info_watchdog_timer.cancel()` without a
+matching `.destroy()`) were explicitly **not touched** this round, per
+direct instruction to leave them for final review.
+
 ### Task 5 summary
 
 Implemented `poc_fusion/poc_fusion/lib/camera_info_watchdog.py` (TDD,
@@ -2115,13 +2261,23 @@ remapped to a silent topic.
 One real finding, chased to ground rather than asserted: `/poc_fusion/points`
 publishes at only ~3–7 Hz, well below the ~14.5 Hz sustained by both
 upstream stages (`depth_cleaned`, `depth_rect`, both measured
-simultaneously with `points` in the same command). This isolates the
-slowdown to `depth_image_proc::PointCloudXyzNode`'s per-pixel projection
-under this session's CPU contention (load average 6.0 on 4 cores, with a
-pre-existing vendor `joystick_control` process alone consuming ~94% of a
-core) rather than to this task's wiring, which is independently confirmed
-correct. Flagged forward to Task 12/16 rather than gated here, since the
-brief only requires "a sane rate," not a specific number.
+simultaneously with `points` in the same command). A follow-up review
+round (see "Task 5 review fix round" above) tested two specific
+alternative mechanisms — single-threaded executor serialization (swapped
+to `component_container_mt`, no material rate recovery: 3.99→4.27 Hz,
+identical 11.7% CPU, worse max latency) and a persistent
+message-synchronizer drop (grepped `point_cloud_xyz_node`'s own log: only
+brief startup-transient warnings in either configuration, not sustained) —
+and ruled out both, along with a wiring/remapping defect (independently
+confirmed correct via `ros2 node info`). **The specific mechanism behind
+the low rate is not isolated by any measurement taken in this task.**
+What is confirmed: it is not a wiring defect, not a rectify bottleneck, not
+purely single-threaded serialization, and not a sync-drop; system-wide CPU
+contention exists (load average ~5–6 on 4 cores, `joystick_control` alone
+at ~94–100% of a core) but was not shown to specifically saturate
+`PointCloudXyzNode`. Flagged forward to Task 12/16 as an open question
+rather than gated here, since the brief only requires "a sane rate," not a
+specific number.
 
 The self-arm-ROI absence check is recorded as currently vacuous (Task 4's
 ROI is a zero-width placeholder; there is nothing yet for the cloud to
