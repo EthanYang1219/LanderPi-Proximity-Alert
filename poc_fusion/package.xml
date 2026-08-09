@@ -14,6 +14,13 @@
   <exec_depend>rclpy</exec_depend>
   <exec_depend>sensor_msgs</exec_depend>
   <exec_depend>nav_msgs</exec_depend>
+  <!-- Task 7: the stop monitor consumes nav2_msgs/Costmap (raw 0-255 cost
+       scale), confirms costmap liveness via lifecycle_msgs GetState +
+       TransitionEvent, and publishes its tri-state as a
+       diagnostic_msgs/DiagnosticArray. -->
+  <exec_depend>nav2_msgs</exec_depend>
+  <exec_depend>lifecycle_msgs</exec_depend>
+  <exec_depend>diagnostic_msgs</exec_depend>
   <exec_depend>geometry_msgs</exec_depend>
   <exec_depend>std_msgs</exec_depend>
   <exec_depend>visualization_msgs</exec_depend>

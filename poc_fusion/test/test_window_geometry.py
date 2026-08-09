@@ -151,3 +151,79 @@ def test_area_cm2_to_cells_differs_by_resolution():
     assert cells_fine != cells_coarse
     assert cells_fine == 4
     assert cells_coarse == 1
+
+
+# --- Task 7 additions: marker corners and yaw extraction -------------------
+#
+# Step 6 publishes the detection window as a visualization_msgs/Marker whose
+# four corners are expressed in the costmap frame. Placing those corners is
+# the same body->world transform window_mask() applies internally, so it
+# lives here rather than in the node: if the marker and the mask ever
+# disagree, the RViz rectangle stops being evidence about the real mask.
+
+import math as _math
+
+import pytest as _pytest
+
+from poc_fusion.lib.window_geometry import window_corners, yaw_from_quaternion
+
+
+def test_corners_at_origin_with_zero_yaw():
+    corners = window_corners(rx=0.0, ry=0.0, ryaw=0.0,
+                             forward_m=1.0, half_width_m=0.3)
+    assert corners == [
+        (0.0, 0.3), (0.0, -0.3), (1.0, -0.3), (1.0, 0.3),
+    ]
+
+
+def test_corners_are_translated_by_robot_position():
+    corners = window_corners(rx=2.0, ry=-1.0, ryaw=0.0,
+                             forward_m=1.0, half_width_m=0.3)
+    assert corners[0] == _pytest.approx((2.0, -0.7))
+    assert corners[2] == _pytest.approx((3.0, -1.3))
+
+
+def test_corners_rotate_with_robot_yaw():
+    # At +90 degrees the robot's +x (forward) points along world +y, so the
+    # far edge of the window must sit at y = +forward_m, not x.
+    corners = window_corners(rx=0.0, ry=0.0, ryaw=_math.pi / 2,
+                             forward_m=1.0, half_width_m=0.3)
+    far_left, far_right = corners[3], corners[2]
+    assert far_left == _pytest.approx((-0.3, 1.0))
+    assert far_right == _pytest.approx((0.3, 1.0))
+
+
+def test_corners_agree_with_window_mask_under_rotation():
+    # The property that actually matters: every corner midpoint the marker
+    # draws must fall inside the mask the detector evaluates. Catches a
+    # marker that silently uses a different sign convention from window_mask.
+    from poc_fusion.lib.window_geometry import window_mask
+    rx, ry, ryaw = 1.5, 1.5, 0.7
+    forward_m, half_width_m = 1.0, 0.3
+    resolution, width, height = 0.05, 60, 60
+    origin_x, origin_y = 0.0, 0.0
+    mask = window_mask(width, height, resolution, origin_x, origin_y,
+                       rx, ry, ryaw, forward_m, half_width_m)
+    corners = window_corners(rx, ry, ryaw, forward_m, half_width_m)
+    centre_x = sum(c[0] for c in corners) / 4.0
+    centre_y = sum(c[1] for c in corners) / 4.0
+    col = int((centre_x - origin_x) / resolution)
+    row = int((centre_y - origin_y) / resolution)
+    assert mask[row, col]
+
+
+def test_yaw_from_identity_quaternion_is_zero():
+    assert yaw_from_quaternion(0.0, 0.0, 0.0, 1.0) == _pytest.approx(0.0)
+
+
+def test_yaw_from_quarter_turn_quaternion():
+    # 90 degrees about +z: (0, 0, sin(45deg), cos(45deg)).
+    half = _math.sqrt(0.5)
+    assert yaw_from_quaternion(0.0, 0.0, half, half) == _pytest.approx(_math.pi / 2)
+
+
+def test_yaw_is_negative_for_a_clockwise_rotation():
+    # Catches a sign flip, which would mirror the whole detection window
+    # about the robot's forward axis without any other symptom.
+    half = _math.sqrt(0.5)
+    assert yaw_from_quaternion(0.0, 0.0, -half, half) == _pytest.approx(-_math.pi / 2)

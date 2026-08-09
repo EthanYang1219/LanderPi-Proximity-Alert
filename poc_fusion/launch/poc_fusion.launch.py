@@ -24,7 +24,10 @@ ships no composable-node plugin in Humble, so the costmap and the lifecycle
 manager run as their own processes alongside the container (see the comment
 inside the container's node list).
 
-Task 8 adds the costmap stop monitor at the marked insertion point below.
+Task 7 added `costmap_stop_monitor_node` (tri-state costmap monitor, consuming
+`/costmap/costmap_raw`) just above the insertion marker. Task 8 still owns
+INTEGRATION VERIFICATION of the whole chain -- Task 7 verified only its own
+node, live and standalone.
 
 `depth_preprocess_node` is a plain (non-composable) Python node -- rclpy
 composable-node support is immature relative to rclcpp's, and Task 4 already
@@ -268,6 +271,41 @@ def generate_launch_description():
                                 'costmap that may never activate'),
     )
 
+    # --- Section: costmap stop monitor (Task 7) -----------------------------
+    #
+    # Reads config/stop_monitor_params.yaml directly as a --params-file: that
+    # file's only top-level key is the node name, so it is already valid ROS
+    # 2 params-file YAML and needs none of the sub-tree extraction the
+    # costmap params file above requires.
+    #
+    # The monitor consumes /costmap/costmap_raw (nav2_msgs/Costmap) rather
+    # than /costmap/costmap (nav_msgs/OccupancyGrid) -- a correction to the
+    # Task 7 brief's Step 1, forced by two live measurements pasted in
+    # docs/poc_fusion_verification.md "Task 7": the OccupancyGrid's costs are
+    # rescaled to 0..100 (so lethal_threshold 253 could never be reached, and
+    # the monitor would report CLEAR forever with no error), and a fresh
+    # subscriber to it received 0 messages in 90 s while costmap_raw
+    # delivered 568. The topic name is a PARAMETER in that YAML, not a
+    # literal here.
+    #
+    # It publishes no velocity and commands no motion -- acting on the signal
+    # is Task 9's scope. Ordering within a LaunchDescription does not gate
+    # startup; the monitor's own tri-state is what refuses to report CLEAR
+    # before the costmap is confirmed ACTIVE, which is Task 6 Step 4's
+    # carried-forward gap closed in the consumer rather than in the launch.
+    #
+    # Task 8 owns integration verification of the whole chain; this action is
+    # wired here only so Task 8 has something to verify.
+    stop_monitor_params = os.path.join(
+        pkg_share, 'config', 'stop_monitor_params.yaml')
+    costmap_stop_monitor_node = Node(
+        package='poc_fusion',
+        executable='costmap_stop_monitor_node',
+        name='costmap_stop_monitor_node',
+        output='screen',
+        parameters=[stop_monitor_params],
+    )
+
     # --- Task 8 finishes wiring and verifies the whole chain here ---
 
     return LaunchDescription([
@@ -275,4 +313,5 @@ def generate_launch_description():
         poc_fusion_container,
         costmap_node,
         lifecycle_manager_costmap,
+        costmap_stop_monitor_node,
     ])
