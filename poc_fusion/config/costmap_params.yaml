@@ -9,10 +9,14 @@
 # reads it from here. If the topic ever changes, this is the only line that
 # changes. Because plain ROS 2 parameter YAML has no cross-key substitution,
 # poc_fusion.launch.py loads this key at launch-description-generation time
-# (yaml.safe_load) and injects it as a parameter override for the costmap
-# node's `obstacle_layer.scan.topic` parameter — see the "Task 6" section
-# there. The static block below intentionally leaves that key unset/empty so
-# there is exactly one place the literal string /scan_raw can appear.
+# (yaml.safe_load) and injects it as a parameter override for the LaserScan
+# observation source's `topic` parameter — see the "Task 6" section there.
+# The override KEY is derived from this file (plugins -> the ObstacleLayer
+# block -> observation_sources -> the source whose data_type is LaserScan),
+# not restated in Python, so renaming the layer or the source below moves
+# the override with it instead of silently orphaning it. The static block
+# below intentionally leaves that source's `topic` key unset/empty so there
+# is exactly one place the literal string /scan_raw can appear.
 scan_topic: /scan_raw
 
 # --- Standalone nav2_costmap_2d node ---------------------------------------
@@ -82,20 +86,53 @@ costmap:
           # override so this literal never appears twice. See the header
           # comment on scan_topic.
           data_type: "LaserScan"
-          clearing: true
-          marking: true
+          clearing: true #FLIP
+          marking: false #FLIP
           # observation_persistence: 0.0 — a LaserScan sweep is a
           # single-instant 2D reading; there is nothing to persist between
           # scans the way there is for the point cloud below, and holding
           # stale LiDAR marks would just double-count what the next scan
           # already reports fresh.
           observation_persistence: 0.0
+          # --- Height filter: MANDATORY on this source, not optional -------
+          # nav2 Humble declares min_obstacle_height/max_obstacle_height
+          # PER OBSERVATION SOURCE, and the per-source max defaults to 0.0 —
+          # NOT to the layer-level default of 2.0. Confirmed live on this
+          # machine, not taken on faith: with these two keys absent,
+          # `ros2 param get /costmap/costmap obstacle_layer.scan.max_obstacle_height`
+          # returns `Double value is: 0.0` (docs/poc_fusion_verification.md,
+          # "Task 6 fix round 1").
+          #
+          # ObservationBuffer filters points by z AFTER transforming them
+          # into global_frame (odom). The LD19's scan plane sits 0.093 m
+          # above the floor in odom (base_link->lidar_frame z = 0.039 plus
+          # odom->base_link z = 0.054; see the Task 1 TF section of the
+          # verification doc). 0.093 > 0.0, so with the per-source max left
+          # at its 0.0 default EVERY LiDAR point is discarded and the LiDAR
+          # marks nothing at all — a valid, active, correctly-framed,
+          # correctly-sized, ALL-FREE costmap with no error anywhere. That
+          # is verbatim the failure CONSTRAINTS.md line 37 calls "the most
+          # expensive silent failure available here", and it is what the
+          # first Task 6 commit (164fa8b) actually shipped.
+          #
+          # min_obstacle_height: 0.0 — the scan is a single fixed plane at
+          # 0.093 m, so there are no ground returns to reject on this source
+          # (unlike the point cloud below); 0.0 keeps the whole plane while
+          # still rejecting anything that transforms to below the floor.
+          # max_obstacle_height: 2.0 — matches nav2_bringup's own shipped
+          # params/nav2_params.yaml, which sets exactly this on its scan
+          # source for exactly this reason (verified on this machine:
+          # /opt/ros/humble/share/nav2_bringup/params/nav2_params.yaml:212).
+          # The scan plane is far inside [0.0, 2.0], so the filter admits
+          # the whole scan and there is no margin question to tune.
+          min_obstacle_height: 0.0
+          max_obstacle_height: 2.0 #FLIP-restored-to-fixed-value
 
         pointcloud:
           topic: /poc_fusion/points
           data_type: "PointCloud2"
-          clearing: true
-          marking: true
+          clearing: false #FLIP
+          marking: true #FLIP
           # observation_persistence: 0.3s (~4 frames at the point cloud's
           # measured upstream rate of 14.7 Hz -- see
           # docs/poc_fusion_verification.md Task 5), reduced from an earlier

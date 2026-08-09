@@ -1,21 +1,30 @@
 """POC fusion launch file.
 
-Task 5 (this task) builds the depth pipeline only:
-  depth_preprocess_node (Task 4)
-    -> /poc_fusion/depth_cleaned
-  image_proc::RectifyNode (nearest-neighbour interpolation -- see the
-    `interpolation` parameter override below; NOT the linear default, which
-    synthesizes "flying pixel" artifacts across depth discontinuities)
-    -> /poc_fusion/depth_rect
-  depth_image_proc::PointCloudXyzNode
-    -> /poc_fusion/points
+Current contents (Tasks 4, 5 and 6 -- Task 8's stop monitor is NOT here yet):
 
-Both composable nodes are loaded into a single `poc_fusion_container`
-(rclcpp_components) rather than run as separate processes, matching the
-brief's intent that this container is a natural place for Task 6 to also
-load the costmap-related composable nodes and Task 8 to wire in the
-lifecycle manager. Do NOT add Task 6's or Task 8's nodes here yet --
-sections below are pre-labelled for where those additions belong.
+  Depth pipeline (Tasks 4/5):
+    depth_preprocess_node (Task 4)
+      -> /poc_fusion/depth_cleaned
+    image_proc::RectifyNode (nearest-neighbour interpolation -- see the
+      `interpolation` parameter override below; NOT the linear default, which
+      synthesizes "flying pixel" artifacts across depth discontinuities)
+      -> /poc_fusion/depth_rect
+    depth_image_proc::PointCloudXyzNode
+      -> /poc_fusion/points
+
+  Costmap (Task 6):
+    nav2_costmap_2d (standalone Costmap2DROS lifecycle node) fusing
+      /scan_raw (LiDAR) + /poc_fusion/points (depth) into one obstacle layer
+      -> /costmap/costmap, /costmap/costmap_updates
+    nav2_lifecycle_manager (autostart) bringing that node to `active`
+
+The two depth composable nodes are loaded into a single `poc_fusion_container`
+(rclcpp_components) rather than run as separate processes. nav2_costmap_2d
+ships no composable-node plugin in Humble, so the costmap and the lifecycle
+manager run as their own processes alongside the container (see the comment
+inside the container's node list).
+
+Task 8 adds the costmap stop monitor at the marked insertion point below.
 
 `depth_preprocess_node` is a plain (non-composable) Python node -- rclpy
 composable-node support is immature relative to rclcpp's, and Task 4 already
@@ -24,8 +33,11 @@ than being force-fit into the container.
 """
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
+from launch.actions import Shutdown
 from launch_ros.actions import ComposableNodeContainer, Node
 from launch_ros.descriptions import ComposableNode
+
+from poc_fusion.lib.costmap_param_keys import resolve_scan_topic_key
 
 import os
 import yaml
@@ -132,22 +144,50 @@ def generate_launch_description():
     scan_topic = costmap_params_full['scan_topic']
     costmap_ros_params = costmap_params_full['costmap']['costmap']['ros__parameters']
 
-    # Node name/namespace deliberately NOT overridden here. Verified live
-    # (docs/poc_fusion_verification.md, Task 6) that `nav2_costmap_2d` run
-    # with no name/namespace override comes up as /costmap/costmap --
-    # matching the costmap_params.yaml key path `costmap: costmap:
-    # ros__parameters:`. Overriding either without also changing the YAML
-    # key path is exactly the silent-mismatch failure mode called out in
-    # the Task 6 brief (costmap silently falls back to defaults, or the
-    # lifecycle manager waits forever on a node name that does not exist).
+    # The override KEY is derived from the params tree, not restated as a
+    # literal. `resolve_scan_topic_key` walks `plugins` -> the single
+    # nav2_costmap_2d::ObstacleLayer block -> `observation_sources` -> the
+    # single source whose data_type is LaserScan, and returns
+    # '<layer>.<source>.topic'. Writing 'obstacle_layer.scan.topic' here
+    # instead would hard-code two names costmap_params.yaml owns: rename
+    # either and the override silently becomes an unused parameter while the
+    # real source falls back to nav2's default topic (the source name, which
+    # does not exist) -- an all-free costmap with no error. Every ambiguous
+    # or missing case raises RuntimeError, so generate_launch_description()
+    # aborts the launch instead of coming up wrong (review finding I5;
+    # unit-tested in test/test_costmap_param_keys.py, mutation-proved live
+    # in docs/poc_fusion_verification.md, "Task 6 fix round 1").
+    scan_topic_key = resolve_scan_topic_key(costmap_ros_params)
+
+    # Node name/namespace deliberately NOT overridden here, and the actual
+    # coupling that creates is NOT the YAML key path. Verified against the
+    # installed launch_ros source
+    # (/opt/ros/humble/lib/python3.10/site-packages/launch_ros/actions/node.py:369-377,
+    # pasted in docs/poc_fusion_verification.md, "Task 6 fix round 1"):
+    # `_create_params_file_from_dict` writes the dict under
+    # `self.node_name if self.is_node_name_fully_specified() else '/**'`.
+    # This action passes no `name=`/`namespace=`, so the temp params file is
+    # written under the `/**` WILDCARD and the parameters load regardless of
+    # what the node ends up calling itself. costmap_params.yaml's
+    # `costmap: costmap: ros__parameters:` nesting is stripped by the Python
+    # extraction above and never reaches rcl, so that nesting is
+    # DOCUMENTATION of the observed default node name, not a binding -- an
+    # earlier version of this comment claimed a silent fallback to defaults
+    # here, which is wrong.
+    # The real name dependency is `node_names: ['costmap/costmap']` on the
+    # lifecycle manager below, and its failure mode is a HANG, not an error:
+    # the manager waits forever on a change_state service that never appears.
     costmap_node = Node(
         package='nav2_costmap_2d',
         executable='nav2_costmap_2d',
         output='screen',
         parameters=[
             costmap_ros_params,
-            {'obstacle_layer.scan.topic': scan_topic},
+            {scan_topic_key: scan_topic},
         ],
+        # See the "fail loudly" block on the lifecycle manager below.
+        on_exit=Shutdown(reason='costmap node exited; tearing down the launch '
+                                'so nothing subscribes to a dead costmap'),
     )
 
     # nav2_lifecycle_manager brings the costmap lifecycle node from
@@ -181,13 +221,38 @@ def generate_launch_description():
     # tolerance workaround for a slow node -- it removes a check for a
     # signal this particular node structurally never sends.
     #
-    # "Fail loudly" (brief Step 4) is still satisfied without the bond
-    # check: `autostart: true` means the manager attempts the transitions
-    # immediately and unconditionally, a genuine configuration/transition
-    # error still surfaces as an ERROR-level log line (as seen above), and
-    # the verification doc's `ros2 lifecycle get` / `ros2 topic hz` /
-    # `ros2 topic echo --once` readbacks are the actual proof the costmap
-    # reached `active` and is producing data -- not the bond mechanism.
+    # --- "Fail loudly" (brief Step 4): what IS and IS NOT covered ----------
+    #
+    # COVERED, by the `on_exit=Shutdown(...)` on both this node and the
+    # costmap node above: if EITHER process dies, the whole launch is torn
+    # down. An earlier version of this file relied on `autostart: true`
+    # plus an ERROR log line and asserted that satisfied the requirement.
+    # It did not -- that is "fail in the scrollback", not "fail loudly", and
+    # it left two real observed failures with the launch still green:
+    #   * lifecycle_manager CRASHING outright (observed at bond_timeout 4.0:
+    #     `statemap::TransitionUndefinedException`, exit -6) while the rest
+    #     of the launch kept running;
+    #   * `Failed to bring up all requested nodes. Aborting bringup.` with
+    #     the manager process still alive.
+    # In both cases `ros2 launch` stayed up and Task 8's stop monitor would
+    # have subscribed to a costmap topic that never publishes -- verbatim
+    # the outcome brief Step 4 exists to prevent. The first of those two is
+    # now covered; the second is not (see below).
+    #
+    # NOT COVERED: the manager-alive-but-costmap-never-active case
+    # ("Aborting bringup" without a process exit). No launch action here
+    # gates on the costmap actually reaching `active`, so this launch CAN
+    # still come up green with an inactive costmap that publishes nothing.
+    # This is stated explicitly rather than papered over: Task 8's stop
+    # monitor MUST refuse to start (or must fail loudly) when
+    # `/costmap/costmap` is not in state `active`, and must not treat
+    # "subscribed, no messages" as "no obstacles". This gap is recorded in
+    # the Task 6 report as well.
+    #
+    # Note the bond check is NOT what would have caught either case: see the
+    # bond_timeout block above -- the standalone nav2_costmap_2d node never
+    # creates a bond at all, so the bond check only ever produced a false
+    # negative here.
     lifecycle_manager_costmap = Node(
         package='nav2_lifecycle_manager',
         executable='lifecycle_manager',
@@ -198,6 +263,9 @@ def generate_launch_description():
             'node_names': ['costmap/costmap'],
             'bond_timeout': 0.0,
         }],
+        on_exit=Shutdown(reason='lifecycle_manager_costmap exited; tearing '
+                                'down the launch so nothing subscribes to a '
+                                'costmap that may never activate'),
     )
 
     # --- Task 8 finishes wiring and verifies the whole chain here ---
