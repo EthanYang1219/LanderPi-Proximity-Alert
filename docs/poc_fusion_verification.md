@@ -2717,10 +2717,21 @@ LAUNCH_PID=75997
 
 `lifecycle_manager_costmap` now logs `Managed nodes are active` with no
 bond error. The one-time `Timed out waiting for transform ... odom` line at
-`1786128844.669` is a startup transient (queried before the first `/tf`
-message arrived) — `tf2_echo odom base_link` moments later in this same
-session resolves cleanly (see Step 4 below) and the costmap proceeds past
-it to `start` within ~0.5s regardless.
+`1786128844.669` is recorded as an observed one-time startup transient: the
+costmap proceeds past it to `start` within ~0.5s and never repeats it.
+
+> **CORRECTION (Task 6 fix round 1).** The original text of this paragraph
+> attributed that line to a cause ("queried before the first `/tf` message
+> arrived") and cross-referenced a `tf2_echo odom base_link` result "in this
+> same session ... see Step 4 below". Neither was supported: no `tf2_echo`
+> output existed anywhere in this Task 6 section, and the cause was asserted
+> rather than measured — the actual error text is `Invalid frame ID "odom"
+> ... frame does not exist`, and `/ekf_filter_node` was already publishing
+> `/tf` before this launch started. Both the dangling cross-reference and
+> the causal parenthetical are removed. A genuinely live `tf2_echo odom
+> base_link` was run during the fix round and is pasted in
+> "Task 6 fix round 1 — Step D"; it reproduces the same message twice before
+> resolving, which is an observation, not an isolated cause.
 
 ### Step 4: proving the node name, parameters, and lifecycle state
 
@@ -2999,10 +3010,20 @@ The `min: 0.100s` bound matches the configured 10 Hz `update_frequency`/
 10Hz); the *average* rate (~6 Hz, not 10 Hz) is measured, not derived, and
 its cause is NOT ISOLATED in this task — no new mechanism is proposed for
 it here. It is consistent with, but not shown to be caused by, the same
-kind of system-wide CPU contention already documented in Task 5 (load
-average ~5-6 on 4 cores at the time of these measurements). Flagged
+kind of system-wide CPU contention already documented in Task 5. Flagged
 forward alongside the existing `/poc_fusion/points` rate question for
 Task 12/16 rather than chased here.
+
+> **CORRECTION (Task 6 fix round 1).** The original text of this paragraph
+> ended the hedge with the parenthetical "(load average ~5-6 on 4 cores at
+> the time of these measurements)". No `uptime`, `top` or `/proc/loadavg`
+> reading was ever taken in this section, so that number was unsupported.
+> It is deleted. The hedge itself ("consistent with, but not shown to be
+> caused by") stands. A real load reading, taken concurrently with a
+> re-measurement of this same topic, is pasted in "Task 6 fix round 1 —
+> Step E". **Also note:** the ~6 Hz figure above is no longer a valid
+> baseline — the fix in this round makes the LiDAR source actually mark, so
+> the costmap's workload changed. See Step E for the post-fix number.
 
 Full-grid message content, proving `resolution`, `width`, `height`, and
 `frame_id` match the configured 3m×3m / 0.05 resolution / `odom` frame:
@@ -3214,3 +3235,864 @@ per-detection, whether the triggering costmap cells were touched by the
 `scan` or `pointcloud` observation buffer (or both) before they are marked
 into the shared grid — noted as a recommendation only, not built here, and
 explicitly not a fix to `proximity_alert/`'s frozen CSV schema.
+
+---
+
+## Task 6 fix round 1 (2026-08-09 ~23:35–23:57 HKT / 2026-08-09 ~15:35–15:57 UTC)
+
+Response to review of the original Task 6 section. Three things are settled
+here: (1) the LiDAR observation source was silently marking **nothing** as
+shipped in `164fa8b`, and the fix is proved by reading the costmap's actual
+`data` array rather than `--no-arr`; (2) two unsupported claims in the
+original Task 6 text (a dangling `tf2_echo` cross-reference, an invented
+load-average number) are corrected in place above; (3) the point cloud
+source's contribution to the grid is measured for the first time.
+
+Host clock and container clock, taken from separate commands (host `date`
+run outside any `docker exec`, container `date -u` run inside it):
+
+```
+$ docker ps --format '{{.Names}}\t{{.Status}}' && echo "=== container date ===" && docker exec -u ubuntu MentorPi bash -lc 'date -u' && echo "=== host date ===" && date
+MentorPi	Up 15 minutes
+=== container date ===
+Sun Aug  9 15:39:47 UTC 2026
+=== host date ===
+Sun Aug  9 11:39:47 PM HKT 2026
+```
+
+### The defect
+
+`nav2_costmap_2d` (Humble) declares `min_obstacle_height` /
+`max_obstacle_height` **per observation source**, and the per-source
+`max_obstacle_height` defaults to `0.0` — not to the layer-level `2.0`.
+`164fa8b` set those keys on the `pointcloud` source only, leaving the `scan`
+source at the `0.0` default. `ObservationBuffer` filters observation points
+by z **after** transforming them into `global_frame` (`odom`), and the LD19's
+scan plane sits at z ≈ 0.093 m in `odom`, so every LiDAR point was discarded.
+The costmap stayed valid, active, correctly framed and correctly sized — and
+all-free. The original section's `ros2 topic echo --once /costmap/costmap
+--no-arr` could not see this, because `--no-arr` suppresses the one field
+that carries the answer.
+
+### Step A: the fix, as deployed
+
+Committed in `de956ea`. `poc_fusion/config/costmap_params.yaml` now sets
+`min_obstacle_height: 0.0` / `max_obstacle_height: 2.0` on the `scan`
+source (the `2.0` matches `nav2_bringup`'s own shipped
+`params/nav2_params.yaml`). Parameter readback from the running node, with
+the full production config deployed:
+
+```
+$ docker exec -u ubuntu MentorPi bash -lc '
+source /opt/ros/humble/setup.bash
+source /home/ubuntu/ros2_ws/install/setup.bash
+date -u
+echo "=== ros2 lifecycle get /costmap/costmap ==="
+ros2 lifecycle get /costmap/costmap
+echo "=== param readback ==="
+ros2 param get /costmap/costmap obstacle_layer.scan.topic
+ros2 param get /costmap/costmap obstacle_layer.scan.max_obstacle_height
+ros2 param get /costmap/costmap obstacle_layer.scan.min_obstacle_height
+ros2 param get /costmap/costmap obstacle_layer.scan.marking
+ros2 param get /costmap/costmap obstacle_layer.pointcloud.marking
+ros2 param get /costmap/costmap obstacle_layer.pointcloud.topic
+'; echo "--- HOST ---"; date
+Sun Aug  9 15:41:21 UTC 2026
+=== ros2 lifecycle get /costmap/costmap ===
+active [3]
+=== param readback ===
+String value is: /scan_raw
+Double value is: 2.0
+Double value is: 0.0
+Boolean value is: True
+Boolean value is: True
+String value is: /poc_fusion/points
+--- HOST ---
+Sun Aug  9 11:41:43 PM HKT 2026
+```
+
+### Step B: LIVE PROOF — the LiDAR now marks the grid, read from `data`
+
+Full stack launched on the robot (`ros2 launch poc_fusion
+poc_fusion.launch.py`: `depth_preprocess_node` + `RectifyNode` +
+`PointCloudXyzNode` + `nav2_costmap_2d` + `nav2_lifecycle_manager`), then the
+costmap's occupancy array read **with the array included**. The occupancy
+histogram is produced by a pipeline that is visible in the command itself
+(`tr`/`sed`/`sort`/`uniq -c` over the `data` field), alongside the count of
+`/scan_raw` returns that fall inside the same 3 m × 3 m window.
+
+The scan counter is a read-only rclpy subscriber (`/tmp/scan_window_count.py`
+in the container; it publishes nothing). Its source, verbatim:
+
+```python
+#!/usr/bin/env python3
+"""Count /scan_raw returns that fall inside the costmap's 3x3 m window.
+
+Read-only: subscribes to /scan_raw, takes ONE message, prints counts. No
+publishing of any kind. The window test is done in the laser frame
+(|x|<=1.5 and |y|<=1.5 m); a return with range r <= 1.5 m is inside the
+box for any bearing, which is the conservative count reported as
+'in_window_conservative'.
+"""
+import math
+import rclpy
+from rclpy.node import Node
+from sensor_msgs.msg import LaserScan
+
+
+class ScanCounter(Node):
+    def __init__(self):
+        super().__init__('scan_window_counter')
+        self.done = False
+        self.create_subscription(LaserScan, '/scan_raw', self.cb, 10)
+
+    def cb(self, msg):
+        if self.done:
+            return
+        self.done = True
+        total = len(msg.ranges)
+        finite = 0
+        in_box = 0
+        conservative = 0
+        for i, r in enumerate(msg.ranges):
+            if not math.isfinite(r) or r < msg.range_min or r > msg.range_max:
+                continue
+            finite += 1
+            a = msg.angle_min + i * msg.angle_increment
+            x = r * math.cos(a)
+            y = r * math.sin(a)
+            if abs(x) <= 1.5 and abs(y) <= 1.5:
+                in_box += 1
+            if r <= 1.5:
+                conservative += 1
+        print('frame_id           :', msg.header.frame_id)
+        print('stamp              : %d.%09d' % (msg.header.stamp.sec,
+                                                msg.header.stamp.nanosec))
+        print('range_min/range_max: %.3f / %.3f' % (msg.range_min, msg.range_max))
+        print('total_beams        :', total)
+        print('valid_returns      :', finite)
+        print('in_window_3x3_box  :', in_box)
+        print('in_window_conservative (r<=1.5m):', conservative)
+
+
+def main():
+    rclpy.init()
+    n = ScanCounter()
+    while rclpy.ok() and not n.done:
+        rclpy.spin_once(n, timeout_sec=1.0)
+    n.destroy_node()
+    rclpy.shutdown()
+
+
+main()
+```
+
+Correlated reading, production config, run 1:
+
+```
+$ docker exec -u ubuntu MentorPi bash -lc '
+source /opt/ros/humble/setup.bash
+source /home/ubuntu/ros2_ws/install/setup.bash
+date -u
+echo "=== /scan_raw returns inside the 3x3 m costmap window ==="
+timeout 30 python3 /tmp/scan_window_count.py
+echo "=== /costmap/costmap occupancy histogram (same moment) ==="
+timeout 20 ros2 topic echo --once /costmap/costmap --field data | tr -d "[]" | tr "," "\n" | sed "s/ //g" | sort -n | uniq -c
+date -u
+'; echo "--- HOST ---"; date
+Sun Aug  9 15:42:25 UTC 2026
+=== /scan_raw returns inside the 3x3 m costmap window ===
+frame_id           : lidar_frame
+stamp              : 1786290153.387331694
+range_min/range_max: 0.020 / 25.000
+total_beams        : 503
+valid_returns      : 256
+in_window_3x3_box  : 190
+in_window_conservative (r<=1.5m): 187
+=== /costmap/costmap occupancy histogram (same moment) ===
+      1 ---
+   3463 0
+      1 0)
+      1 array('b'
+    136 100
+Sun Aug  9 15:42:36 UTC 2026
+--- HOST ---
+Sun Aug  9 11:42:36 PM HKT 2026
+```
+
+Reading the histogram: 3463 + 136 + 1 = 3600 = 60 × 60 cells (the `1 array('b'`
+and `1 0)` lines are the opening/closing tokens of the `array('b', [...])`
+repr split by the same `tr`, and `1 ---` is `ros2 topic echo`'s YAML document
+terminator — all three are artifacts of the visible pipeline, not data).
+**136 cells at cost 100 (lethal), with 190 genuine LiDAR returns inside the
+window.** Non-zero occupancy, from the real `data` array.
+
+That the array itself is genuinely being read and not summarised away
+(`--no-arr` is exactly what hid the original bug) is shown by the raw
+`--field data` output pasted, command and all, in the **run 4** block of
+Step C below: `array('b', [0, 0, 0, ...` printed literally by
+`ros2 topic echo --once /costmap/costmap --field data | head -c 400`.
+
+### Step C: the discrimination proof — flip, paste, restore
+
+Four runs, differing only in `poc_fusion/config/costmap_params.yaml`, each
+one a full deploy → `colcon build` → relaunch → measure cycle. The LiDAR
+input is essentially unchanged across all four (177–190 valid returns inside
+the window), so the occupancy differences are attributable to the config.
+
+| run | `observation_sources` | `scan.max_obstacle_height` | LiDAR returns in window | cells at cost 100 |
+|---|---|---|---|---|
+| 1 | `scan pointcloud` | `2.0` (fixed) | 190 | **136** |
+| 2 | `scan pointcloud` | `0.0` (broken default) | 186 | **80** |
+| 3 | `scan` only | `0.0` (broken default) | 177 | **0** |
+| 4 | `scan` only | `2.0` (fixed) | 187 | **94** |
+| 5 | `scan pointcloud` | `2.0` (restored, committed) | 184 | **62** |
+
+Run 3 vs run 4 is the clean single-variable flip on the LiDAR source:
+**0 occupied cells with the broken default, 94 with the fix, same sensor, same
+scene, nothing else changed.**
+
+Run 2 (both sources listed, LiDAR height-filtered out):
+
+```
+$ docker exec -u ubuntu MentorPi bash -lc '
+source /opt/ros/humble/setup.bash
+source /home/ubuntu/ros2_ws/install/setup.bash
+date -u
+echo "=== param readback (mutated) ==="
+ros2 param get /costmap/costmap obstacle_layer.scan.max_obstacle_height
+ros2 param get /costmap/costmap obstacle_layer.scan.marking
+ros2 param get /costmap/costmap obstacle_layer.pointcloud.marking
+echo "=== /scan_raw returns inside the 3x3 m window (unchanged sensor input) ==="
+timeout 30 python3 /tmp/scan_window_count.py
+echo "=== /costmap/costmap occupancy histogram, sample 1 ==="
+timeout 20 ros2 topic echo --once /costmap/costmap --field data | tr -d "[]" | tr "," "\n" | sed "s/ //g" | sort -n | uniq -c
+sleep 15
+echo "=== /costmap/costmap occupancy histogram, sample 2 (15s later) ==="
+timeout 20 ros2 topic echo --once /costmap/costmap --field data | tr -d "[]" | tr "," "\n" | sed "s/ //g" | sort -n | uniq -c
+echo "=== is /poc_fusion/points alive during this run? ==="
+timeout 15 ros2 topic hz /poc_fusion/points 2>&1 | tail -3
+date -u
+'; echo "--- HOST ---"; date
+Sun Aug  9 15:51:37 UTC 2026
+=== param readback (mutated) ===
+Double value is: 0.0
+Boolean value is: True
+Boolean value is: True
+=== /scan_raw returns inside the 3x3 m window (unchanged sensor input) ===
+frame_id           : lidar_frame
+stamp              : 1786290708.386996247
+range_min/range_max: 0.020 / 25.000
+total_beams        : 503
+valid_returns      : 253
+in_window_3x3_box  : 186
+in_window_conservative (r<=1.5m): 184
+=== /costmap/costmap occupancy histogram, sample 1 ===
+      1 ---
+   3519 0
+      1 0)
+      1 array('b'
+     80 100
+=== /costmap/costmap occupancy histogram, sample 2 (15s later) ===
+      1 ---
+   3519 0
+      1 0)
+      1 array('b'
+     80 100
+=== is /poc_fusion/points alive during this run? ===
+	min: 0.051s max: 1.233s std dev: 0.25282s window: 33
+average rate: 3.350
+	min: 0.051s max: 2.245s std dev: 0.42050s window: 34
+Sun Aug  9 15:52:23 UTC 2026
+--- HOST ---
+Sun Aug  9 11:52:23 PM HKT 2026
+```
+
+Run 2 did **not** give zero occupancy, and that is a real result rather than a
+failed prediction: 80 cells remained. Run 3 isolates why — with the point
+cloud source removed and the same broken height default, the LiDAR source
+alone marks nothing at all:
+
+```
+$ docker exec -u ubuntu MentorPi bash -lc '
+source /opt/ros/humble/setup.bash
+source /home/ubuntu/ros2_ws/install/setup.bash
+date -u
+echo "=== params: LiDAR-only isolation, BROKEN default height ==="
+ros2 param get /costmap/costmap obstacle_layer.observation_sources
+ros2 param get /costmap/costmap obstacle_layer.scan.max_obstacle_height
+echo "=== /scan_raw returns inside the 3x3 m window ==="
+timeout 30 python3 /tmp/scan_window_count.py
+echo "=== /costmap/costmap occupancy histogram ==="
+timeout 20 ros2 topic echo --once /costmap/costmap --field data | tr -d "[]" | tr "," "\n" | sed "s/ //g" | sort -n | uniq -c
+sleep 12
+echo "=== /costmap/costmap occupancy histogram, 12s later ==="
+timeout 20 ros2 topic echo --once /costmap/costmap --field data | tr -d "[]" | tr "," "\n" | sed "s/ //g" | sort -n | uniq -c
+date -u
+'; echo "--- HOST ---"; date
+Sun Aug  9 15:53:51 UTC 2026
+=== params: LiDAR-only isolation, BROKEN default height ===
+String value is: scan
+Double value is: 0.0
+=== /scan_raw returns inside the 3x3 m window ===
+frame_id           : lidar_frame
+stamp              : 1786290837.414110875
+range_min/range_max: 0.020 / 25.000
+total_beams        : 502
+valid_returns      : 248
+in_window_3x3_box  : 177
+in_window_conservative (r<=1.5m): 174
+=== /costmap/costmap occupancy histogram ===
+      1 ---
+   3599 0
+      1 0)
+      1 array('b'
+=== /costmap/costmap occupancy histogram, 12s later ===
+      1 ---
+   3599 0
+      1 0)
+      1 array('b'
+Sun Aug  9 15:54:13 UTC 2026
+--- HOST ---
+Sun Aug  9 11:54:13 PM HKT 2026
+```
+
+3599 + 1 (`0)` token) = 3600 cells, **every one of them 0**, with 177 genuine
+LiDAR returns inside the window. This is the `164fa8b` defect reproduced
+exactly: a valid, active, `active [3]`, correctly-sized, entirely free
+costmap with no error anywhere.
+
+Run 4 — same isolation, height fixed:
+
+```
+$ docker exec -u ubuntu MentorPi bash -lc '
+source /opt/ros/humble/setup.bash
+source /home/ubuntu/ros2_ws/install/setup.bash
+date -u
+echo "=== params: LiDAR-only isolation, FIXED height ==="
+ros2 param get /costmap/costmap obstacle_layer.observation_sources
+ros2 param get /costmap/costmap obstacle_layer.scan.max_obstacle_height
+echo "=== /scan_raw returns inside the 3x3 m window ==="
+timeout 30 python3 /tmp/scan_window_count.py
+echo "=== /costmap/costmap occupancy histogram ==="
+timeout 20 ros2 topic echo --once /costmap/costmap --field data | tr -d "[]" | tr "," "\n" | sed "s/ //g" | sort -n | uniq -c
+echo "=== raw data field, first 400 bytes (proving the array is really being read) ==="
+timeout 20 ros2 topic echo --once /costmap/costmap --field data | head -c 400
+echo
+date -u
+'; echo "--- HOST ---"; date
+Sun Aug  9 15:54:50 UTC 2026
+=== params: LiDAR-only isolation, FIXED height ===
+String value is: scan
+Double value is: 2.0
+=== /scan_raw returns inside the 3x3 m window ===
+frame_id           : lidar_frame
+stamp              : 1786290898.687052658
+range_min/range_max: 0.020 / 25.000
+total_beams        : 503
+valid_returns      : 257
+in_window_3x3_box  : 187
+in_window_conservative (r<=1.5m): 184
+=== /costmap/costmap occupancy histogram ===
+      1 ---
+   3505 0
+      1 0)
+      1 array('b'
+     94 100
+=== raw data field, first 400 bytes (proving the array is really being read) ===
+array('b', [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+Sun Aug  9 15:55:03 UTC 2026
+--- HOST ---
+Sun Aug  9 11:55:03 PM HKT 2026
+```
+
+Run 5 — the committed production config restored (both sources, fixed
+height), which is the state the repository is left in:
+
+```
+$ docker exec -u ubuntu MentorPi bash -lc '
+source /opt/ros/humble/setup.bash
+source /home/ubuntu/ros2_ws/install/setup.bash
+date -u
+echo "=== params: PRODUCTION (both sources, fixed height) ==="
+ros2 param get /costmap/costmap obstacle_layer.observation_sources
+ros2 param get /costmap/costmap obstacle_layer.scan.max_obstacle_height
+ros2 param get /costmap/costmap obstacle_layer.scan.min_obstacle_height
+ros2 param get /costmap/costmap obstacle_layer.scan.marking
+ros2 param get /costmap/costmap obstacle_layer.scan.clearing
+ros2 param get /costmap/costmap obstacle_layer.pointcloud.marking
+ros2 param get /costmap/costmap obstacle_layer.pointcloud.clearing
+ros2 param get /costmap/costmap obstacle_layer.scan.topic
+echo "=== ros2 lifecycle get /costmap/costmap ==="
+ros2 lifecycle get /costmap/costmap
+echo "=== /scan_raw returns inside the 3x3 m window ==="
+timeout 30 python3 /tmp/scan_window_count.py
+echo "=== /costmap/costmap occupancy histogram ==="
+timeout 20 ros2 topic echo --once /costmap/costmap --field data | tr -d "[]" | tr "," "\n" | sed "s/ //g" | sort -n | uniq -c
+date -u
+'; echo "--- HOST ---"; date
+Sun Aug  9 15:55:54 UTC 2026
+=== params: PRODUCTION (both sources, fixed height) ===
+String value is: scan pointcloud
+Double value is: 2.0
+Double value is: 0.0
+Boolean value is: True
+Boolean value is: True
+Boolean value is: True
+Boolean value is: True
+String value is: /scan_raw
+=== ros2 lifecycle get /costmap/costmap ===
+active [3]
+=== /scan_raw returns inside the 3x3 m window ===
+frame_id           : lidar_frame
+stamp              : 1786290981.488540904
+range_min/range_max: 0.020 / 25.000
+total_beams        : 503
+valid_returns      : 279
+in_window_3x3_box  : 184
+in_window_conservative (r<=1.5m): 184
+=== /costmap/costmap occupancy histogram ===
+      1 ---
+   3537 0
+      1 0)
+      1 array('b'
+     62 100
+Sun Aug  9 15:56:24 UTC 2026
+--- HOST ---
+Sun Aug  9 11:56:24 PM HKT 2026
+```
+
+Within run 5 the count is stable; between run 1 (136) and run 5 (62) it is
+not, with the robot stationary and the scene unchanged by anyone in the room.
+That between-run difference is **measured, not isolated** — no mechanism is
+proposed for it here, and nothing in this section depends on the absolute
+count, only on zero-vs-non-zero and on within-run comparisons:
+
+```
+$ docker exec -u ubuntu MentorPi bash -lc '
+source /opt/ros/humble/setup.bash
+source /home/ubuntu/ros2_ws/install/setup.bash
+date -u
+for i in 1 2 3 4 5 6; do
+  echo "--- sample $i ---"
+  timeout 20 ros2 topic echo --once /costmap/costmap --field data | tr -d "[]" | tr "," "\n" | sed "s/ //g" | grep -c "^100$"
+  sleep 5
+done
+date -u
+'; echo "--- HOST ---"; date
+Sun Aug  9 15:56:34 UTC 2026
+--- sample 1 ---
+62
+--- sample 2 ---
+62
+--- sample 3 ---
+62
+--- sample 4 ---
+62
+--- sample 5 ---
+62
+--- sample 6 ---
+62
+Sun Aug  9 15:57:21 UTC 2026
+--- HOST ---
+Sun Aug  9 11:57:21 PM HKT 2026
+```
+
+And the mutation left nothing behind in the repository:
+
+```
+$ echo "=== git diff --stat ===" && git diff --stat && echo "=== TEMP markers left? ===" && (grep -rn "TEMP-DISCRIMINATION-MUTATION" poc_fusion/ || echo "(none)") && echo "=== FLIP markers? ===" && (grep -rn FLIP poc_fusion/ || echo "(none)")
+=== git diff --stat ===
+ poc_fusion/config/costmap_params.yaml | 10 +++++-----
+ 1 file changed, 5 insertions(+), 5 deletions(-)
+=== TEMP markers left? ===
+(none)
+=== FLIP markers? ===
+(none)
+```
+
+(The 5-line diff shown there is the `#FLIP` revert described in Step H,
+which was still uncommitted at that moment; it is committed in this round.)
+
+### Step D: `tf2_echo odom base_link` — live (corrects the dangling citation)
+
+```
+$ docker exec -u ubuntu MentorPi bash -lc '
+source /opt/ros/humble/setup.bash
+source /home/ubuntu/ros2_ws/install/setup.bash
+date -u
+echo "=== tf2_echo odom base_link (single sample, live) ==="
+timeout 8 ros2 run tf2_ros tf2_echo odom base_link 2>&1 | head -20
+echo "=== EXIT ==="
+date -u
+'; echo "--- HOST ---"; date
+Sun Aug  9 15:43:04 UTC 2026
+=== tf2_echo odom base_link (single sample, live) ===
+[INFO] [1786290185.533270382] [tf2_echo]: Waiting for transform odom ->  base_link: Invalid frame ID "odom" passed to canTransform argument target_frame - frame does not exist
+[INFO] [1786290187.482621507] [tf2_echo]: Waiting for transform odom ->  base_link: Invalid frame ID "base_link" passed to canTransform argument source_frame - frame does not exist
+At time 1786290188.467496868
+- Translation: [0.000, 0.000, 0.054]
+- Rotation: in Quaternion [0.000, 0.000, 0.001, 1.000]
+- Rotation: in RPY (radian) [0.000, -0.000, 0.001]
+- Rotation: in RPY (degree) [0.000, -0.000, 0.064]
+- Matrix:
+  1.000 -0.001  0.000  0.000
+  0.001  1.000  0.000  0.000
+  0.000  0.000  1.000  0.054
+  0.000  0.000  0.000  1.000
+At time 1786290189.475504044
+- Translation: [0.000, 0.000, 0.054]
+- Rotation: in Quaternion [0.000, 0.000, 0.000, 1.000]
+- Rotation: in RPY (radian) [0.000, -0.000, 0.001]
+- Rotation: in RPY (degree) [0.000, -0.000, 0.054]
+- Matrix:
+  1.000 -0.001  0.000  0.000
+  0.001  1.000  0.000  0.000
+=== EXIT ===
+Sun Aug  9 15:43:10 UTC 2026
+--- HOST ---
+Sun Aug  9 11:43:10 PM HKT 2026
+```
+
+`odom -> base_link` resolves, at z = 0.054 m, which is the value the
+`costmap_params.yaml` comment relies on when it computes the LiDAR scan
+plane's height in `odom` (0.039 + 0.054 = 0.093 m). Note also that a
+freshly-started `tf2_echo` in this same graph emits the *same*
+`Invalid frame ID ... frame does not exist` message twice before resolving.
+That is an **observation**, and it is the reason the corrected paragraph
+earlier in this document now records the costmap's identical startup line
+without asserting a cause: nothing here isolates one.
+
+### Step E: `/costmap/costmap_updates` re-measured after the fix, with a real concurrent load reading
+
+The fix changes what the costmap marks, so the original section's ~6 Hz
+figure is **not** carried forward as a baseline. Fresh measurement, with
+`uptime` / `/proc/loadavg` taken *while the `ros2 topic hz` run was still
+in flight* — the concurrency is visible in the command (the `hz` job is
+backgrounded, its PID checked alive, then `wait`ed on):
+
+```
+$ docker exec -u ubuntu MentorPi bash -lc '
+source /opt/ros/humble/setup.bash
+source /home/ubuntu/ros2_ws/install/setup.bash
+date -u
+timeout 25 ros2 topic hz /costmap/costmap_updates > /tmp/hz_updates.txt 2>&1 &
+HZ_PID=$!
+sleep 10
+echo "=== uptime / loadavg taken DURING the hz run above (pid $HZ_PID still running) ==="
+uptime
+cat /proc/loadavg
+echo "=== hz still alive? ==="
+kill -0 $HZ_PID && echo "yes, pid $HZ_PID alive"
+wait $HZ_PID
+echo "=== ros2 topic hz /costmap/costmap_updates (25s) ==="
+cat /tmp/hz_updates.txt
+date -u
+'; echo "--- HOST ---"; date
+Sun Aug  9 15:43:26 UTC 2026
+=== uptime / loadavg taken DURING the hz run above (pid 65679 still running) ===
+ 15:43:36 up 20 min,  0 users,  load average: 7.37, 5.76, 3.83
+7.37 5.76 3.83 10/1012 66454
+=== hz still alive? ===
+yes, pid 65679 alive
+=== ros2 topic hz /costmap/costmap_updates (25s) ===
+average rate: 7.112
+	min: 0.100s max: 0.201s std dev: 0.03602s window: 9
+average rate: 6.409
+	min: 0.100s max: 0.347s std dev: 0.06102s window: 15
+average rate: 6.993
+	min: 0.004s max: 0.347s std dev: 0.06909s window: 24
+average rate: 6.994
+	min: 0.004s max: 0.347s std dev: 0.06255s window: 31
+average rate: 6.992
+	min: 0.004s max: 0.347s std dev: 0.05952s window: 38
+average rate: 6.825
+	min: 0.004s max: 0.347s std dev: 0.05769s window: 45
+average rate: 6.887
+	min: 0.004s max: 0.347s std dev: 0.05588s window: 53
+average rate: 6.906
+	min: 0.004s max: 0.347s std dev: 0.05351s window: 61
+average rate: 6.804
+	min: 0.004s max: 0.347s std dev: 0.05267s window: 68
+average rate: 6.821
+	min: 0.004s max: 0.347s std dev: 0.05202s window: 75
+average rate: 6.780
+	min: 0.004s max: 0.347s std dev: 0.05121s window: 82
+average rate: 6.781
+	min: 0.004s max: 0.347s std dev: 0.05049s window: 89
+average rate: 6.670
+	min: 0.004s max: 0.347s std dev: 0.05076s window: 95
+average rate: 6.554
+	min: 0.004s max: 0.347s std dev: 0.05079s window: 101
+average rate: 6.606
+	min: 0.004s max: 0.347s std dev: 0.04989s window: 109
+average rate: 6.532
+	min: 0.004s max: 0.347s std dev: 0.04980s window: 115
+average rate: 6.488
+	min: 0.004s max: 0.347s std dev: 0.04946s window: 121
+average rate: 6.544
+	min: 0.004s max: 0.347s std dev: 0.04870s window: 129
+average rate: 6.506
+	min: 0.004s max: 0.347s std dev: 0.04880s window: 135
+average rate: 6.516
+	min: 0.004s max: 0.347s std dev: 0.04854s window: 142
+average rate: 6.458
+	min: 0.004s max: 0.347s std dev: 0.04880s window: 148
+Sun Aug  9 15:43:52 UTC 2026
+--- HOST ---
+Sun Aug  9 11:43:52 PM HKT 2026
+```
+
+**Post-fix `/costmap/costmap_updates`: ~6.5 Hz average over 25 s
+(final window: `average rate: 6.458`, `window: 148`), against a configured
+10 Hz. MEASURED, NOT ISOLATED.** No causal story is offered. The load
+average at the moment of measurement was 7.37 (1-minute) on this 4-core
+Raspberry Pi 5 — that is a genuine concurrent reading, and it is recorded as
+*context, not cause*: nothing here shows the rate gap is caused by it.
+Note also `min: 0.004s`, i.e. some update pairs arrive far faster than the
+100 ms configured period, which the older section did not observe.
+
+### Step F: does the depth-camera point cloud reach the grid?
+
+This was never tested before — the original Task 6 probe ran without the
+depth pipeline, and `ros2 node info` only ever proved *subscription*.
+
+The run-2 / run-3 pair in Step C answers it. Both runs used the broken
+`scan.max_obstacle_height: 0.0`, so the LiDAR source contributed nothing in
+either. They differ only in whether the `pointcloud` source is listed:
+
+- run 3, `observation_sources: "scan"` → **0** occupied cells.
+- run 2, `observation_sources: "scan pointcloud"` → **80** occupied cells,
+  stable across two samples 15 s apart.
+
+`obstacle_layer` is the only plugin configured (`plugins: ["obstacle_layer"]`
+— no static layer, no inflation layer), and `scan` marked nothing under that
+height filter, so **those 80 cells can only have been marked by
+`/poc_fusion/points`**. The depth-derived point cloud is not merely
+subscribed; its observations reach the occupancy grid. `/poc_fusion/points`
+was confirmed live during that same run at `average rate: 3.350` Hz.
+
+**What this does NOT show, stated plainly:**
+
+- It does not show the depth camera sees anything the LiDAR would have
+  missed. That is Step 5's hand-wave test and it still has not been done.
+  **"Fusion is not verified working" from the original report stands and is
+  NOT walked back.**
+- It does not show *what* those 80 cells are. With `min_obstacle_height:
+  0.03` / `max_obstacle_height: 0.94` on that source and an empty floor in
+  front of a camera tilted ~40° down, near-floor returns and genuine
+  low obstacles are not distinguished by anything measured here.
+- No human was present in this session to put a hand or an object into the
+  camera's FOV outside the LiDAR plane, so the correlated "object appears →
+  new cells appear at the expected bearing" test was not attempted at all.
+
+### Step G: launch-mechanism evidence cited by the source comments
+
+The `/**` wildcard claim in `poc_fusion.launch.py`'s comment, from the
+installed `launch_ros` source in the container:
+
+```
+$ docker exec -u ubuntu MentorPi bash -lc '
+echo "=== launch_ros node.py lines 366-378 ==="
+sed -n "366,378p" /opt/ros/humble/lib/python3.10/site-packages/launch_ros/actions/node.py
+'
+=== launch_ros node.py lines 366-378 ===
+        keywords = (self.UNSPECIFIED_NODE_NAME, self.UNSPECIFIED_NODE_NAMESPACE)
+        return all(x not in self.node_name for x in keywords)
+
+    def _create_params_file_from_dict(self, params):
+        with NamedTemporaryFile(mode='w', prefix='launch_params_', delete=False) as h:
+            param_file_path = h.name
+            param_dict = {
+                self.node_name if self.is_node_name_fully_specified() else '/**':
+                {'ros__parameters': params}
+            }
+            yaml.dump(param_dict, h, default_flow_style=False)
+            return param_file_path
+```
+
+And the temporary params files actually generated by the five launches above,
+showing both the `/**` wildcard key in practice and the injected scan-topic
+override landing as its own file:
+
+```
+$ docker exec -u ubuntu MentorPi bash -lc '
+cd /tmp
+for f in $(find . -maxdepth 1 -name "launch_params_*" -newermt "-25 minutes" | head -20); do echo "--- $f ---"; head -6 "$f"; done
+'
+--- ./launch_params_sbhtj9ge ---
+/**:
+  ros__parameters:
+    global_frame: odom
+    height: 3
+    obstacle_layer.enabled: true
+    obstacle_layer.observation_sources: scan pointcloud
+--- ./launch_params_glx07sbe ---
+/**:
+  ros__parameters:
+    autostart: true
+    bond_timeout: 0.0
+    node_names: !!python/tuple
+    - costmap/costmap
+--- ./launch_params_enmjhq3y ---
+/**:
+  ros__parameters:
+    global_frame: odom
+    height: 3
+    obstacle_layer.enabled: true
+    obstacle_layer.observation_sources: scan pointcloud
+--- ./launch_params_jeoltfsz ---
+/**:
+  ros__parameters:
+    obstacle_layer.scan.topic: /scan_raw
+--- ./launch_params_u7bqcf4k ---
+/**:
+  ros__parameters:
+    obstacle_layer.scan.topic: /scan_raw
+--- ./launch_params_c50s0pl_ ---
+/**:
+  ros__parameters:
+    autostart: true
+    bond_timeout: 0.0
+    node_names: !!python/tuple
+    - costmap/costmap
+--- ./launch_params_p6veoov6 ---
+/**:
+  ros__parameters:
+    global_frame: odom
+    height: 3
+    obstacle_layer.enabled: true
+    obstacle_layer.observation_sources: scan
+--- ./launch_params_xltwkv_m ---
+/**:
+  ros__parameters:
+    obstacle_layer.scan.topic: /scan_raw
+--- ./launch_params_g6ggjynx ---
+/**:
+  ros__parameters:
+    autostart: true
+    bond_timeout: 0.0
+    node_names: !!python/tuple
+    - costmap/costmap
+--- ./launch_params_4o9s2pve ---
+/**:
+  ros__parameters:
+    global_frame: odom
+    height: 3
+    obstacle_layer.enabled: true
+    obstacle_layer.observation_sources: scan pointcloud
+--- ./launch_params_7d8uc64p ---
+/**:
+  ros__parameters:
+    obstacle_layer.scan.topic: /scan_raw
+--- ./launch_params_gn1dr94t ---
+/**:
+  ros__parameters:
+    autostart: true
+    bond_timeout: 0.0
+    node_names: !!python/tuple
+    - costmap/costmap
+--- ./launch_params_v0uuj1vc ---
+/**:
+  ros__parameters:
+    autostart: true
+    bond_timeout: 0.0
+    node_names: !!python/tuple
+    - costmap/costmap
+--- ./launch_params_8c618ih1 ---
+/**:
+  ros__parameters:
+    obstacle_layer.scan.topic: /scan_raw
+--- ./launch_params_6a_fjqkk ---
+/**:
+  ros__parameters:
+    global_frame: odom
+    height: 3
+    obstacle_layer.enabled: true
+    obstacle_layer.observation_sources: scan
+```
+
+`resolve_scan_topic_key` mutation-proof, run on the host against the real
+shipped YAML (this is the claim `poc_fusion.launch.py` makes when it says the
+override key follows a rename instead of orphaning itself):
+
+```
+$ cd /home/pi/Desktop/LanderPi-Proximity-Alert/poc_fusion && python3 -c "
+import copy, yaml, sys
+sys.path.insert(0, '.')
+from poc_fusion.lib.costmap_param_keys import resolve_scan_topic_key
+tree = yaml.safe_load(open('config/costmap_params.yaml'))['costmap']['costmap']['ros__parameters']
+print('as-shipped                       ->', resolve_scan_topic_key(tree))
+m = copy.deepcopy(tree)
+m['fused_layer'] = m.pop('obstacle_layer'); m['plugins'] = ['fused_layer']
+print('layer renamed to fused_layer     ->', resolve_scan_topic_key(m))
+m2 = copy.deepcopy(m)
+m2['fused_layer']['lidar'] = m2['fused_layer'].pop('scan')
+m2['fused_layer']['observation_sources'] = 'lidar pointcloud'
+print('source renamed to lidar          ->', resolve_scan_topic_key(m2))
+m3 = copy.deepcopy(tree)
+del m3['obstacle_layer']['scan']['data_type']
+try:
+    resolve_scan_topic_key(m3)
+except RuntimeError as e:
+    print('LaserScan source removed         -> RuntimeError:', e)
+"
+as-shipped                       -> obstacle_layer.scan.topic
+layer renamed to fused_layer     -> fused_layer.scan.topic
+source renamed to lidar          -> fused_layer.lidar.topic
+LaserScan source removed         -> RuntimeError: expected exactly one LaserScan observation source on costmap layer 'obstacle_layer', found 0: []
+```
+
+### Step H: `#FLIP` discipline and host tests
+
+The `#FLIP` markers used during this round to prove the config discriminates
+a real regression are all gone, and the host suite is green:
+
+```
+$ date && git status && git log --oneline -3 && echo "=== FLIP ===" && grep -rn FLIP poc_fusion/ ; echo "exit=$?"
+Sun Aug  9 11:35:34 PM HKT 2026
+On branch feature/poc-fusion-costmap
+Changes not staged for commit:
+  (use "git add <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+	modified:   poc_fusion/config/costmap_params.yaml
+
+no changes added to commit (use "git add" and/or "git commit -a")
+de956ea Implement dynamic scan topic resolution and enhance costmap parameter handling
+164fa8b Task 6: costmap configuration (standalone nav2_costmap_2d + lifecycle manager)
+2cc984a Task 5 fix round part 3: correct two grep blocks to match their commands
+=== FLIP ===
+exit=1
+```
+
+```
+$ cd /home/pi/Desktop/LanderPi-Proximity-Alert/poc_fusion && python3 -m pytest test/ -q 2>&1 | tail -5
+.................................................                        [100%]
+49 passed in 0.30s
+```
+
+### Robot left as found
+
+Each run was stopped by sending `SIGINT` to the launch's own process group
+only — `~/.stop_ros.sh` was never used, no velocity command and no arm
+command was ever published, and the vendor stack was verified intact
+afterwards:
+
+```
+$ docker exec -u ubuntu MentorPi bash -lc '
+source /opt/ros/humble/setup.bash; source /home/ubuntu/ros2_ws/install/setup.bash
+ps -o pid,stat,cmd -p 57875
+echo "=== node list (fresh discovery) ==="
+ros2 node list | grep -E "costmap|poc_fusion" || echo "(no poc_fusion/costmap nodes)"
+'
+    PID STAT CMD
+  57875 Z    [nav2_costmap_2d] <defunct>
+=== node list (fresh discovery) ===
+(no poc_fusion/costmap nodes)
+```
+
+(PID 57875 is a zombie left from run 1, where `nav2_costmap_2d` did not exit
+on `SIGTERM` and was `kill -9`ed by PID — a single targeted signal to one of
+this POC's own processes, not a broad kill. It holds no resources and has no
+ROS presence, as the node list shows. Runs 2–5 shut down cleanly via
+process-group `SIGINT` and needed no such signal.)

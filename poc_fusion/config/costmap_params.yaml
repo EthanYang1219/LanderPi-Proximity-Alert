@@ -86,8 +86,8 @@ costmap:
           # override so this literal never appears twice. See the header
           # comment on scan_topic.
           data_type: "LaserScan"
-          clearing: true #FLIP
-          marking: false #FLIP
+          clearing: true
+          marking: true
           # observation_persistence: 0.0 — a LaserScan sweep is a
           # single-instant 2D reading; there is nothing to persist between
           # scans the way there is for the point cloud below, and holding
@@ -126,13 +126,13 @@ costmap:
           # The scan plane is far inside [0.0, 2.0], so the filter admits
           # the whole scan and there is no margin question to tune.
           min_obstacle_height: 0.0
-          max_obstacle_height: 2.0 #FLIP-restored-to-fixed-value
+          max_obstacle_height: 2.0
 
         pointcloud:
           topic: /poc_fusion/points
           data_type: "PointCloud2"
-          clearing: false #FLIP
-          marking: true #FLIP
+          clearing: true
+          marking: true
           # observation_persistence: 0.3s (~4 frames at the point cloud's
           # measured upstream rate of 14.7 Hz -- see
           # docs/poc_fusion_verification.md Task 5), reduced from an earlier
