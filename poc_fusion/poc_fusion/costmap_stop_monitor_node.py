@@ -64,6 +64,7 @@ from lifecycle_msgs.msg import TransitionEvent
 from lifecycle_msgs.srv import GetState
 from nav2_msgs.msg import Costmap
 from rclpy.duration import Duration
+from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.qos import (
     DurabilityPolicy,
@@ -587,9 +588,23 @@ def main(args=None):
     node = CostmapStopMonitorNode()
     try:
         rclpy.spin(node)
+    except (KeyboardInterrupt, ExternalShutdownException):
+        # On SIGINT/SIGTERM rclpy's own signal handler has already shut the
+        # context down, so an unguarded rclpy.shutdown() in `finally` would
+        # raise `RCLError: failed to shutdown: rcl_shutdown already called`.
+        # Guarding on rclpy.ok() below makes shutdown quiet.
+        #
+        # NOT LIVE-VERIFIED. This guard was written by the Task 7 implementer
+        # against the running stack, but that agent died and its evidence did
+        # not survive, so the "observed on every clean SIGTERM" claim it
+        # carried has been removed rather than restated unbacked. The
+        # mechanism above is standard rclpy behaviour and the guard is
+        # correct either way; a live SIGTERM check is still owed.
+        pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == '__main__':
