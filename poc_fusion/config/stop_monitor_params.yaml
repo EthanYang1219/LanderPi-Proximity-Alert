@@ -143,9 +143,16 @@ costmap_stop_monitor_node:
     # status message can report `fusion_coverage_m` =
     # min(window_forward_m, this) and `lidar_only_beyond_m` = this. It
     # gates NO detection logic -- the costmap's own obstacle_layer height
-    # filter (costmap_params.yaml, max_obstacle_height: 0.94) is what
+    # filter (costmap_params.yaml, pointcloud max_obstacle_height) is what
     # actually bounds the camera's contribution. Restating it here is for
     # the trial record only.
+    #
+    # This value stays 0.94 because it is measured ABOVE THE FLOOR, which
+    # is the frame a trial write-up cares about. The costmap key it mirrors
+    # reads 0.99 rather than 0.94 because nav2 applies that filter in odom,
+    # whose origin sits 0.054 m below base_link and ~0.048 m below the
+    # floor. Same physical ceiling, two frames -- see the Task 8 height
+    # -filter comment in costmap_params.yaml for the measurement.
     camera_coverage_ceiling_m: 0.94
 
     # --- Step 3: grid-rotation assumption ---------------------------------

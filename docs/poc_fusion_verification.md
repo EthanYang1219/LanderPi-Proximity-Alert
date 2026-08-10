@@ -4413,3 +4413,512 @@ $ ros2 node list | grep -iE "costmap|poc_fusion|stop_monitor|depth_preprocess"
 The single `<defunct>` entry is an unreaped exit status, not a live process —
 the container runs no init reaper, as documented in Task 6. No velocity was
 ever published, no arm command was ever sent, and `.stop_ros.sh` was not run.
+
+---
+
+## Task 8: Integration verification of the full chain (2026-08-10 ~22:20–23:58 HKT / 14:20–15:58 UTC)
+
+Task 8's brief is three steps: write the launch file, load all three config YAMLs
+with `scan_topic` passed onward rather than restated, and verify the whole chain
+starts clean alongside the existing bringup without disturbing `proximity_alert`.
+The brief carries **no latency requirement** — latency is Task 12's, and is to be
+measured there, not derived here.
+
+Verification of the third step turned up a **defect in production configuration**
+that made the chain's headline acceptance criterion ("clear environment reports
+CLEAR") impossible to satisfy. That defect, its measurement, its fix and the
+re-verification are the bulk of this section.
+
+**Standing rule applied throughout: consumption of a sensor into the costmap is
+never inferred from a subscription existing.** Every consumption claim below is
+backed by a measurement that would read differently if the sensor were not being
+consumed.
+
+---
+
+### Step 3a: the whole chain runs, all eight stages measured simultaneously
+
+One process subscribed to all eight stages of the pipeline at once for 45.02 s, so
+the rates below are concurrent, not stitched together from separate runs.
+
+```
+   stage                topic                                  msgs     Hz
+1  depth in             /ascamera/.../depth0/image_raw          658  14.62
+2  cleaned              /poc_fusion/depth_cleaned               639  14.19
+3  rectified            /poc_fusion/depth_rect                  651  14.46
+4  points               /poc_fusion/points                       96   2.13
+5  lidar                /scan_raw                               444   9.86
+6  costmap              /costmap/costmap_raw                    294   6.53
+7  status               /costmap_app/monitor_status             215   4.78
+8  safety Bool          /costmap_app/obstacle_detected          277   6.15
+-- content observed --
+  bool_values: {True}
+  costmap_cells: 3600
+  costmap_lethal: 18
+  costmap_max: 254
+  lifecycle: active
+  points_width: 256000
+  scan_min_m: 1.732
+  scan_returns: 171
+  states: {('OBSTACLE', 'lethal_cells_in_window')}
+```
+
+Every stage carries traffic and the lifecycle node reports `active`, so the chain
+is connected end to end.
+
+**MEASURED, NOT ISOLATED — new figure to carry forward.** `/poc_fusion/points` ran
+at **2.13 Hz** here, *below* the ~3–7 Hz band previously ratified for this topic
+(Task 5) and far below the 14.6 Hz its own upstream depth input sustained in the
+same window. This is recorded as an input for Task 11/12, **not explained**. No
+cause was isolated and none is asserted. Task 12's latency figures must be measured
+against whatever rate is observed at that time, never derived from this one.
+
+The `states` line — `OBSTACLE` with 18 lethal cells — was what triggered the rest
+of this section, because the scene was an empty floor.
+
+---
+
+### Step 3b: the reported OBSTACLE was not backed by either sensor
+
+`scan_min_m: 1.732` says the nearest LiDAR return **anywhere in the scan** was
+1.732 m, yet the monitor reported lethal cells inside a window extending only 1.0 m
+forward. Something was marking the near field. Locating every lethal cell in
+`base_link`:
+
+```
+costmap: 60x60 @ 0.05 m, origin=(-1.450, -1.450) frame=odom
+TF odom->base_link: t=(0.000,0.000) yaw=-129.96 deg
+
+lethal cells (cost >= 253): 22
+ x_base(m)  y_base(m)  range(m)  cost
+     0.202      0.124     0.237   254
+     0.234      0.163     0.285   254
+     0.266      0.201     0.334   254
+     0.305      0.169     0.348   254
+     0.298      0.239     0.382   254
+     0.337      0.207     0.395   254
+     0.369      0.245     0.443   254
+     0.401      0.284     0.491   254
+     0.439      0.252     0.506   254
+     0.471      0.290     0.553   254
+nearest lethal cell: 0.237 m
+
+lethal cells inside monitor window (0 < x <= 1.0, |y| <= 0.3): 10
+
+LaserScan: 173 valid returns, nearest 1.735 m
+  within +/-20 deg of forward: 25 returns, nearest 9.987 m
+```
+
+The cells lie on a ray at ~31.5° to port, 0.237 m to 0.60 m out. The LiDAR sees
+nothing closer than 1.735 m anywhere, and nothing closer than 9.987 m ahead. **The
+LiDAR cannot be the source.** Neither could persistence hide it: the scan source
+runs `observation_persistence: 0.0` and the pointcloud source only 0.3 s.
+
+---
+
+### Step 3c: root cause — the height filter is applied in `odom`, not above the floor
+
+`nav2_costmap_2d`'s `ObservationBuffer` transforms each observation into the
+costmap's `global_frame` and **only then** compares z against
+`min_obstacle_height` / `max_obstacle_height`. This costmap's `global_frame` is
+`odom`.
+
+Frame offsets, measured live:
+
+```
+odom->base_link:            t=(+0.0000, +0.0000, +0.0540)
+base_link->lidar_frame:     t=(+0.0730, +0.0000, +0.0387)
+odom->lidar_frame:          t=(-0.0469, +0.0560, +0.0927)
+base_link->depth_camera_link: t=(+0.1049, +0.0209, +0.1918)
+```
+
+`odom->base_link` z is a **fixed** +0.0540 m, not drift — 860 lookups over 20 s:
+
+```
+odom->base_link z over 860 lookups in 20 s:
+  min=0.054000 max=0.054000 mean=0.054000 std=1.31081e-17
+```
+
+The camera measures the floor plane at `base_link` z ≈ −0.006, so **the floor sits
+at `odom` z ≈ +0.048** — above the configured `min_obstacle_height: 0.03`. The
+threshold written to reject the floor was underneath it.
+
+The same 200,961-point cloud frame, same instant, expressed in each frame:
+
+```
+--- cloud expressed in base_link ---
+  n=200961  z: min=-0.2242 p05=-0.0211 median=-0.0060 p95=+0.0251 max=+0.0344
+  points passing height band [0.03, 0.94]: 1984 / 200961 (1.0%)
+
+--- cloud expressed in odom ---
+  n=200961  z: min=-0.1702 p05=+0.0329 median=+0.0480 p95=+0.0791 max=+0.0884
+  points passing height band [0.03, 0.94]: 200596 / 200961 (99.8%)
+```
+
+**1.0% versus 99.8%.** In the frame the filter actually runs in, essentially the
+entire cloud — bare floor — was admitted as obstacle.
+
+Why only 22 lethal cells appeared rather than a plastered field: the LiDAR source
+has `clearing: true` and raytraces the near field clear at ~10 Hz while the camera
+re-marks it at ~2 Hz. The two race. Measured over 30 s with the **robot stationary
+and the scene unchanged**:
+
+```
+costmap samples over 30 s: 184
+lethal cells per sample: min=14 max=123 mean=85.3
+cells lethal in AT LEAST ONE sample: 127
+cells lethal in EVERY sample:        10
+total cell add/remove events between consecutive samples: 6328
+mean churn per publication: 34.6 cells
+
+monitor states seen: {('OBSTACLE', 'lethal_cells_in_window'): 147}
+```
+
+A genuine obstacle gives a stable cell set. 34.6 cells changing per publication on
+a motionless robot in a static scene is the signature of the mark/clear race, and
+the monitor sat at **OBSTACLE in 147 of 147 samples, never once reaching CLEAR**.
+
+---
+
+### Step 3d: the fix
+
+The band is now expressed in `odom`, the frame it is compared in.
+
+| key | before | after | rationale |
+|---|---|---|---|
+| `obstacle_layer.pointcloud.min_obstacle_height` | 0.03 | **0.10** | floor at odom z ≈ 0.048; clears observed floor-noise max 0.0884 by ~12 mm |
+| `obstacle_layer.pointcloud.max_obstacle_height` | 0.94 | **0.99** | same 0.94 m camera ceiling *above the floor*, expressed in odom (0.048 + 0.94 = 0.988) |
+
+The scan source is untouched: its band is [0.0, 2.0] and the scan plane at odom
+z = 0.0927 sits well inside it either way.
+
+**Capability consequence, stated plainly:** the minimum detectable obstacle is now
+roughly **0.052 m tall** (0.10 − 0.048). This is a chosen trade-off ratified by the
+user against the measured floor-noise distribution above, **not a derived bound**.
+Floor noise has been measured on **one surface only**. The granite and metal trial
+surfaces are exactly what Task 11 re-measures; if their floor noise is worse, this
+is the key that moves.
+
+Readback from the running node — the values nav2 actually loaded, not the file:
+
+```
+obstacle_layer.pointcloud.min_obstacle_height        Double value is: 0.1
+obstacle_layer.pointcloud.max_obstacle_height        Double value is: 0.99
+obstacle_layer.scan.min_obstacle_height              Double value is: 0.0
+obstacle_layer.scan.max_obstacle_height              Double value is: 2.0
+```
+
+This readback was reproduced on a **second, independent launch** after the robot
+was power-cycled for charging, so the fix is confirmed to survive a cold start.
+
+**Also corrected in the same file:** the scan source's comment described the LiDAR
+plane as sitting "0.093 m above the floor". 0.0927 is its height above the **odom
+origin**; the floor is at odom z ≈ 0.048, so the plane is only ~0.045 m above the
+actual floor. The conclusion that comment supported is unaffected (the filter
+compares odom z regardless), but the stated fact was wrong and is now fixed.
+
+---
+
+### Step 3e: re-verification after the fix
+
+Identical script, identical stationary scene:
+
+| metric | before fix | after fix |
+|---|---|---|
+| lethal cells per publication | 14–123 (mean 85.3) | 7–14 (mean 9.4) |
+| cells lethal in every sample | 10 | 5 |
+| churn per publication | 34.6 cells | 3.0 cells |
+| monitor state | OBSTACLE 147/147 | **CLEAR 136/136** |
+
+```
+costmap samples over 30 s: 164
+lethal cells per sample: min=7 max=14 mean=9.4
+total cell add/remove events between consecutive samples: 490
+mean churn per publication: 3.0 cells
+
+monitor states seen: {('CLEAR', 'window_clear'): 136}
+```
+
+And the surviving cells are now outside the window and at plausible ranges:
+
+```
+lethal cells (cost >= 253): 8
+nearest lethal cell: 1.711 m
+lethal cells inside monitor window (0 < x <= 1.0, |y| <= 0.3): 0
+```
+
+With the scene bare, the depth cloud's odom z now maxes at +0.0886, entirely below
+the 0.10 threshold, so the camera correctly marks **nothing**. That is the desired
+behaviour, and it is also why proving depth *consumption* required an actual
+obstacle (Step 3g).
+
+---
+
+### Step 3f: LiDAR observations are demonstrably consumed
+
+Each lethal cell was transformed into `lidar_frame` and matched against the
+**concurrent** scan in (bearing, range) space. A cell that is genuinely a LiDAR
+mark must have a scan return at its own bearing agreeing in range to about one cell
+diagonal (tolerance 0.08 m, bearing tolerance 3°).
+
+```
+lethal cells: 12   valid scan returns: 177
+
+ cell_bearing  cell_range  scan_range   d_range   verdict
+       -108.2       0.455       6.341    +5.886  MISMATCH
+        -64.5       0.900       0.897    -0.003     MATCH
+        -63.2       0.945       0.897    -0.048     MATCH
+       -103.2       1.705       1.736    +0.031     MATCH
+       -101.7       1.728       1.736    +0.008     MATCH
+       -104.0       1.750       1.741    -0.009     MATCH
+       -102.5       1.773       1.741    -0.032     MATCH
+         96.2       1.774       1.794    +0.020     MATCH
+         95.0       1.809       1.810    +0.001     MATCH
+         92.8       1.811       1.810    -0.001     MATCH
+         97.3       1.811       1.810    -0.001     MATCH
+         93.9       1.845       1.827    -0.018     MATCH
+
+lethal cells backed by a concurrent scan return (within 0.08 m at same bearing): 11 / 12
+```
+
+**11 of 12.** This is direct evidence of LiDAR consumption into the costmap, not
+inference from a subscription.
+
+**Correction recorded.** The first version of this cross-check reported only 4/12
+and claimed five cells had *no scan return at their bearing*. That was a bug in the
+checking script, not a finding: the LD19's `angle_min` is ~0 so beam bearings run
+0…2π, while `atan2`-derived cell bearings run −π…π, and the comparison did not wrap.
+A cell at −105° was being compared against beams at +255° — the same direction — and
+never matched. The claim was withdrawn and the script fixed before any conclusion
+was drawn from it. Per-sector scan validity was measured separately and confirms
+those bearings do carry finite returns:
+
+```
+total beams 504, finite in-range 181 (35.9%)
+ sector(deg)  beams  finite  inf/oor   nan
+    240..255     21       1        0    20
+    255..270     21      16        0     5
+    270..285     21      16        0     5
+    285..300     21      19        0     2
+```
+
+**DEFERRED, NOT EXPLAINED.** The one mismatched cell sits at −108.2°, range 0.455 m,
+where the concurrent scan reports 6.341 m — a mark with measured free space in front
+of it that the clearing raytrace has not removed. It is outside the monitor window
+and the cell set is transient (7–14 cells), so it does not affect any Task 8
+criterion. No cause is isolated and none is asserted. Recorded for the final
+whole-branch review. The risk it represents — a ghost mark that cannot be cleared
+landing *inside* the window — would fail safe (permanent OBSTACLE, robot stops)
+rather than fail dangerous.
+
+Separately noted from the same measurement: only **35.9%** of the LD19's 504 beams
+carry finite in-range returns, with a contiguous all-`nan` arc from ~105° to ~240°.
+Recorded as an observation; not investigated here.
+
+---
+
+### Step 3g: Phase A — controlled obstacle, present then removed
+
+Robot **stationary throughout; no velocity was ever published and no wheel or servo
+was commanded.** The only thing that moved was the box, placed and removed by hand.
+
+Per-second capture of state, Bool, lethal cells in window, and — crucially — the
+attribution columns `scan_win` (LaserScan returns whose endpoint falls in the
+window) and `pts_win` (depth points in the window passing the production odom band
+[0.10, 0.99]).
+
+| phase | wall (UTC) | samples | state | Bool | win_cells | scan_win | pts_win |
+|---|---|---|---|---|---|---|---|
+| baseline, clear | 15:54:45–15:55:54 | 70 | CLEAR, all | False | 0 | 0 | 0 |
+| box present | 15:55:55–15:56:56 | 62 | OBSTACLE, all | True | 11–14 | ~80 | ~21,400 |
+| box removed | 15:56:57–15:58:59 | 64+ | CLEAR, all | False | 0 | 0 | 0 |
+
+Rising edge, within a single sample:
+
+```
+15:55:53     CLEAR             window_clear  False         0   1.519        0       0
+15:55:54     CLEAR             window_clear  False         0   1.550        0       0
+15:55:55  OBSTACLE   lethal_cells_in_window   True        11   0.326      117   69395
+15:55:56  OBSTACLE   lethal_cells_in_window   True        13   0.326      105   69202
+15:55:57  OBSTACLE   lethal_cells_in_window   True        13   0.432       81   21388
+```
+
+Falling edge:
+
+```
+15:56:56  OBSTACLE   lethal_cells_in_window   True        14   0.432       80   21398
+15:56:57     CLEAR             window_clear  False         0   1.519        0   20531
+15:56:58     CLEAR             window_clear  False         0   1.519        0       0
+```
+
+Exactly **three state changes** across 260 s and 1669 Bool messages. The nearest
+lethal cell reads 1.519 m both before placement and after removal — the same
+background structure — so the scene demonstrably reset rather than merely quieting.
+
+This establishes, with captured evidence:
+
+- **Depth observations are consumed.** `pts_win` went 0 → 69,395 at the instant of
+  placement and returned to 0 on removal. A subscription that was not being
+  consumed could not move that number.
+- **The costmap→monitor→Bool chain carries a real obstacle signal.** State and Bool
+  tracked the physical object in both directions.
+- **Clear environment reports CLEAR** (70 consecutive samples before, 64+ after).
+- **Recovery works** and is not a one-sample flicker.
+- **The cluster filter does its job.** In the first Phase A run the monitor held
+  CLEAR while `win_cells` was 1 — a lone 25 cm² cell correctly rejected by
+  `min_cluster_area_cm2: 100.0` rather than tripping a stop.
+
+**Superseded run, recorded for honesty.** An earlier Phase A attempt (14:24–14:28
+UTC) was **confounded**: the capture was already `OBSTACLE` at its first sample
+(22 window cells, `scan_win` 43, `pts_win` 0) because the box went in before the
+baseline was established. Its *falling* edge was clean — CLEAR at 14:26:20 held for
+131 s across 132 consecutive samples with zero relapses — but its rising edge proves
+nothing, so the run above was performed from a verified-clear baseline and
+supersedes it. The superseded run is not used to support any claim.
+
+---
+
+### NOT LIVE-VERIFIED — Phase B, depth-only detection of an overhang
+
+**Status: pending. No evidence exists for this claim and none is asserted.**
+
+Phase A used a box resting on the floor, which **both** sensors see (`scan_win`
+≈ 80 alongside `pts_win` ≈ 21,400). It therefore proves depth is consumed, but it
+does **not** show the depth camera detecting anything the LiDAR misses — which is
+the fusion's actual contribution and the geometry behind the 2026-07-22 pedestal
+desk collision.
+
+The discriminating test is an object whose lowest solid part is above the floor
+with nothing beneath it, so the LiDAR's fixed ~0.045 m scan plane passes
+underneath. The passing result is **`scan_win` == 0 with `pts_win` > 0 and state
+OBSTACLE**.
+
+Three attempts were made. The first was aborted at 37 samples when the session was
+stopped. The second was cancelled before placement because a suitable overhanging
+object was not available. The third ran to completion (261 samples, 16:05:55–16:10:15
+UTC) and **failed**:
+
+```
+samples: 261    CLEAR 202    OBSTACLE 59
+max pts_win:   0
+max scan_win: 10
+max win_cells: 5
+samples with pts_win > 0 AND scan_win == 0:  0
+```
+
+```
+16:07:05  OBSTACLE   lethal_cells_in_window   True         5   0.941        7       0
+16:07:06  OBSTACLE   lethal_cells_in_window   True         5   0.834        9       0
+16:07:07     CLEAR             window_clear  False         3   0.834        8       0
+16:07:08  OBSTACLE   lethal_cells_in_window   True         4   0.834        8       0
+```
+
+`pts_win` was **0 for every one of the 261 samples**. The LiDAR saw the object
+(`scan_win` 7–10); the depth camera never did. The discriminating query returned
+zero samples.
+
+**The failure was in the test instruction, not in the pipeline or the operator.**
+The placement asked for was "lowest solid part ≥ 0.15 m above the floor, 0.5–0.7 m
+ahead". That is outside this camera's field of view. Measured afterwards by
+projecting the **real ray directions of one live 201,738-point cloud** to candidate
+obstacle heights, counting only rays crossing within the monitor window's ±0.3 m
+half-width:
+
+```
+camera origin in base_link: (0.105, 0.021, 0.192)  -> 0.198 m above floor
+observed floor patch in base_link: x 0.217..0.669   y -0.353..0.344
+
+ obstacle height  base_link z     reachable x (m)    rays
+           0.05m        0.044       0.18 .. 0.61   201660
+           0.10m        0.094       0.16 .. 0.44   201738
+           0.15m        0.144       0.13 .. 0.27   201738
+           0.20m        0.194        unreachable        0
+           0.25m        0.244        unreachable        0
+           0.30m        0.294        unreachable        0
+           0.40m        0.394        unreachable        0
+           0.50m        0.494        unreachable        0
+```
+
+At 0.15 m the camera reaches only x 0.13–0.27 m — the object was placed 2–5x
+beyond that. At and above 0.20 m nothing is reachable at all: no ray in the cloud
+rises above ~19.3° below horizontal, consistent with a ~40° downtilt.
+
+**MEASURED, NOT ISOLATED.** Whether the 0.669 m far cutoff is the FOV edge or
+grazing-angle dropout on the floor was **not** isolated, and no cause is asserted.
+What is measured is that on this scene the camera contributed no ray above
+`base_link` z ≈ 0.194.
+
+This finding matters well beyond Phase B, and is flagged for the final whole-branch
+review and for Task 11:
+
+- `camera_coverage_ceiling_m: 0.94` (stop_monitor_params.yaml) and
+  `max_obstacle_height: 0.99` (costmap_params.yaml) are **height-filter bounds, not
+  achieved coverage**. Neither is reached in practice. The parameters are not wrong
+  — a filter bound above the achievable ceiling admits nothing extra — but a trial
+  write-up must not quote 0.94 m as camera coverage.
+- The camera's usable contribution at its current pose is a **narrow near-floor
+  band, roughly x 0.16–0.61 m for obstacles 0.05–0.10 m tall**. The monitor window
+  extends to 1.0 m, so most of the window is LiDAR-only in practice, not just the
+  far 6 cm the config comment describes.
+- This is quantitative evidence for the 2026-07-22 pedestal-desk blind spot: at
+  desk-underside height the camera has no rays at all.
+
+Until a Phase B is run inside the measured envelope, **depth-only detection of
+LiDAR-invisible geometry remains unverified**, and no claim about it may appear in
+the write-up. A viable retry geometry follows from the table above: overhang
+underside **0.10–0.14 m** above the floor (above the LiDAR's ~0.045 m plane and
+above the ~0.052 m minimum detectable height) placed at **x ≈ 0.20–0.30 m**, with
+supports outside ±0.3 m laterally.
+
+---
+
+### Task 8 status summary
+
+| goal | status |
+|---|---|
+| Sensor data enters the pipeline | VERIFIED — all 8 stages carrying traffic concurrently |
+| Costmap produces expected obstacle representation | VERIFIED — after the height-band fix; 11/12 cells scan-backed |
+| Monitor positively validates active costmap | VERIFIED — `get_state` returns `active` on two independent launches |
+| Clear environment → CLEAR | VERIFIED — 136/136, and 70 + 64 samples either side of Phase A |
+| Lethal obstacle → safety response | VERIFIED — OBSTACLE + Bool True, 62/62 samples |
+| Obstacle removal → recovery | VERIFIED — three clean state changes, no flicker |
+| Timing/latency | NOT REQUIRED by the Task 8 brief — Task 12 |
+| Robot stationary unless a test requires motion | HELD — no motion was ever commanded in Task 8 |
+| Depth-only detection of an overhang | **NOT LIVE-VERIFIED — pending** |
+
+### Robot left as found
+
+```
+$ kill -TERM 13518 13602 13604 13606 13608 13610
+$ ros2 node list | wc -l
+28
+$ ros2 node list | grep -iE "costmap|poc_fusion|stop_monitor|depth_preprocess"
+(none of ours - clean)
+$ ps -eo pid,stat,cmd | grep -E "poc_fusion|nav2_costmap|lifecycle_manager|depth_preprocess"
+  13606 Z    [nav2_costmap_2d] <defunct>
+```
+
+28 vendor nodes remain, matching the baseline recorded at the end of Task 6, and
+`proximity_alert` was undisturbed throughout. The single `<defunct>` entry is an
+unreaped exit status, not a live process — the container runs no init reaper, as
+documented in Task 6. No velocity was ever published, no arm or servo command was
+ever sent, and `.stop_ros.sh` was not run.
+
+### Deferred to the final whole-branch review
+
+Recorded here so none of these is lost; none blocks a Task 8 criterion, and none is
+explained.
+
+1. **Un-cleared ghost cell** at −108.2°, range 0.455 m, with the concurrent scan
+   reading 6.341 m (Step 3f). Outside the window; fails safe, not dangerous.
+2. **`/poc_fusion/points` at 2.13 Hz** (Step 3a), below the previously ratified
+   ~3–7 Hz band. An input for Tasks 11/12, never an explanation.
+3. **State chatter at the cluster-area threshold.** In the failed Phase B run
+   `win_cells` oscillated 3–5 against `min_cluster_area_cm2: 100.0` (= exactly 4
+   cells at 25 cm² each), flipping CLEAR/OBSTACLE across the boundary. No
+   hysteresis exists on this threshold. Whether that matters is a Task 11 tuning
+   question against trial data.
+4. **Camera coverage envelope** far tighter than the configured filter ceilings
+   (Phase B section). Affects how camera coverage may be described in the write-up.
+5. **LD19 beam validity: 35.9%** of 504 beams finite in-range, with an all-`nan`
+   arc ~105°–240° (Step 3f).
