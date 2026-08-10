@@ -4922,3 +4922,231 @@ explained.
    (Phase B section). Affects how camera coverage may be described in the write-up.
 5. **LD19 beam validity: 35.9%** of 504 beams finite in-range, with an all-`nan`
    arc ~105°–240° (Step 3f).
+
+## Task 9: Stop action + audible alert (2026-08-11 ~01:12–01:55 HKT / 2026-08-10 ~17:12–17:55 UTC)
+
+Every run in this section was **observe-only**: the stack was launched with
+`publish_cmd_vel:=false`, so `stop_action_node` created **no Twist publisher at
+all**. No wheel could be commanded. This is stated up front because most of what
+follows looks like stop-path verification and is not — see "What Task 9 does NOT
+yet establish".
+
+### Design: what the node decides, and what decides it
+
+All decision logic is in `poc_fusion/lib/stop_action.py`, which imports no ROS and
+is unit-tested off-robot. `stop_action_node.py` is a shell that maps topics onto
+it. The four reasons are disjoint and never share an output value:
+
+| Reason | Trigger | stop | alert |
+|---|---|---|---|
+| `no_obstacle_signal` | no Bool ever received | **True** | no |
+| `obstacle_signal_stale` | age > `signal_staleness_bound_s` | **True** | no |
+| `obstacle_detected` | Bool True and fresh | **True** | on rising edge only |
+| `clear` | Bool False and fresh | False | no |
+
+The two fail-safe reasons stop the robot but deliberately do **not** fire the
+alert: an alert means "an obstacle was detected", and neither of those is a
+detection. Conflating them would teach an operator to distrust the buzzer.
+
+**Why absence must mean stop.** The monitor publishes *no* `std_msgs/Bool` while
+degraded (Task 7). On the derived Bool topic, UNKNOWN is therefore a **gap in the
+stream**, indistinguishable from a dead monitor, a crashed container or an
+unplugged camera. Absence of a message is never permission to drive, so the
+staleness timeout is the whole mechanism that makes UNKNOWN safe.
+
+### Step 1: unit tests, with mutation testing
+
+`test_stop_action.py`, 16 tests. Tests were proven to have teeth by mutation:
+
+| Mutation | Result |
+|---|---|
+| `stop=True` → `stop=False` for `no_obstacle_signal` | **caught** |
+| `>` → `>=` on the staleness comparison | **caught** |
+| drop the `previous_reason` guard (alert every tick) | **caught** |
+| `obstacle` checked before staleness | **caught** |
+
+4/4 caught. Full suite at the close of this task: **121 passed**.
+
+### Step 2: live safety gates (observe-only, zero motion)
+
+Launched with `stop_action:=true publish_cmd_vel:=false` (log `/tmp/t9_launch2.log`).
+
+**Gate 1 — startup fail-safe.** Before any monitor message existed, the node held
+a stop and said why:
+
+```
+[stop_action_node]: stop action: None -> no_obstacle_signal (stop=True)
+[stop_action_node]: holding a stop with NO live obstacle signal
+                    (no_obstacle_signal). This is fail-safe, not a detection.
+```
+
+then released only once the monitor reached CLEAR, 4.4 s later:
+
+```
+[stop_action_node]: stop action: no_obstacle_signal -> clear (stop=False)
+```
+
+**Gate 2 — monitor death.** In an earlier run (`/tmp/t9_launch1.log`) the monitor
+was SIGKILLed. `stop_active` flipped false→true and the reason was correct:
+
+```
+[stop_action_node]: stop action: clear -> obstacle_signal_stale (stop=True)
+[stop_action_node]: holding a stop with NO live obstacle signal
+                    (obstacle_signal_stale). This is fail-safe, not a detection.
+```
+
+**Gate 3 — no publisher exists.** The decisive check that this run could not move
+the robot:
+
+```
+$ ros2 topic info /cmd_vel
+Type: geometry_msgs/msg/Twist
+Publisher count: 0
+Subscription count: 1
+```
+
+**Gate 4 — output rate.** `/costmap_app/stop_active` measured at **10.006 Hz**
+(window 96, min 0.091 s, max 0.110 s) against `tick_rate_hz: 10.0`.
+
+### Measured UNKNOWN gaps — an updated number
+
+Two UNKNOWN episodes occurred in the ~4-minute run, extracted from all 74 monitor
+state transitions:
+
+| Episode | Duration | Cause |
+|---|---|---|
+| startup | 0.992 s | `costmap_not_active` — before the costmap went active |
+| steady state | **0.303 s** | `tf_lookup_failed` |
+
+The startup episode is covered by the `no_obstacle_signal` fail-safe and is not a
+steady-state gap. **The steady-state gap of 0.303 s is a new measurement and is
+larger than the previously recorded worst gap of 0.2612 s.** It was absorbed by
+`signal_staleness_bound_s: 0.75` without a degraded stop, which is the designed
+behaviour. Recorded plainly: the margin against the configured bound is 2.5×.
+This is a fresh measurement of a real gap, not a re-opening of the withdrawn
+claim about 0.40 s, which remains withdrawn and is not revived here.
+
+### The alert path
+
+`_fire_alert()` spawns `aplay -D <device> <wav>` non-blocking, deliberately
+identical to the mechanism already in `proximity_alert`'s `path_tracker` (line
+383) so this POC introduces no second audio mechanism. `proximity_alert` is
+frozen for the surface trials, so extracting the shared code was not an option.
+
+What is established: the WAV exists (`/home/ubuntu/shared/audio/obstacle_alert.wav`,
+30912 bytes), `aplay` exists (`/usr/bin/aplay`), `alert_enabled=True`, and 17
+rising edges fired the path with **no** `could not launch aplay` warning — so
+every `Popen` succeeded.
+
+What is **not** established: **audibility**. `Popen` is non-blocking with output
+discarded, so a successful spawn is not proof of sound. Only a human in the room
+can close this, and it is listed as pending below rather than assumed.
+
+### What Task 9 does NOT yet establish
+
+- **That a stop actually stops the robot.** Not tested. Requires motion.
+- **That the stop persists.** The STM32 latches the last commanded velocity
+  forever, so a zero Twist at costmap rate does not hold a stop. `motion_watchdog`
+  (`/cmd_vel_unsafe` → `/cmd_vel` at 20 Hz) is **required** in the loop, and when
+  it is, `cmd_vel_topic` must be repointed at its **input**, `/cmd_vel_unsafe`.
+- **Publisher arbitration.** ROS 2 does not arbitrate publishers. If anything else
+  publishes to the same topic, last-write-wins and `zero_twist_burst: 3` is a
+  mitigation, not a fix. The correct fix is a series gate; that is out of Task 9
+  scope and is documented in the node's docstring rather than silently hoped away.
+- **Audibility of the alert** (above).
+
+`/controller/cmd_vel` has 5 vendor publishers and is never written to; the node
+raises `ValueError` at construction if `cmd_vel_topic` is set to it.
+
+### Launch default is deliberately unsafe-by-omission
+
+`stop_action` defaults to **`'false'`** in `poc_fusion.launch.py`. The Task 8
+launch command therefore remains incapable of moving a wheel even after this task
+added a node that can. Opting in is explicit.
+
+## Task 12: Latency budget — Steps 1–4
+
+### Step 1: `latency_recorder_node.py`
+
+On each False→True transition of `/costmap_app/obstacle_detected`, records
+`now − (stamp of the newest depth frame that had ARRIVED before the transition)`.
+`/poc_fusion/depth_cleaned` carries the camera stamp verbatim (Task 4 Step 1),
+which is why it is the origin. **This node commands nothing.**
+
+Pure logic lives in `lib/latency_stats.py`, 18 tests. Mutation testing found **two
+surviving mutants — my own tests were weaker than their docstrings claimed**:
+
+1. *Select the reference frame by `stamp` instead of by arrival.* Survived because
+   the test put the late frame outside the eligibility window, so the **filter**
+   answered it and the comparator was never exercised. Fixed by making both frames
+   arrive before the transition with stamps in the opposite order to arrivals.
+2. *Truncate the p95 rank instead of rounding up.* Survived because at n=20,
+   `ceil(0.95n)` and `int(0.95n)` both land on rank 19. Fixed by adding n=3
+   (2.85 → rank 3 vs rank 2) and n=5 cases.
+
+Both mutants fail correctly now. Recorded because the first version of this
+section would have claimed tested behaviour that was not actually pinned.
+
+### Step 2: ≥20 rising edges
+
+**35 edges collected, 0 dropped**, over a 252.8 s window (2026-08-10 17:44:56 →
+17:49:09 UTC), by repeatedly presenting an obstacle. Requirement was ≥20.
+
+Dataset audited before use, not merely trusted:
+
+| Check | Result |
+|---|---|
+| Rows | 35 (+ header) |
+| `edge_index` contiguous 1..n | yes — single run, no appended second run |
+| `transition_time_s` monotonic | yes |
+| Non-positive latencies | 0 |
+| Frames selected that arrived **after** their edge | 0 |
+| `DROPPED` warnings in log | 0 |
+
+Node's own final report:
+
+```
+FINAL latency over 35 edges (LOWER BOUND, excludes camera exposure):
+median 75.4 ms, p95 115.8 ms, min 42.0 ms, max 116.4 ms, dropped 0.
+Samples: /tmp/poc_fusion_latency.csv
+```
+
+**median 75.4 ms, p95 115.8 ms** (p95 nearest-rank, an actually-observed value,
+not interpolated). Inter-edge gaps: min 3.4 s, median 6.7 s, max 20.7 s.
+
+### Step 3: what this figure covers and what it does not
+
+**Covers:** depth preprocessing, rectification, projection, costmap update, the
+costmap publish interval, and monitor evaluation — everything this POC adds.
+
+**Does not cover:** the camera's own exposure and internal processing latency,
+which is unrecoverable from message stamps and would need external high-frame-rate
+video to capture.
+
+The reported figure is a **lower bound on true physical-entry-to-stop latency**.
+It is **not** end-to-end, and it is **not** stop-completion latency — it ends when
+the Bool flips, not when the wheels have stopped. The wheel-stop segment is
+unmeasured because Task 9 Step 3 has not run.
+
+### Step 4: check against the budget
+
+**Target: p95 ≤ 300 ms. Measured p95 = 115.8 ms. PASS**, with 2.6× margin.
+
+The target is met by the added pipeline alone, so the escalation path in the plan
+(the Task 4 median filter kernel, explicitly **not** a further publish-rate
+increase) is not triggered and no tuning lever was pulled. `publish_frequency`
+remains at the 10 Hz set in Task 6 Step 1.
+
+Caveat carried forward rather than buried: because the figure excludes camera
+exposure and the wheel-stop segment, **the true physical latency is higher by an
+unmeasured amount**. The 2.6× margin is against the lower bound, not against the
+real number. Task 13's CPU figures are not yet collected, so the latency/compute
+tradeoff is not yet visible.
+
+### Sample set archived
+
+`/tmp/poc_fusion_latency.csv` is ephemeral, so the 35-sample set backing the
+headline numbers is committed at
+`docs/poc_fusion_data/task12_latency_2026-08-10.csv`. It is POC evidence and is
+deliberately kept out of `organized_data/`, which belongs to the frozen
+surface-trial pipeline.
