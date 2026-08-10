@@ -5150,3 +5150,95 @@ headline numbers is committed at
 `docs/poc_fusion_data/task12_latency_2026-08-10.csv`. It is POC evidence and is
 deliberately kept out of `organized_data/`, which belongs to the frozen
 surface-trial pipeline.
+
+## Task 9 Step 3: does a stop PERSIST? — **FAILED** (2026-08-11 ~02:07 HKT / 2026-08-10 ~18:07 UTC)
+
+**First test in this branch to command motion.** Robot was hand-held by the
+operator with the wheels clear of the ground for the entire run. Result is a
+**FAIL**, and it blocks physical floor testing.
+
+### Topology under test
+
+Verified before any wheel turned:
+
+```
+/cmd_vel_unsafe : Publisher = stop_action_node   Subscriber = motion_watchdog
+/cmd_vel        : Publisher = motion_watchdog    Subscriber = odom_publisher
+```
+
+`motion_watchdog` owns `/cmd_vel` exclusively. `/controller/cmd_vel` was never
+touched. Pre-motion baseline: 63/63 `/cmd_vel` samples at 0.0.
+
+### Method, and why it is shaped this way
+
+The harness publishes forward `linear.x=0.05` to `/cmd_vel_unsafe` at 10 Hz **and
+keeps publishing for the whole run**, then the monitor is SIGKILLed mid-motion.
+
+Two deliberate choices:
+
+1. **The motion source never yields.** A navigation or teleop source has no idea
+   an obstacle appeared. If a stop only holds once the motion source gives up, it
+   is not a stop.
+2. **The trigger is monitor-death, not a real obstacle.** With the wheels off the
+   ground the wheel encoders advance `odom` while the robot is physically still,
+   so obstacle marks recede in `odom` and a real obstacle can decay to `clear` on
+   its own. That would produce a restart that looks like a stop-path failure but
+   is an artifact of the robot being airborne. `obstacle_signal_stale` cannot
+   decay that way, so a restart under this trigger has no alternative explanation.
+
+### Result: detection passed, actuation failed
+
+```
+t=1.699 s   monitor SIGKILLed
+t=2.472 s   /cmd_vel -> 0.0     (0.773 s after kill)
+t=2.521 s   /cmd_vel -> 0.05    <-- forward command returns
+t=2.571 s   /cmd_vel -> 0.0
+t=2.623 s   /cmd_vel -> 0.05
+            ... alternating at ~10 Hz for the remaining 9.5 s
+```
+
+| Measure | Value |
+|---|---|
+| Detection latency (kill → `obstacle_signal_stale`) | **0.700 s** (bound 0.75 s) — PASS |
+| Time to first zero on `/cmd_vel` | 0.773 s after kill |
+| Samples after the kill | 213 |
+| **Non-zero samples after the kill** | **110 (51.6 % forward duty cycle)** |
+| Stop held? | **NO** |
+
+The decision layer was correct throughout: `clear → obstacle_signal_stale
+(stop=True)` fired on time and `stop_active` stayed true. **The robot kept
+receiving forward commands roughly half the time while the system reported that
+it was holding a stop.** On the floor it would have continued crawling into the
+obstacle.
+
+### Cause — measured, not inferred
+
+`stop_action_node` and the motion source both publish to `/cmd_vel_unsafe`. ROS 2
+does not arbitrate publishers; it is last-write-wins. At matched ~10 Hz rates that
+is a coin flip every cycle.
+
+**`zero_twist_burst: 3` is not merely imperfect against this, it is ineffective.**
+Three zeros are overwritten by the next forward message 50 ms later. The parameter
+was documented as "a mitigation, not a fix" — this run shows it does not mitigate
+either, and that wording in `stop_action_node.py` is now too generous.
+
+### Consequence
+
+**Physical floor testing is BLOCKED.** The gating fix is the **series gate**
+already named in `stop_action_node.py`'s docstring as out of Task 9 scope: the
+motion source must flow *through* the stop node rather than publish alongside it,
+so that a stop removes the forward command instead of merely competing with it.
+No parameter change can close this — it is a topology defect, and any tuning of
+`zero_twist_burst` would only alter the duty cycle.
+
+Nothing about the detection chain (Tasks 4–8, 12) is invalidated: sensing, costmap,
+monitor and decision logic all behaved correctly. What is disproven is the claim
+that a detection results in a stop.
+
+Sample set: `docs/poc_fusion_data/task9_step3_part1_stop_persistence.csv` (239 rows).
+
+### Part 2 not run
+
+The wall-obstacle run was cancelled rather than executed. It exercises the same
+broken actuation path with a different trigger and could not have changed the
+conclusion; spinning the wheels again for no new evidence was not justified.
