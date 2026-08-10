@@ -30,6 +30,7 @@ setup(
         'console_scripts': [
             'depth_preprocess_node = poc_fusion.depth_preprocess_node:main',
             'costmap_stop_monitor_node = poc_fusion.costmap_stop_monitor_node:main',
+            'stop_action_node = poc_fusion.stop_action_node:main',
             'latency_recorder_node = poc_fusion.latency_recorder_node:main',
         ],
     },

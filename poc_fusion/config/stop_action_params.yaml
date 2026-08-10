@@ -1,0 +1,93 @@
+# stop_action_node parameters (Task 9).
+#
+# The POC's ONLY response to a detection: full stop plus audible alert. No
+# avoidance maneuver -- design doc section 11 defers consuming the costmap in
+# avoidance.py to protect the surface-trial dataset (Task 9 Step 4).
+#
+# All decision rules are in poc_fusion/lib/stop_action.py and unit-tested
+# off-robot. See docs/poc_fusion_verification.md "Task 9" for live evidence.
+stop_action_node:
+  ros__parameters:
+
+    # --- Input ------------------------------------------------------------
+    #
+    # The monitor's DERIVED Bool, not its authoritative tri-state. The
+    # monitor publishes NOTHING here while UNKNOWN (monitor_state
+    # .should_publish_bool()), so on this topic UNKNOWN is a GAP IN THE
+    # STREAM, indistinguishable from a dead monitor. stop_action.py treats
+    # every gap as a reason to stop, never as permission to drive.
+    obstacle_detected_topic: /costmap_app/obstacle_detected
+
+    # --- Output: velocity -------------------------------------------------
+    #
+    # Task 9 Step 2: from config, defaulting to /cmd_vel. NEVER
+    # /controller/cmd_vel -- that topic already carries five vendor
+    # publishers (lidar_app, line_following, object_tracking, hand_gesture,
+    # joystick_control) and ROS 2 arbitrates between publishers not at all.
+    # The node raises at startup if this is set to /controller/cmd_vel.
+    #
+    # WHEN motion_watchdog IS IN THE LOOP, SET THIS TO ITS INPUT TOPIC
+    # (/cmd_vel_unsafe by default). motion_watchdog OWNS its output topic and
+    # republishes at 20 Hz; publishing into its output would be overwritten
+    # on the very next watchdog tick. Task 9 Step 3 requires the watchdog,
+    # because a zero Twist at costmap rate does NOT hold a stop on this
+    # platform -- the STM32 latches the last commanded velocity forever,
+    # which is what allowed the previously recorded 8-minute uncommanded
+    # spin. Stop-hold is deliberately NOT reimplemented here.
+    cmd_vel_topic: /cmd_vel
+
+    # Zeros published per tick. ROS 2 does not arbitrate publishers, so when
+    # a driver is commanding motion on the same topic this node's zeros
+    # INTERLEAVE with its commands rather than overriding them. A burst makes
+    # the last message in each tick window a zero far more often than not.
+    # This is a mitigation, NOT a fix: the correct fix is a series gate that
+    # forwards the driver's Twist unless stopping, which is out of Task 9's
+    # scope and is recorded rather than silently added.
+    zero_twist_burst: 3
+
+    # --- Output: observability -------------------------------------------
+    #
+    # Published every tick regardless of state, so silence from this node is
+    # itself a symptom rather than being confused with "not stopping". Also
+    # the measurement point Task 12 times the stop path against.
+    stop_active_topic: /costmap_app/stop_active
+
+    # --- Safety switch ----------------------------------------------------
+    #
+    # false runs every decision, log line and alert normally but creates NO
+    # Twist publisher at all, so no wheel can be commanded. Used to verify
+    # the full chain on a stationary robot before any motion test. The node
+    # logs a loud warning in this mode so an observe-only run can never be
+    # mistaken for a live safety test.
+    publish_cmd_vel: true
+
+    # --- Staleness --------------------------------------------------------
+    #
+    # Sized against the MONITOR's publish period, not the costmap's: the
+    # monitor publishes the Bool on its own status timer
+    # (status_publish_period_s: 0.2, i.e. 5 Hz) whenever the state is
+    # determinate. 0.75 s therefore means roughly four consecutive monitor
+    # publications were missed. It matches the monitor's own
+    # costmap_staleness_bound_s so the two layers degrade on the same
+    # timescale rather than one masking the other.
+    #
+    # MEASURED input, not derived: /costmap_app/obstacle_detected was
+    # observed at 6.15 Hz over a concurrent 45.02 s capture (Task 8 Step 3a).
+    # Task 12 re-measures; do not re-derive this bound from nominal rates.
+    signal_staleness_bound_s: 0.75
+
+    # How often the decision runs, independent of Bool arrivals -- a stop
+    # must keep being commanded while the input is silent.
+    tick_rate_hz: 10.0
+
+    # --- Alert ------------------------------------------------------------
+    #
+    # Deliberately the SAME mechanism as proximity_alert's path_tracker: a
+    # non-blocking `aplay -D <alsa_device> <wav_path>`, same defaults. The
+    # code is not imported because that playback is a private method on
+    # path_tracker's Node class and proximity_alert is frozen for the surface
+    # trials. Fires ONCE on the rising edge, never on a stale reading -- the
+    # alert claims a sighting, and a stale reading is not one.
+    alert_enabled: true
+    wav_path: /home/ubuntu/shared/audio/obstacle_alert.wav
+    alsa_device: plughw:2,0

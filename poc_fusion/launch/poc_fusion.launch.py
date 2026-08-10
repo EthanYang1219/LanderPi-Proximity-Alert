@@ -36,7 +36,9 @@ than being force-fit into the container.
 """
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import Shutdown
+from launch.actions import DeclareLaunchArgument, Shutdown
+from launch.conditions import IfCondition
+from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import ComposableNodeContainer, Node
 from launch_ros.descriptions import ComposableNode
 
@@ -307,12 +309,66 @@ def generate_launch_description():
         parameters=[stop_monitor_params],
     )
 
-    # --- Task 8 finishes wiring and verifies the whole chain here ---
+    # --- Section: stop action (Task 9) --------------------------------------
+    #
+    # OFF BY DEFAULT, and that default is a safety decision, not laziness.
+    # This is the first and only node in this launch that can command a
+    # velocity. Task 8 verified the whole sensing chain with `ros2 launch
+    # poc_fusion poc_fusion.launch.py` and nothing in that launch could move
+    # a wheel; keeping the default at false preserves exactly that property,
+    # so the verified command stays safe to run at any time.
+    #
+    # Enable explicitly, and read stop_action_node.py's REQUIRED TOPOLOGY
+    # section first -- with `proximity_alert`'s motion_watchdog in the loop
+    # (which Task 9 Step 3 requires, because a zero Twist at costmap rate
+    # does NOT hold a stop on this platform), cmd_vel_topic must be the
+    # WATCHDOG'S INPUT:
+    #
+    #   ros2 launch poc_fusion poc_fusion.launch.py \
+    #       stop_action:=true cmd_vel_topic:=/cmd_vel_unsafe
+    #
+    # `publish_cmd_vel:=false` runs every decision, log line and alert but
+    # creates no Twist publisher at all -- the observe-only mode used to
+    # verify the chain on a stationary robot before any motion test.
+    stop_action_arg = DeclareLaunchArgument(
+        'stop_action', default_value='false',
+        description='Bring up stop_action_node (Task 9). OFF by default: it '
+                    'is the only node here that can command a velocity.')
+    cmd_vel_topic_arg = DeclareLaunchArgument(
+        'cmd_vel_topic', default_value='/cmd_vel',
+        description="Where stop_action_node publishes its zero Twist. Set to "
+                    "motion_watchdog's input topic (/cmd_vel_unsafe) when the "
+                    "watchdog is in the loop. Never /controller/cmd_vel.")
+    publish_cmd_vel_arg = DeclareLaunchArgument(
+        'publish_cmd_vel', default_value='true',
+        description='false = observe-only: decisions and alerts run, but no '
+                    'Twist publisher is created and no wheel can be commanded.')
+
+    stop_action_params = os.path.join(
+        pkg_share, 'config', 'stop_action_params.yaml')
+    stop_action_node = Node(
+        package='poc_fusion',
+        executable='stop_action_node',
+        name='stop_action_node',
+        output='screen',
+        condition=IfCondition(LaunchConfiguration('stop_action')),
+        parameters=[
+            stop_action_params,
+            # Launch arguments win over the YAML so the two safety-relevant
+            # keys can be set at the command line without editing config.
+            {'cmd_vel_topic': LaunchConfiguration('cmd_vel_topic')},
+            {'publish_cmd_vel': LaunchConfiguration('publish_cmd_vel')},
+        ],
+    )
 
     return LaunchDescription([
+        stop_action_arg,
+        cmd_vel_topic_arg,
+        publish_cmd_vel_arg,
         depth_preprocess_node,
         poc_fusion_container,
         costmap_node,
         lifecycle_manager_costmap,
         costmap_stop_monitor_node,
+        stop_action_node,
     ])
