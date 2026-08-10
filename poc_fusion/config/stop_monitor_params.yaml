@@ -84,26 +84,35 @@ costmap_stop_monitor_node:
 
     # --- Requirement 3: staleness bound, chosen from MEASURED rates -------
     #
-    # /costmap/costmap_raw, measured over one continuous 90 s subscription on
-    # the live stack: 568 messages, 567 inter-arrival intervals, mean 0.1585 s
-    # (6.309 Hz), median 0.1552 s, min 0.0958 s, p95 0.2235 s, p99 0.2539 s,
-    # max 0.3417 s. Zero of those 567 intervals exceeded 0.40 s. A separate
-    # 65 s `ros2 topic hz --window 500` run reported a larger worst gap of
-    # 0.467 s, and THAT -- not the 90 s run's 0.3417 s -- is the worst gap
-    # observed across all Task 7 measurement runs, so it is what the bound is
-    # sized against. (The configured update/publish frequency is 10 Hz. The
-    # ~6.3 Hz vs 10 Hz shortfall is a MEASURED, NOT-ISOLATED system
+    # /costmap/costmap_raw, measured over one continuous 90.15 s subscription
+    # on the live stack: 562 messages, 561 inter-arrival intervals,
+    # mean 0.1565 s (6.389 Hz), median 0.1561 s, min 0.0947 s, p95 0.2292 s,
+    # p99 0.2441 s, max (worst observed gap) 0.2612 s.
+    #
+    # Captured output for this run is pasted in docs/poc_fusion_verification.md
+    # under "Task 7 -- Step 2". (The configured update/publish frequency is
+    # 10 Hz. The ~6.4 Hz vs 10 Hz shortfall is a MEASURED, NOT-ISOLATED system
     # constraint already ratified for this project -- used here as an input,
     # never explained.)
     #
-    # 0.75 s is 1.61x the worst gap observed across all runs (0.467 s), 2.2x
-    # the worst gap in the controlled 90 s run, and 4.73x the measured mean
-    # interval, so reaching it means roughly five consecutive publications
-    # were missed. The margin over the single worst observed gap is thinner
-    # than the other ratios suggest and is stated plainly here rather than
-    # rounded away. Sizing the bound off the CONFIGURED 10 Hz instead would
-    # have given ~0.4 s, which the 0.467 s worst observed gap ALREADY
-    # EXCEEDS -- that bound would have flapped to UNKNOWN on healthy data.
+    # 0.75 s is 2.87x the worst gap actually observed (0.2612 s) and 4.79x the
+    # measured mean interval, so reaching it means roughly five consecutive
+    # publications were missed.
+    #
+    # PROVENANCE NOTE -- an earlier version of this comment sized the bound
+    # against a 0.467 s worst gap (from a `ros2 topic hz` run) and a 0.3417 s
+    # 90 s-run maximum, and argued that a 10 Hz-derived ~0.40 s bound "would
+    # have flapped" because 0.467 s exceeds it. Those figures came from the
+    # Task 7 implementer session, which died; its evidence did not survive.
+    # The re-measurement above reproduces the DISTRIBUTION SHAPE closely
+    # (562 vs 568 messages, 6.389 vs 6.309 Hz) but its worst gap is 0.2612 s
+    # -- it does NOT reproduce 0.3417 s or 0.467 s. So the "0.40 s would have
+    # flapped" argument is NOT supported by reproducible evidence and has been
+    # withdrawn rather than restated: against this run's data a 0.40 s bound
+    # would not have flapped. 0.75 s is retained because it is comfortably
+    # clear of the observed distribution either way, not because of that
+    # argument. Any future re-derivation should re-measure rather than trust
+    # the withdrawn figures.
     costmap_staleness_bound_s: 0.75
 
     # --- Requirement 2: positive liveness ---------------------------------

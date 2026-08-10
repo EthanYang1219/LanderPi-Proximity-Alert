@@ -594,12 +594,13 @@ def main(args=None):
         # raise `RCLError: failed to shutdown: rcl_shutdown already called`.
         # Guarding on rclpy.ok() below makes shutdown quiet.
         #
-        # NOT LIVE-VERIFIED. This guard was written by the Task 7 implementer
-        # against the running stack, but that agent died and its evidence did
-        # not survive, so the "observed on every clean SIGTERM" claim it
-        # carried has been removed rather than restated unbacked. The
-        # mechanism above is standard rclpy behaviour and the guard is
-        # correct either way; a live SIGTERM check is still owed.
+        # LIVE-VERIFIED: this node was SIGTERMed on the running stack and the
+        # launch reported "process has finished cleanly [pid 31236]" with no
+        # RCLError and no traceback in the launch log. Captured output is in
+        # docs/poc_fusion_verification.md under "Task 7 -- Step 5". (The
+        # original implementer session's own evidence for this was lost when
+        # that agent died; the check above was re-run from scratch rather
+        # than restated on trust.)
         pass
     finally:
         node.destroy_node()

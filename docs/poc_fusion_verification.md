@@ -4096,3 +4096,320 @@ on `SIGTERM` and was `kill -9`ed by PID — a single targeted signal to one of
 this POC's own processes, not a broad kill. It holds no resources and has no
 ROS presence, as the node list shows. Runs 2–5 shut down cleanly via
 process-group `SIGINT` and needed no such signal.)
+
+## Task 7: Costmap stop monitor (2026-08-10, live session ~21:43–21:49 HKT / 13:43–13:49 UTC)
+
+All evidence in this section was captured in a single continuous session on
+the live robot (off charger). Every command below was run inside the MentorPi
+container as `ubuntu`. The monitor publishes no velocity and commands no
+motion — acting on the signal is Task 9's scope — so nothing here moved the
+robot.
+
+**Provenance warning, read before trusting any number here.** The original
+Task 7 implementer session died and its output was unrecoverable. Its code
+survived in git (`1adbb3f`), but the measurements it cited in code comments
+did not. Nothing in this section is carried over from that session: every
+figure below was re-measured from scratch. Where a re-measurement failed to
+reproduce an original claim, the original is recorded as **withdrawn**, not
+restated.
+
+### Step 1 — Deploy and build
+
+```
+$ scripts/deploy_poc_fusion.sh
+Deploying /home/pi/Desktop/LanderPi-Proximity-Alert/poc_fusion -> MentorPi:/home/ubuntu/ros2_ws/src/poc_fusion
+No stale destination files to remove.
+Deploy complete.
+
+$ docker exec -u ubuntu MentorPi bash -lc 'source /opt/ros/humble/setup.bash && cd /home/ubuntu/ros2_ws && colcon build --packages-select poc_fusion --symlink-install'
+Finished <<< poc_fusion [3.80s]
+
+Summary: 1 package finished [6.14s]
+  1 package had stderr output: poc_fusion
+```
+
+(The stderr output is the setuptools `setup.py develop` deprecation warning
+already documented in earlier tasks, not an error.)
+
+### Step 2 — Costmap topic measurement (Requirement 3 evidence)
+
+Measured with a purpose-written subscriber (`/tmp/measure_costmap.py`, a
+throwaway tool, not part of the package) rather than `ros2 topic hz`, so that
+message *content* could be inspected in the same window as arrival timing.
+One continuous 90 s subscription:
+
+```
+$ docker exec -u ubuntu MentorPi bash -lc 'source /opt/ros/humble/setup.bash; source /home/ubuntu/ros2_ws/install/setup.bash; date -Is; python3 /tmp/measure_costmap.py; date -Is'
+2026-08-10T13:43:02+00:00
+measuring for 90 s ...
+window actually elapsed: 90.15 s
+--- /costmap/costmap_raw (nav2_msgs/Costmap) ---
+messages received: 562
+intervals: 561
+mean   : 0.1565 s  (6.389 Hz)
+median : 0.1561 s
+min    : 0.0947 s
+p95    : 0.2292 s
+p99    : 0.2441 s
+max    : 0.2612 s   <-- worst observed gap
+raw max cost value observed : 254
+--- /costmap/costmap (nav_msgs/OccupancyGrid) ---
+messages received: 1
+intervals: n/a (need >=2 messages)
+grid max cost value observed: 100
+2026-08-10T13:44:39+00:00
+```
+
+**This settles the topic choice.** `/costmap/costmap` (OccupancyGrid) carries
+costs rescaled to 0..100. The monitor's `lethal_threshold` is 253, so on that
+topic the threshold could **never** be reached: the monitor would report CLEAR
+forever, with no error and no missing message to notice. Consuming
+`/costmap/costmap_raw` (max cost 254 observed, the real nav2 cost scale where
+253 = INSCRIBED_INFLATED_OBSTACLE and 254 = LETHAL_OBSTACLE) is what makes the
+threshold meaningful. This is a correction to the Task 7 brief's Step 1, and
+it is exactly the class of silent failure `CONSTRAINTS.md:37` warns about.
+
+The 6.389 Hz measured against a configured 10 Hz is used here as a **measured,
+not-isolated** input, consistent with the standing project ruling. It is not
+explained and no cause is offered.
+
+**Withdrawn claims.** The pre-existing comment in `stop_monitor_params.yaml`
+sized the staleness bound against a 0.467 s worst gap (attributed to a
+`ros2 topic hz --window 500` run) and a 0.3417 s maximum in its own 90 s run,
+and argued that a 10 Hz-derived ~0.40 s bound "would have flapped" because
+0.467 s exceeds it. The re-measurement above reproduces the distribution
+*shape* closely (562 vs 568 messages; 6.389 vs 6.309 Hz; median 0.1561 vs
+0.1552 s) but **does not reproduce either large gap** — the worst gap observed
+here is 0.2612 s. Against this run's data a 0.40 s bound would *not* have
+flapped. That argument has therefore been withdrawn from the config comment
+rather than restated. The bound stays at 0.75 s on the surviving justification
+alone: 2.87x the worst gap actually observed and 4.79x the mean interval.
+
+### Step 3 — Requirement 5, and normal operation with an ACTIVE costmap
+
+Launch log excerpt (`/tmp/t7_launch.log`), from startup:
+
+```
+[costmap_stop_monitor_node-5] [INFO] [1786369316.969318052] [costmap_stop_monitor_node]: monitor state: None -> UNKNOWN (no_costmap_received)
+[costmap_stop_monitor_node-5] [ERROR] [1786369316.972866150] [costmap_stop_monitor_node]: no depth frame within 2.0 s: FUSION IS NO LONGER ACTIVE and the costmap is now LiDAR-ONLY. Low-profile obstacles the LiDAR plane misses will NOT be seen. Not halting -- degrading to the proven sensor is correct here; degrading silently is not.
+[costmap_stop_monitor_node-5] [INFO] [1786369317.220948742] [costmap_stop_monitor_node]: depth frames resumed on the camera axis: fusion is ACTIVE again (was LIDAR_ONLY).
+[nav2_costmap_2d-3] [WARN] [1786369318.235406689] [costmap.costmap.rclcpp]: failed to send response to /costmap/costmap/get_state (timeout): client will not receive response, at ./src/rmw_response.cpp:154, at ./src/rcl/service.c:314
+[costmap_stop_monitor_node-5] [WARN] [1786369318.613261270] [costmap_stop_monitor_node]: get_state on /costmap/costmap did not answer within 0.50 s; costmap liveness is now UNCONFIRMED.
+[costmap_stop_monitor_node-5] [INFO] [1786369318.815430715] [costmap_stop_monitor_node]: monitor state: UNKNOWN -> UNKNOWN (tf_lookup_failed)
+[costmap_stop_monitor_node-5] [WARN] [1786369318.895016364] [costmap_stop_monitor_node]: no TF odom -> base_link at the previous costmap message's stamp before the next message arrived; that cycle was dropped unevaluated. State is UNKNOWN, NOT clear.
+[costmap_stop_monitor_node-5] [INFO] [1786369319.015245315] [costmap_stop_monitor_node]: monitor state: UNKNOWN -> OBSTACLE (lethal_cells_in_window)
+```
+
+Four requirements are demonstrated in these nine lines:
+
+- **Requirement 4 (fail-safe startup):** the very first state is
+  `None -> UNKNOWN (no_costmap_received)`. Startup is UNKNOWN, never CLEAR.
+- **Requirement 2 (positive liveness):** a `get_state` call that did not
+  answer within 0.50 s drove liveness to **UNCONFIRMED** rather than being
+  treated as "fine". Absence of an answer is not an affirmative answer. The
+  costmap's own matching `failed to send response` warning is in the log too,
+  so this was a genuine unanswered call, not a client-side artifact.
+- **Requirement 1 (UNKNOWN is not CLEAR):** a TF lookup failure produced
+  `UNKNOWN (tf_lookup_failed)` and the cycle was dropped unevaluated.
+- The camera axis is independent: it reported LIDAR_ONLY then FUSION_ACTIVE
+  without changing the costmap-side state.
+
+Full status sample during ACTIVE operation:
+
+```
+$ ros2 topic echo /costmap_app/monitor_status --once
+status:
+- level: "\0"
+  name: 'costmap_stop_monitor: costmap'
+  message: CLEAR
+  hardware_id: /costmap/costmap_raw
+  values:
+  - {key: state, value: CLEAR}
+  - {key: reason, value: window_clear}
+  - {key: costmap_age_s, value: '0.048'}
+  - {key: costmap_staleness_bound_s, value: '0.750'}
+  - {key: costmap_lifecycle_node, value: /costmap/costmap}
+  - {key: costmap_lifecycle_state, value: active}
+  - {key: costmap_frame, value: odom}
+  - {key: tf_ok, value: 'True'}
+  - {key: obstacle_in_window, value: 'False'}
+  - {key: bool_published, value: 'True'}
+  - {key: window_forward_m, value: '1.000'}
+  - {key: window_half_width_m, value: '0.300'}
+  - {key: lethal_threshold, value: '253'}
+- level: "\0"
+  name: 'costmap_stop_monitor: fusion'
+  message: FUSION_ACTIVE
+  values:
+  - {key: camera_axis, value: FUSION_ACTIVE}
+  - {key: depth_age_s, value: '0.008'}
+  - {key: camera_timeout_s, value: '2.000'}
+```
+
+(Reformatted from `ros2 topic echo`'s one-key-per-line YAML into inline
+mappings for width; keys and values are verbatim.) `costmap_lifecycle_state:
+active` is the positive confirmation required by Requirement 2 — the state is
+reported from a real `get_state`/`transition_event` answer, not inferred from
+the existence of a subscription.
+
+### Step 4 — Requirement 7: lifecycle manager alive, costmap NOT active
+
+This is the scenario carried forward from Task 6 Step 4, where "manager alive
+but costmap never active" had no launch-time gate. Task 7 closes it in the
+consumer instead: the monitor refuses to treat a non-ACTIVE costmap as usable.
+
+The real costmap lifecycle node was driven out of ACTIVE while the monitor
+kept running (`/tmp/live_check_b.py`):
+
+```
+=== PHASE 1: baseline, costmap ACTIVE (10 s) ===
+  Bool messages published : 65  values=[False, True]
+  status samples          : 50
+    state=CLEAR     reason=window_clear             lifecycle=active       diag_level=0
+    state=OBSTACLE  reason=lethal_cells_in_window   lifecycle=active       diag_level=0
+
+=== DEACTIVATING costmap lifecycle node ===
+  ros2 lifecycle set /costmap/costmap deactivate -> Transitioning successful
+
+=== PHASE 2: manager alive, costmap NOT active (20 s) ===
+  status samples          : 110
+    state=UNKNOWN   reason=costmap_not_active       lifecycle=inactive     diag_level=2
+
+=== REACTIVATING costmap lifecycle node ===
+  ros2 lifecycle set /costmap/costmap activate -> Transitioning successful
+
+=== PHASE 3: recovery (12 s) ===
+    state=OBSTACLE  reason=lethal_cells_in_window   lifecycle=active       diag_level=0
+    state=CLEAR     reason=window_clear             lifecycle=active       diag_level=0
+```
+
+`diag_level=2` is `DiagnosticStatus.ERROR` — Requirement 5's "loud and
+observable" on the wire, greppable in a rosbag when a trial is audited
+afterwards for blind operation. The corresponding log line:
+
+```
+[costmap_stop_monitor_node-5] [ERROR] [...] [costmap_stop_monitor_node]: MONITOR STATE UNKNOWN (costmap_not_active): this node is NOT a valid safety input right now and this is NOT "clear". costmap_age_s=26.019 bound=0.750 lifecycle='inactive' tf_ok=True. No std_msgs/Bool is being published while degraded.
+```
+
+Recovery was observed through the `transition_event` path, which is
+Requirement 2's second mechanism:
+
+```
+[costmap_stop_monitor_node-5] [INFO] [...] /costmap/costmap lifecycle transition: inactive -> activating
+[costmap_stop_monitor_node-5] [INFO] [...] /costmap/costmap lifecycle transition: activating -> active
+[costmap_stop_monitor_node-5] [INFO] [...] monitor state: UNKNOWN -> CLEAR (window_clear)
+```
+
+#### The Bool-silence claim, and why the first run's result was not trusted
+
+The safety invariant is that UNKNOWN publishes **nothing** on the
+`std_msgs/Bool` compatibility topic — never `False`, which a consumer would
+read as "clear". A first attempt counted Bool messages per phase and appeared
+to **fail**: 1 Bool inside the UNKNOWN window.
+
+That result was not reported as a defect, because per-phase counting cannot
+distinguish "published while UNKNOWN" from "published while still ACTIVE and
+received a moment later" — the timestamps are *receipt* times at the
+subscriber, on two different topics, so they cannot order publications at the
+node. A second run (`/tmp/live_check_b3.py`) separated the two:
+
+```
+deactivate -> Transitioning successful
+entered UNKNOWN(costmap_not_active) at t_deact+0.010 s
+
+-- BOUNDARY WINDOW (the 3 s settle) --
+Bools after entering UNKNOWN: 1
+   offset +0.0003 s after UNKNOWN, value=True
+
+-- STEADY STATE (20 s of continuous UNKNOWN) --
+status samples          : 100
+distinct (state, reason): [('UNKNOWN', 'costmap_not_active')]
+BOOLS IN STEADY UNKNOWN : 0   <-- PASS (gate holds; the boundary Bool was an interleave)
+```
+
+The single boundary Bool arrived **0.3 ms** after the first UNKNOWN status —
+three orders of magnitude inside one ~0.156 s publish cycle, i.e. a same-cycle
+interleave between two topics at the subscriber, not a gate leak. Over 20 s of
+**continuous** UNKNOWN (100 consecutive samples, no other state) the Bool was
+completely silent. Its value was also `True`, never `False`: even the
+interleaved message pointed in the fail-safe direction.
+
+This matches the static reading of the code — `costmap_stop_monitor_node.py`
+has exactly one Bool publish site, gated by `should_publish_bool()`, and
+`bool_value()` raises `ValueError` on UNKNOWN so the conflation cannot be
+reintroduced silently.
+
+### Step 5 — Shutdown guard (SIGTERM)
+
+```
+$ PID=$(pgrep -f costmap_stop_monitor_node | head -1); echo "pid=$PID"; kill -TERM $PID
+pid=31236
+...
+[INFO] [costmap_stop_monitor_node-5]: process has finished cleanly [pid 31236]
+```
+
+No `RCLError: failed to shutdown: rcl_shutdown already called` and no
+traceback appeared in the launch log. The `rclpy.ok()` guard added in
+`17af039` is therefore live-verified. (The `NOT LIVE-VERIFIED` marker that
+commit carried has been retired on the strength of this run, not on trust in
+the dead session that originally wrote the guard.)
+
+**Observed and carried forward to Task 9:** killing the monitor did **not**
+tear down the rest of the launch — `nav2_costmap_2d`, `lifecycle_manager`,
+`component_container` and `depth_preprocess_node` all kept running. A dead
+monitor is therefore *silent* rather than false-clear, which is the fail-safe
+direction, but it means **Task 9 must treat Bool silence as "not clear"**, not
+as "no obstacle". This is a consumer-side requirement, recorded here so it is
+not rediscovered later.
+
+### Step 6 — Not verified live
+
+Stated plainly rather than left implied:
+
+- **`UNKNOWN (costmap_stale)` was never exercised live.** `evaluate_state()`
+  checks lifecycle before staleness, so deactivating the costmap always
+  reports `costmap_not_active` first. Producing a genuine stale-but-ACTIVE
+  costmap would require stalling publication while the lifecycle node still
+  reports ACTIVE, which was not arranged in this session. The path is covered
+  by unit tests, two of which are mutation-proven (Step 7), but it has **no
+  live evidence**.
+- The `0.3417 s` and `0.467 s` worst-gap figures from the dead implementer
+  session remain **unreproduced** (Step 2).
+
+### Step 7 — Test suite and mutation proofs
+
+The discrimination bar (Requirement 6) was verified by mutation rather than by
+assertion: each safety rule was broken in turn and the suite re-run, proving
+the tests actually discriminate and are not vacuous.
+
+```
+$ cd poc_fusion && python3 -m pytest test -q
+87 passed in 1.53s
+```
+
+| Mutation applied to `lib/monitor_state.py` | Result |
+|---|---|
+| startup (`costmap_age_s is None`) returns CLEAR instead of UNKNOWN | 2 failed — `test_startup_before_any_costmap_is_unknown_not_clear`, `test_startup_is_unknown_even_when_lifecycle_is_already_active` |
+| staleness check disabled (stale treated as fresh) | 2 failed — `test_stale_costmap_is_unknown_not_clear`, `test_stale_costmap_is_unknown_even_when_an_obstacle_was_last_seen` |
+| `should_publish_bool()` returns True unconditionally | 1 failed — `test_bool_is_not_published_in_unknown` |
+| lifecycle check disabled (inactive costmap treated as usable) | 6 failed — `test_every_non_active_lifecycle_state_is_unknown[inactive]`, `[finalized]`, `[errorprocessing]`, and others in that parametrisation |
+
+All four mutations were reverted and the suite re-run clean afterwards.
+
+### Step 8 — Robot left as found
+
+```
+$ kill -TERM 31210 31228 31230 31232 31234
+$ ps -eo pid,stat,cmd | grep -E "poc_fusion|nav2_costmap|lifecycle_manager|component_container|depth_preprocess" | grep -v grep
+  31232 Z    [nav2_costmap_2d] <defunct>
+
+$ ros2 node list | wc -l
+28
+$ ros2 node list | grep -iE "costmap|poc_fusion|stop_monitor|depth_preprocess"
+(none of ours - clean)
+```
+
+28 vendor nodes remain, matching the baseline recorded at the end of Task 6.
+The single `<defunct>` entry is an unreaped exit status, not a live process —
+the container runs no init reaper, as documented in Task 6. No velocity was
+ever published, no arm command was ever sent, and `.stop_ros.sh` was not run.

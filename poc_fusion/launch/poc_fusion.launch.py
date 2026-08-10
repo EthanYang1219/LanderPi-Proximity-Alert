@@ -281,12 +281,13 @@ def generate_launch_description():
     # The monitor consumes /costmap/costmap_raw (nav2_msgs/Costmap) rather
     # than /costmap/costmap (nav_msgs/OccupancyGrid) -- a correction to the
     # Task 7 brief's Step 1, forced by two live measurements pasted in
-    # docs/poc_fusion_verification.md "Task 7": the OccupancyGrid's costs are
-    # rescaled to 0..100 (so lethal_threshold 253 could never be reached, and
-    # the monitor would report CLEAR forever with no error), and a fresh
-    # subscriber to it received 0 messages in 90 s while costmap_raw
-    # delivered 568. The topic name is a PARAMETER in that YAML, not a
-    # literal here.
+    # docs/poc_fusion_verification.md under "Task 7 -- Step 2": over one
+    # 90.15 s window a single subscriber saw max cost 100 on the
+    # OccupancyGrid versus 254 on costmap_raw (so lethal_threshold 253 could
+    # never be reached there, and the monitor would report CLEAR forever with
+    # no error), and received 1 OccupancyGrid message against 562 on
+    # costmap_raw. The topic name is a PARAMETER in that YAML, not a literal
+    # here.
     #
     # It publishes no velocity and commands no motion -- acting on the signal
     # is Task 9's scope. Ordering within a LaunchDescription does not gate
