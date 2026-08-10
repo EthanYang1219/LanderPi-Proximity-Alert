@@ -5242,3 +5242,127 @@ Sample set: `docs/poc_fusion_data/task9_step3_part1_stop_persistence.csv` (239 r
 The wall-obstacle run was cancelled rather than executed. It exercises the same
 broken actuation path with a different trigger and could not have changed the
 conclusion; spinning the wheels again for no new evidence was not justified.
+
+## Task 9 Step 3 (re-run): does a stop PERSIST with the series gate? — **PASSED** (2026-08-11 ~03:35–03:38 HKT / 2026-08-10 ~19:35–19:38 UTC)
+
+Same harness, same 0.05 m/s, same monitor SIGKILL as the failed run above. The
+only change is topology.
+
+### What changed
+
+`stop_action_node` is now a **series gate**: the motion source flows *through* it.
+
+```
+motion source -> /cmd_vel_raw -> [stop_action_node] -> /cmd_vel_unsafe
+                                                              |
+                                             motion_watchdog <-/
+                                                     |
+                                                 /cmd_vel -> motors
+```
+
+Verified live before any motion, and this is the whole fix:
+
+| Topic | Publishers | Subscribers |
+|---|---|---|
+| `/cmd_vel_raw` | 0 (until the harness starts) | 1 (the gate) |
+| **`/cmd_vel_unsafe`** | **1 — the gate, and only the gate** | 1 (watchdog) |
+| `/cmd_vel` | 1 (watchdog) | 1 (base) |
+
+In the failed run `/cmd_vel_unsafe` had **two** publishers. There is now nothing
+left to race. `zero_twist_burst` was **removed**, not retuned — no value of it
+fixes a topology defect, and keeping it would imply the race was still something
+to manage.
+
+`proximity_alert` was **not modified**. `path_tracker` publishes to a hardcoded
+`/cmd_vel` and is remapped at launch, which is the idiom `motion_watchdog`'s own
+docstring already documents.
+
+### Method: why a positive control was mandatory
+
+A first re-run produced 212/212 zeros on `/cmd_vel` and was **rejected as
+evidence**. The harness needs ~4 s to initialise, so it only began publishing
+3.4 s *after* the gate had already latched to zero. That run proves an
+already-engaged stop blocks a live source, but it cannot distinguish "the gate
+correctly suppressed forward" from "the gate never forwards anything at all" —
+those two produce byte-identical files. A test that cannot tell success from
+total failure is not evidence of success.
+
+It is retained as a distinct, weaker claim only:
+`docs/poc_fusion_data/task9_step3_seriesgate_alreadylatched_2026-08-11.csv`.
+
+The accepted run therefore requires the sequence **motion → monitor failure →
+zero**, with sustained non-zero `/cmd_vel` observed *before* the kill.
+
+### Result
+
+Wheels were genuinely driven for this run — the first test in Task 9 where
+`/cmd_vel` left zero at all.
+
+| Criterion | Evidence | Verdict |
+|---|---|---|
+| Sustained non-zero before the kill | **322/322 samples at 0.05 over 16.054 s — 100 % duty, 0 interruptions** | PASS |
+| Monitor death latches the gate | `clear → obstacle_signal_stale (stop=True)`, `gate: forward → zero` | PASS |
+| Stop latency ≤ 0.75 s | kill `1786390656.251` → latch `1786390656.990` = **0.739 s** | PASS |
+| Every subsequent sample zero | **473/473 zero, 0 non-zero, over 23.606 s** | PASS |
+| Gate remains latched | no further gate transition logged | PASS |
+
+Directly against the control, same harness and trigger:
+
+| | Failed run (parallel publisher) | This run (series gate) |
+|---|---|---|
+| Samples after the kill | 213 | 473 |
+| **Non-zero after the kill** | **110 — 51.6 % forward duty** | **0 — 0.0 %** |
+| Stop held? | NO | **YES**, for 23.6 s |
+
+Sample set: `docs/poc_fusion_data/task9_step3_seriesgate_2026-08-11.csv` (806 rows).
+
+### On the 0.739 s latency
+
+11 ms under the bound. This is **not** a near-miss of a tolerance — it is the
+design bound behaving as specified. The monitor publishes the Bool at 5 Hz, so
+observed latency is `0.75 s − (time since the last Bool when the kill landed)`,
+giving an expected range of ~0.55–0.75 s. This kill landed just after a publish;
+an earlier run of the same test measured 0.711 s. **The worst case is 0.75 s by
+construction, and both measurements sit inside it.** Any figure above 0.75 s
+would indicate a real defect.
+
+### Measurement integrity
+
+The latency figure uses **two wall-clock stamps only** and never touches the CSV.
+An initial analysis anchored CSV time on the last non-zero sample and then used
+that anchor to classify samples — circular, and it reported a spurious
+"1 non-zero after latch" that was only the boundary sample itself. The accepted
+numbers avoid the mapping: latency from wall clock, and the zero-run stated
+purely as a property of the file (last non-zero at `t=16.645`; all 473 samples
+after it are zero).
+
+### What this does and does not establish
+
+Established: a monitor failure while the robot is under power **removes** the
+forward command, within the staleness bound, and holds it removed.
+
+Not established by this run: response to a *real obstacle* under motion. The
+trigger here is monitor death (the fail-safe path), not a detection. Part 2 —
+the wall-obstacle run — remains outstanding.
+
+### Test suite state at this commit
+
+| Suite | Where run | Result |
+|---|---|---|
+| `poc_fusion/test` | host | **135 passed** |
+| `proximity_alert/test` (non-`rclpy`) | host | **139 passed** |
+| `proximity_alert/test` (full, needs `rclpy`) | container, against the **host** tree | **186 passed** |
+
+Two environment traps, recorded because both produce convincing false results:
+
+1. **`rclpy` is not installed on the host.** Six `proximity_alert` test modules
+   fail to *collect* there. They are not broken; they cannot run.
+2. **The container's `proximity_alert` tests are STALE.** `scripts/deploy_poc_fusion.sh`
+   syncs `poc_fusion` only. Running `proximity_alert/test` against the container's
+   own copy reports **14 failures** — all
+   `TypeError: _FakeController.step() takes 6 positional arguments but 7 were given`,
+   a test-double signature drift. The container's `path_tracker.py` happens to be
+   identical to the host's, so the staleness is invisible until the fakes are
+   exercised. The authoritative run copies the host tree into the container and
+   gets 186 passed. **Do not read container `proximity_alert` test failures as
+   defects without first diffing that tree against the host.**
