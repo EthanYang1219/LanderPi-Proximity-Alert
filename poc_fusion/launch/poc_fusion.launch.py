@@ -319,26 +319,37 @@ def generate_launch_description():
     # so the verified command stays safe to run at any time.
     #
     # Enable explicitly, and read stop_action_node.py's REQUIRED TOPOLOGY
-    # section first -- with `proximity_alert`'s motion_watchdog in the loop
-    # (which Task 9 Step 3 requires, because a zero Twist at costmap rate
-    # does NOT hold a stop on this platform), cmd_vel_topic must be the
-    # WATCHDOG'S INPUT:
+    # section first. stop_action_node is a SERIES GATE: the motion source
+    # flows through it, so it must sit between that source and
+    # `proximity_alert`'s motion_watchdog. The watchdog is required because a
+    # zero Twist at costmap rate does NOT hold a stop on this platform.
     #
-    #   ros2 launch poc_fusion poc_fusion.launch.py \
-    #       stop_action:=true cmd_vel_topic:=/cmd_vel_unsafe
+    #   ros2 run proximity_alert motion_watchdog
+    #   ros2 run proximity_alert path_tracker --ros-args -r /cmd_vel:=/cmd_vel_raw
+    #   ros2 launch poc_fusion poc_fusion.launch.py stop_action:=true
+    #
+    # The defaults already wire /cmd_vel_raw -> gate -> /cmd_vel_unsafe, which
+    # is the watchdog's input. The parallel-publisher design these replaced was
+    # measured failing in Task 9 Step 3 (51.6% forward duty cycle after a stop
+    # engaged); see the config file for the full account.
     #
     # `publish_cmd_vel:=false` runs every decision, log line and alert but
     # creates no Twist publisher at all -- the observe-only mode used to
-    # verify the chain on a stationary robot before any motion test.
+    # verify the chain on a stationary robot before any motion test. In that
+    # mode the gate also passes no motion through.
     stop_action_arg = DeclareLaunchArgument(
         'stop_action', default_value='false',
         description='Bring up stop_action_node (Task 9). OFF by default: it '
                     'is the only node here that can command a velocity.')
-    cmd_vel_topic_arg = DeclareLaunchArgument(
-        'cmd_vel_topic', default_value='/cmd_vel',
-        description="Where stop_action_node publishes its zero Twist. Set to "
-                    "motion_watchdog's input topic (/cmd_vel_unsafe) when the "
-                    "watchdog is in the loop. Never /controller/cmd_vel.")
+    cmd_vel_in_topic_arg = DeclareLaunchArgument(
+        'cmd_vel_in_topic', default_value='/cmd_vel_raw',
+        description='Motion source feeding the gate. Remap path_tracker onto '
+                    'this topic. Never /controller/cmd_vel.')
+    cmd_vel_out_topic_arg = DeclareLaunchArgument(
+        'cmd_vel_out_topic', default_value='/cmd_vel_unsafe',
+        description="Gate output; must be motion_watchdog's input topic. "
+                    'Never /controller/cmd_vel, and never equal to '
+                    'cmd_vel_in_topic.')
     publish_cmd_vel_arg = DeclareLaunchArgument(
         'publish_cmd_vel', default_value='true',
         description='false = observe-only: decisions and alerts run, but no '
@@ -356,14 +367,16 @@ def generate_launch_description():
             stop_action_params,
             # Launch arguments win over the YAML so the two safety-relevant
             # keys can be set at the command line without editing config.
-            {'cmd_vel_topic': LaunchConfiguration('cmd_vel_topic')},
+            {'cmd_vel_in_topic': LaunchConfiguration('cmd_vel_in_topic')},
+            {'cmd_vel_out_topic': LaunchConfiguration('cmd_vel_out_topic')},
             {'publish_cmd_vel': LaunchConfiguration('publish_cmd_vel')},
         ],
     )
 
     return LaunchDescription([
         stop_action_arg,
-        cmd_vel_topic_arg,
+        cmd_vel_in_topic_arg,
+        cmd_vel_out_topic_arg,
         publish_cmd_vel_arg,
         depth_preprocess_node,
         poc_fusion_container,
