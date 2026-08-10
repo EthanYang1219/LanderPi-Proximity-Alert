@@ -5366,3 +5366,147 @@ Two environment traps, recorded because both produce convincing false results:
    exercised. The authoritative run copies the host tree into the container and
    gets 186 passed. **Do not read container `proximity_alert` test failures as
    defects without first diffing that tree against the host.**
+
+## Task 9 Part 2: physical obstacle-triggered stop under motion — **PASSED** (2026-08-11 ~03:58 HKT / 2026-08-10 ~19:58 UTC)
+
+Step 3 proved the **fail-safe** path (`motion → monitor death → gate → zero`).
+This run proves the **perception** path:
+
+```
+motion → real wall → LiDAR → costmap → monitor → Bool → gate → /cmd_vel zero → robot halts
+```
+
+### Setup
+
+| | |
+|---|---|
+| Robot | on the floor, unrestrained, operator supervising |
+| Obstacle | flat wall square across the path, initially **1.871 m** ahead (LiDAR-measured) |
+| Commanded speed | **0.05 m/s** forward, `/cmd_vel_raw` |
+| Harness duration | 30 s — capped so that even with total gate failure max travel is 1.5 m, i.e. **the run could not reach the wall** |
+| Detection window | `window_forward_m 1.000`, `window_half_width_m 0.300`, `lethal_threshold 253` |
+| Recording | `ros2 bag` on `/cmd_vel`, `/cmd_vel_raw`, `/cmd_vel_unsafe`, `/costmap_app/{obstacle_detected,stop_active,monitor_status}`, `/scan_raw` |
+
+Pre-motion baseline: costmap lifecycle `active [3]`, monitor `CLEAR/window_clear`,
+`costmap_age_s 0.169` (bound 0.750), `tf_ok True`, `camera_axis FUSION_ACTIVE`,
+`obstacle_detected` 28/28 False, `/cmd_vel` 55/55 zero, `/cmd_vel_unsafe`
+publisher count **1**. Battery 7.23 V.
+
+### The causal chain, with independent per-layer timestamps
+
+Every timestamp below comes from a **different** source; none is inferred from another.
+
+| # | Event | Source | Epoch (s) |
+|---|---|---|---|
+| 1 | gate `silent → forward` | node log | 1786391915.495315 |
+| 2 | motion begins — first non-zero `/cmd_vel` | bag | **1786391915.529317** |
+| 3 | monitor publishes first `True` | bag, `/costmap_app/obstacle_detected` | **1786391937.861463** |
+| 4 | gate `clear → obstacle_detected (stop=True)` | node log | 1786391937.888153 |
+| 5 | gate `forward → zero` | node log | 1786391937.890358 |
+| 6 | last non-zero `/cmd_vel` | bag | **1786391937.864981** |
+| 7 | `stop_active` first `True` | bag | 1786391937.892370 |
+| 8 | monitor `CLEAR → OBSTACLE (lethal_cells_in_window)` | monitor log | 1786391937.911210 |
+
+Derived intervals:
+
+| Interval | Value |
+|---|---|
+| Motion duration (2 → 6) | **22.336 s** |
+| Distance travelled (LiDAR) | 1.871 → 0.912 m = **0.959 m** |
+| Actual speed vs commanded | **0.043 m/s** vs 0.050 m/s (86 %) |
+| **Bool `True` → last commanded motion (3 → 6)** | **0.0035 s** |
+| Bool `True` → gate latch (3 → 5) | 0.0289 s |
+| Post-stop hold | **620 messages, 0 non-zero, 30.951 s** |
+
+Two ordering notes, recorded so they are not later mistaken for anomalies:
+
+- **Event 8 is 50 ms *after* event 3.** The monitor publishes the Bool before it
+  emits its own state-transition log line. Monitor-internal latency therefore
+  **cannot** be computed from the log line, and is not claimed here.
+- **`/cmd_vel_unsafe` last non-zero is 1786391937.788527 — 73 ms *before* the Bool.**
+  This is the gate's 10 Hz tick cadence: its last forward publish simply preceded
+  the Bool's arrival, and it never published another. `motion_watchdog` re-echoed
+  that last forward at 20 Hz until the gate's zero arrived, which is why `/cmd_vel`
+  carries motion 76 ms longer than the gate's own output.
+
+### Physical outcome — measured, not asserted
+
+LiDAR forward-corridor minimum range over the run:
+
+```
+t-start  -0.93 s : 1.871 m
+        +5.36 s : 1.657 m
+       +11.56 s : 1.391 m
+       +17.66 s : 1.123 m
+       +21.76 s : 0.943 m
+       +23.96 s : 0.912 m   <- stopped
+       +30.16 s : 0.913 m
+       +52.86 s : 0.912 m   <- still 0.912 m, 30 s later
+```
+
+The range **froze at 0.912 m and stayed there for over 30 s**. The robot halted
+roughly **0.91 m short of the wall. No collision**, and the standstill is
+established by an independent sensor rather than by the absence of commands.
+
+### Detection provenance: **LiDAR** — measured, not inferred
+
+The Phase C prediction was **wrong** and is corrected here. It was predicted that
+detection would fire at the 1.0 m window edge, outside `fusion_coverage_m 0.940`,
+making LiDAR attribution geometric. Detection actually fired at **0.921 m**, which
+is *inside* the reported fusion coverage — so geometry alone no longer settled it.
+
+Provenance was therefore measured directly, with the robot parked at the detection
+geometry (wall at 0.912 m) and **zero motion**. `/poc_fusion/points` was
+transformed from `depth_camera_link` into `base_footprint` and binned along the
+forward corridor (`|y| ≤ 0.30 m`, `z > 0.03 m`), over two consecutive clouds
+(~195 000 corridor points each):
+
+```
+0.05-0.50 m : 158565 pts
+0.50-0.80 m :  36678 pts
+0.80-0.88 m :      0 pts
+0.88-0.96 m :      0 pts     <- the detection band
+0.96-1.20 m :      0 pts
+1.20-2.50 m :      0 pts
+max corridor x = 0.668 m
+```
+
+**Depth contributes zero points at the detection distance.** Its far limit in the
+corridor is **0.668 m**, well short of 0.921 m. At the current ~40° downward
+camera pose the depth sensor is looking at the floor and physically cannot see the
+wall at that range. The stop was triggered by **LiDAR alone**; depth contributed
+nothing. No ablation run was required — the measurement is direct.
+
+`camera_axis` read `FUSION_ACTIVE` with `depth_age_s 0.038` throughout. **That flag
+means depth frames are arriving, not that depth contributed to this detection.**
+It must not be cited as evidence of fusion.
+
+### Finding: `fusion_coverage_m` overstates real coverage at this pose
+
+The monitor reports `fusion_coverage_m: 0.940` / `lidar_only_beyond_m: 0.940`, but
+measured depth reach in the forward corridor is **0.668 m** — a **0.27 m**
+overstatement. The parameter appears to describe a nominal camera envelope rather
+than the achieved reach at the mounted 40° pose. Anything relying on 0.94 m as the
+fusion/LiDAR-only boundary is relying on a figure this run contradicts. Logged for
+the whole-branch review; **not** changed here, since altering a safety-adjacent
+parameter while validating a safety test would invalidate the test.
+
+### Also measured
+
+`/poc_fusion/points` ran at **2.06 Hz** during this session — below the ~4 Hz
+previously recorded for this known constraint. Recorded as a fresh measurement;
+cause not isolated, and not derived from anything.
+
+### What this does and does not establish
+
+Established: a physically present obstacle, encountered by a genuinely moving
+robot, produces a costmap obstacle, a monitor `OBSTACLE` state, a gate transition
+to zero, and a real physical halt with no collision — with commanded motion ending
+**3.5 ms** after the safety signal.
+
+Not established: any depth or fused contribution to obstacle detection. On this
+evidence the POC's detection of a floor-standing wall is **LiDAR-only**. The
+fusion claim remains unverified and is still blocked behind Task 10a (camera pose).
+
+Evidence: `docs/poc_fusion_data/task9_part2_wall_events_2026-08-11.csv`
+(4136 rows, all recorded channels merged on one timeline).
