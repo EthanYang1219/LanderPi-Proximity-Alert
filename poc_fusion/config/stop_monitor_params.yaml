@@ -75,7 +75,32 @@ costmap_stop_monitor_node:
     # published status message's `fusion_coverage_m` field, so that a trigger
     # occurring at ~1 m is never written up as a camera detection.
     window_forward_m: 1.0
-    window_half_width_m: 0.3
+    # CHANGED 2026-08-12: 0.3 -> 0.135. Derived, not tuned; the derivation is
+    # `lib/window_bounds.max_window_half_width_m` and the deployed value is
+    # held to it by `test/test_window_bounds.py`.
+    #
+    #   robot half-width      0.085  (measured: 0.170 m outer wheel to outer
+    #                                 wheel; URDF axle y +/-0.0738 leaves
+    #                                 0.0112 m of wheel beyond the axle plane)
+    # + swept-path clearance  0.025  (stated design margin, half a cell)
+    # + half a costmap cell   0.025  (window_mask tests cell CENTRES and the
+    #                                 grid is a rolling window in odom, so the
+    #                                 effective edge jitters under the robot)
+    # = 0.135
+    #
+    # WHY 0.3 WAS WRONG, not merely generous: the frozen avoidance
+    # controller's `front` is the MINIMUM over a 180 deg arc
+    # (`front_arc_deg: 180.0`), so an obstacle at 60 deg bearing and 0.20 m
+    # range sits at roughly base_link x=0.17, y=0.17 -- inside a +/-0.3 m
+    # window. It therefore stayed in the window throughout the very STRAFE
+    # that was clearing it, holding the gate closed for the whole maneuver.
+    # At 0.135 a 0.15 m-wide obstacle leaves the window after ~0.21 m of
+    # strafe, against `max_strafe_distance` 0.40 m. At 0.3 it needed ~0.375 m
+    # -- marginal against that same 0.40 m cap.
+    #
+    # This narrows the backstop to the robot's own swept path, which is the
+    # only question it exists to answer: "is the robot about to hit this?"
+    window_half_width_m: 0.135
     # 253 == nav2's INSCRIBED_INFLATED_OBSTACLE; 254 == LETHAL_OBSTACLE. A
     # threshold of 253 catches both. Raw cost scale -- see costmap_topic.
     lethal_threshold: 253

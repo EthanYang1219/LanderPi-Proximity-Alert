@@ -71,6 +71,20 @@ motion:
   cross_track_kp: 0.6
   cross_track_max_speed_mps: 0.10
 
+# --- Robot geometry --------------------------------------------------------
+# Measured 2026-08-12, +/- 0.001 m. The GRIPPER is the frontmost point, not
+# the chassis --- the arm protrudes 0.032 m past the chassis front. That makes
+# the arm's parked pose a safety-relevant configuration, because it sets the
+# lower bound on window_forward_m. If the arm is moved or sags between runs,
+# re-measure; do not carry this value forward unchecked.
+geometry:
+  front_extent_from_base_link_m: 0.1328   # to the gripper
+  chassis_front_from_base_link_m: 0.101
+  overall_width_m: 0.170
+  half_width_m: 0.085
+  arm_parked_pose_verified: TODO          # true | false --- check before the run
+  arm_protrusion_past_chassis_m: 0.032
+
 # --- LiDAR -----------------------------------------------------------------
 lidar:
   model: LD19
@@ -106,7 +120,7 @@ costmap:
 # (which sits +0.073 m forward). A LiDAR range of 0.20 m is ~0.273 m here.
 stop_monitor:
   window_forward_m: 1.0
-  window_half_width_m: 0.3
+  window_half_width_m: 0.135
   lethal_threshold: 253
   min_occupancy_fraction: 0.30
   min_cluster_area_cm2: 100.0

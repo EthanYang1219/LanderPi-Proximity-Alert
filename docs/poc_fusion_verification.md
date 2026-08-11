@@ -5664,3 +5664,117 @@ exists to reject floor returns from a camera pitched ~40° at the floor, and Tas
 verified that filter. Lowering it to make this test runnable would have
 invalidated both this test and Task 8's verification. No parameter, threshold or
 config was modified. `proximity_alert` untouched.
+
+---
+
+## 2026-08-12 — Stop-window envelope: half-width shrunk, forward window BLOCKED
+
+New entry. Nothing above is amended or overwritten.
+
+### What prompted it
+
+The Task 9 Part 2 root-cause investigation (systematic-debugging, 2026-08-11)
+established that nothing latched the stop. `evaluate_stop_action` and
+`evaluate_gate` are both stateless. The stop persisted because the wall stayed
+inside the stop window and was re-detected every tick, and the robot could not
+leave because `GATE_ZERO` publishes a bare `Twist()` — direction-agnostic, so
+the lateral components that would have cleared the window were zeroed too.
+
+The chosen remedy (user decision, option (a)) is to shrink the window so it
+sits strictly *inside* the frozen avoidance controller's trigger, letting
+avoidance take over instead of the backstop pre-empting it.
+
+### Derivation, not tuning
+
+`poc_fusion/poc_fusion/lib/window_bounds.py` (new, commit 9c83629) computes both
+edges as pure functions; `poc_fusion/test/test_window_bounds.py` holds the
+deployed YAML to them. `safety_distance` is **imported** from the frozen
+`proximity_alert.avoidance.AvoidanceConfig`, not restated, so the guard fails
+rather than going stale if that value ever moves.
+
+Half a costmap cell (0.025 m) is absorbed at every bound: `window_mask` tests
+cell CENTRES and the costmap is a rolling window in `odom`, so the effective
+edge jitters under the robot as it drives.
+
+### Physical measurements (operator, ruler, 2026-08-12, all ±0.001 m)
+
+| Quantity | Measured | Derived base_link value |
+|---|---|---|
+| front axle centre → gripper | 0.066 m | front extent **0.1328 m** (URDF axle x = +0.0668) |
+| outer wheel → outer wheel | 0.170 m | half-width **0.085 m** |
+| arm protrusion past chassis front | 0.032 m | chassis front 0.101 m |
+
+The **gripper**, not the chassis, is the frontmost point. Cross-checks: chassis
+front at 0.101 m matches the ~0.10 m independently implied by the front wheel's
+outer edge; URDF axle y = ±0.0738 leaves 0.0112 m of wheel beyond the axle
+plane, consistent with mecanum roller width. Because the arm sets the bound, its
+**parked pose is now safety-relevant** and is a required field in the trial
+metadata template. Arm motion remains forbidden (CONSTRAINTS.md line 30).
+
+### Result 1 — `window_half_width_m`: **DONE, GREEN**
+
+`0.3 → 0.135` in `poc_fusion/config/stop_monitor_params.yaml`.
+
+    robot half-width      0.085
+  + swept-path clearance  0.025   (stated design margin, not a measurement)
+  + half a costmap cell   0.025
+  = 0.135
+
+The guard `test_deployed_half_width_does_not_veto_strafes` was verified RED
+against 0.3 (`AssertionError: window_half_width_m=0.3 ... Must be <= 0.1350 m`)
+before the config change, and GREEN after. Red-green confirmed, not assumed.
+
+Why 0.3 was wrong rather than merely generous: `front_arc_deg: 180.0` means the
+controller's `front` is the MINIMUM over a 180° arc, so an obstacle at ~60°
+bearing and 0.20 m range sits near base_link x=0.17, y=0.17 — inside a ±0.3 m
+window, and it *stays* inside throughout the very strafe that is clearing it.
+At 0.135 a 0.15 m-wide obstacle leaves the window after ~0.21 m of strafe
+against `max_strafe_distance` 0.40 m; at 0.3 it needed ~0.375 m.
+
+### Result 2 — `window_forward_m`: **BLOCKED, unchanged at 1.0**
+
+The forward envelope is
+
+    front_extent + stopping_distance + half_cell
+        < window <
+    safety_distance + lidar_x_offset − stopping_distance − half_cell
+
+Stopping distance enters with opposite signs on the two sides, so it closes the
+band from both directions. With front extent 0.1328 m and LiDAR offset 0.0730 m:
+
+| stopping distance d | min | max | band width | feasible |
+|---|---|---|---|---|
+| 0.000 m | 0.1578 | 0.2480 | +0.0902 | yes |
+| 0.010 m | 0.1678 | 0.2380 | +0.0702 | yes |
+| 0.030 m | 0.1878 | 0.2180 | +0.0302 | yes |
+| 0.0451 m | 0.2029 | 0.2029 | 0.0000 | crossover |
+| 0.050 m | 0.2078 | 0.1980 | −0.0098 | **no** |
+
+**Option (a) is feasible if and only if the stopping distance at the operating
+0.20 m/s is under 0.0451 m.** Task 9 Part 2 gives 0.009 m, but at 0.05 m/s; a 4×
+speed extrapolation suggests ~0.036 m, which is under the limit by only ~20%.
+That extrapolation is **not** treated as evidence and no window value is being
+chosen from it. `MEASURED_STOPPING_DISTANCE_M` stays `None` in the test module
+and the two forward guards SKIP rather than pass on an invented number.
+
+If the arm were retracted (front extent 0.101 m) the crossover moves to
+0.0610 m — 35% more headroom. Not available: arm motion is forbidden.
+
+### Still open, and gating any actuating A→B run
+
+Whether the costmap **clears** once an obstacle leaves the window is unmeasured.
+`inf_is_valid`, `raytrace_max_range` and `obstacle_max_range` are all undeclared
+in `costmap_params.yaml`, and nav2 drops `inf` returns unless `inf_is_valid` is
+set. Task 9 Part 2 cannot distinguish "cleared correctly" from "never needed to
+clear" — the wall never left. If clearing does not work, fixing the trigger
+distance still leaves the robot held after it passes the obstacle.
+
+### Test status
+
+`cd poc_fusion && python3 -m pytest test -q` → **141 passed, 2 skipped**
+(baseline before this work: 135 passed). The 2 skips are the forward guards,
+pending the stopping-distance measurement.
+
+`git diff --stat -- proximity_alert/` → empty. The frozen package and the
+research-data pipeline are untouched. No robot motion was commanded for any part
+of this work.

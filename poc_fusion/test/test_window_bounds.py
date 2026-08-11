@@ -40,24 +40,30 @@ LIDAR_X_OFFSET_M = 0.0730
 # poc_fusion/config/costmap_params.yaml -> resolution: 0.05
 COSTMAP_RESOLUTION_M = 0.05
 
-# --- PENDING PHYSICAL MEASUREMENT -----------------------------------------
-# Deliberately None, not a plausible-looking placeholder. The config guards
-# below SKIP while these are None rather than passing on invented numbers --
-# a green suite here must mean the deployed window was checked against real
-# measurements, never that a default happened to satisfy an assumed bound.
+# --- PHYSICAL MEASUREMENTS ------------------------------------------------
+# Anything not yet measured stays None, never a plausible-looking placeholder.
+# The config guards below SKIP on None rather than passing on invented
+# numbers: a green suite here must mean the deployed window was checked
+# against real measurements, never that a default happened to satisfy an
+# assumed bound. Measured with a ruler by the operator, all +/- 0.001 m.
 #
-# MEASURED_FRONT_EXTENT_M      ruler: base_link -> frontmost physical point.
-#                              URDF gives only a collision MESH, and TF was
-#                              already 7 mm off the ruler in bench Phase 0,
-#                              so this is measured, not derived.
-# MEASURED_ROBOT_HALF_WIDTH_M  ruler: half the widest overall width.
-# MEASURED_STOPPING_DISTANCE_M distance travelled after a zero command at
-#                              forward_speed 0.20 m/s. The Task 9 Part 2 run
-#                              measured 0.009 m but at 0.05 m/s -- a 4x
-#                              extrapolation is not evidence, so it is
-#                              re-measured at the operating speed.
-MEASURED_FRONT_EXTENT_M = None
-MEASURED_ROBOT_HALF_WIDTH_M = None
+# Front extent: 0.066 m from the front-wheel axle centre to the GRIPPER, which
+# is the frontmost point -- the arm protrudes 0.032 m past the chassis front.
+# The URDF puts the front axle at base_link x = +0.0668, so:
+#     0.0668 + 0.066 = 0.1328 m
+# Cross-check: chassis front is then 0.066 - 0.032 = 0.034 m ahead of the
+# axle, i.e. base_link x = 0.101 m, matching the ~0.10 m independently implied
+# by the front wheel's outer edge. The two agree, so the arm -- not the
+# chassis -- sets this bound.
+MEASURED_FRONT_EXTENT_M = 0.1328
+
+# Overall width 0.170 m outer-wheel to outer-wheel.
+# Cross-check: URDF wheel axle y = +/-0.0738, leaving 0.0112 m of wheel beyond
+# the axle plane. Consistent with the mecanum roller width.
+MEASURED_ROBOT_HALF_WIDTH_M = 0.085
+
+# Still pending: requires a motion test at the operating speed. Task 9 Part 2
+# measured 0.009 m but at 0.05 m/s, and a 4x extrapolation is not evidence.
 MEASURED_STOPPING_DISTANCE_M = None
 
 # Lateral gap allowed beyond the robot's own width before the backstop stops
@@ -65,10 +71,13 @@ MEASURED_STOPPING_DISTANCE_M = None
 # design margin, sized at half a costmap cell.
 SWEPT_PATH_CLEARANCE_M = 0.025
 
-_PENDING = (MEASURED_FRONT_EXTENT_M is None
-            or MEASURED_ROBOT_HALF_WIDTH_M is None
-            or MEASURED_STOPPING_DISTANCE_M is None)
-_pending_reason = 'awaiting physical measurement; see module docstring'
+# Skip conditions are per-constraint, not global: the half-width guard needs
+# no stopping distance, so lumping them together would hide a live failure
+# behind an unrelated pending measurement.
+_PENDING_FORWARD = (MEASURED_FRONT_EXTENT_M is None
+                    or MEASURED_STOPPING_DISTANCE_M is None)
+_PENDING_HALF_WIDTH = MEASURED_ROBOT_HALF_WIDTH_M is None
+_pending_reason = 'awaiting physical measurement; see comments above'
 
 _CFG_DIR = os.path.join(os.path.dirname(__file__), '..', 'config')
 
@@ -148,7 +157,7 @@ def test_half_width_confines_backstop_to_swept_path():
 
 # --- The regression guard on the DEPLOYED config --------------------------
 
-@pytest.mark.skipif(_PENDING, reason=_pending_reason)
+@pytest.mark.skipif(_PENDING_FORWARD, reason=_pending_reason)
 def test_deployed_window_forward_is_inside_the_avoidance_trigger():
     """THE test. Fails against window_forward_m: 1.0."""
     params = _monitor_params()
@@ -167,7 +176,7 @@ def test_deployed_window_forward_is_inside_the_avoidance_trigger():
     )
 
 
-@pytest.mark.skipif(_PENDING, reason=_pending_reason)
+@pytest.mark.skipif(_PENDING_FORWARD, reason=_pending_reason)
 def test_deployed_window_forward_still_prevents_contact():
     params = _monitor_params()
     bound = min_window_forward_m(
@@ -181,7 +190,7 @@ def test_deployed_window_forward_still_prevents_contact():
     )
 
 
-@pytest.mark.skipif(_PENDING, reason=_pending_reason)
+@pytest.mark.skipif(_PENDING_HALF_WIDTH, reason=_pending_reason)
 def test_deployed_half_width_does_not_veto_strafes():
     params = _monitor_params()
     bound = max_window_half_width_m(
