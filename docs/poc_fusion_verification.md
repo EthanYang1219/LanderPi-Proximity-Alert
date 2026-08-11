@@ -5862,3 +5862,91 @@ never approaching the 0.45 m abort threshold. Scans clean: dt = 0.100 s for
 `cd poc_fusion && python3 -m pytest test -q` → **162 passed, 2 skipped**.
 `git diff --stat -- proximity_alert/` → empty; the frozen package and the
 research-data pipeline remain untouched.
+
+## 2026-08-12 — A→B demo readiness (no motion): fusion runs observationally
+
+Verification that the intended demonstration configuration preserves the frozen
+LiDAR-driven A→B avoidance path while the fusion stack observes alongside it.
+**No motion was commanded.** The robot was on charge throughout.
+
+### Correction to the stated chain
+
+The requested chain `path_tracker → /cmd_vel → motion_watchdog → motors` cannot
+hold. `motion_watchdog` **publishes** `/cmd_vel` — it is the last stage, not a
+middle one (`input_topic: /cmd_vel_unsafe`, `output_topic: /cmd_vel`). Putting
+path_tracker on `/cmd_vel` as well would give that topic two publishers, which is
+exactly the last-write-wins failure the gate design exists to prevent. The
+configuration that satisfies the intent is path_tracker remapped straight onto
+the watchdog's input, with the gate simply skipped:
+
+    path_tracker (-r /cmd_vel:=/cmd_vel_unsafe)
+        --> /cmd_vel_unsafe --> motion_watchdog --> /cmd_vel --> motors
+
+`stop_action_node` is omitted entirely via the launch argument `stop_action`,
+whose default is already `false` ("OFF by default: it is the only node here that
+can command a velocity"). This is NOT `publish_cmd_vel:=false`, which suppresses
+the gate's publisher and therefore passes no motion at all.
+
+### Configuration used
+
+    ros2 launch poc_fusion poc_fusion.launch.py      # stop_action defaults false
+
+### Evidence captured
+
+Fusion nodes up: `/costmap/costmap`, `/costmap_stop_monitor_node`,
+`/depth_preprocess_node`, `/lifecycle_manager_costmap`,
+`/poc_fusion/depth_rectify_node`. `stop_action_node` **absent**.
+Costmap lifecycle: `active [3]`.
+
+Every Twist topic in the system, with the full fusion stack running:
+
+| topic | publishers | subscribers |
+|---|---|---|
+| `/cmd_vel` | **0** | 1 — `odom_publisher` (vendor, drives motors) |
+| `/controller/cmd_vel` | 5 — `lidar_app`, `line_following`, `object_tracking`, `hand_gesture`, `joystick_control` (all stock vendor apps) | 1 — `odom_publisher` |
+
+There are only two Twist topics in the entire system and **no fusion node
+publishes a Twist on either**. `/costmap_stop_monitor_node` publishes only
+`Bool`, `DiagnosticArray` and `Marker`.
+
+| topic | publishers | subscribers |
+|---|---|---|
+| `/costmap_app/obstacle_detected` | 1 — `costmap_stop_monitor_node` | **0** |
+| `/costmap_app/monitor_status` | 1 | 0 |
+
+The Bool has **no consumer**: the only node that would act on it is
+`stop_action_node`, which is not running. The veto path does not exist in this
+configuration — not "is disabled", but is structurally absent.
+
+### Incidental confirmation of the window preemption finding
+
+With the robot stationary 0.7350 m from the wall, the monitor reported:
+
+    state=OBSTACLE  reason=lethal_cells_in_window  window_forward_m=1.000
+    costmap_age_s=0.165  lifecycle=active  tf_ok=True  bool_published=True
+
+The wall at 0.735 m sits inside the 1.000 m window. Had the gate been in series,
+the robot would have been held at zero before `AvoidanceController` (which
+engages at `safety_distance = 0.20` m front range) could ever act. This is the
+preemption predicted from the envelope math, observed live.
+
+### Status
+
+| # | Item | Result |
+|---|---|---|
+| 1 | Demo motion chain | VERIFIED, with the chain corrected as above |
+| 2 | `/cmd_vel` exactly one publisher | NOT YET — currently 0; the single publisher is `motion_watchdog`, not yet started |
+| 3 | Gate not in the motion chain | VERIFIED — node absent, not merely suppressed |
+| 4 | Fusion runs observationally | VERIFIED |
+| 5 | path_tracker selects STRAFE on a real obstacle | BLOCKED |
+| 6 | No fusion component can publish to or veto `/cmd_vel` | VERIFIED |
+| 7 | Publisher/subscriber evidence recorded | VERIFIED (this entry) |
+
+Item 5 is blocked on two things: permission to start `path_tracker` (the attempt
+was refused by the tooling's permission control and was not worked around), and a
+physical obstacle — the nearest return in the current scene is 0.735 m, well
+outside the 0.20 m trigger, so the controller would report DRIVE regardless.
+
+`git diff --stat -- proximity_alert/` → empty. The frozen package and the
+research-data pipeline are untouched; the demo configuration is achieved entirely
+with launch-time remapping and existing launch arguments.
