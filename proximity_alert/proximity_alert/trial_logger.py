@@ -13,11 +13,13 @@ For each trial it records:
     - odom_distance_m     : straight-line distance from start to end
                              odometry position (drift-affected estimate)
 
-It also watches /cmd_vel during the trial to detect whether path_tracker's
-obstacle-avoidance state (AVOIDING) ever triggered -- that state is the
-only place a negative linear.x is ever commanded, so a reverse command
-during the trial window is an unambiguous signal the robot swerved
-around something instead of driving a clean A->B line. Trials with
+It also watches /avoidance_decision during the trial and counts how many
+distinct avoidance encounters the controller actually committed to, which is
+an unambiguous signal the robot swerved around something instead of driving
+a clean A->B line. (It does NOT infer this from /cmd_vel: a STRAFE commands
+linear.x == 0.0, so reverse-detection missed strafe-only encounters entirely,
+and a crab correction is indistinguishable from a strafe on /cmd_vel.)
+Trials with
 avoidance_events > 0 measure something different (avoidance-affected
 slippage) than a clean run and must not be silently pooled with clean
 trials in the stats -- see avoidance_events below.
@@ -52,7 +54,7 @@ lives in your own separate layout sheet, not in this CSV.
 
 Topics:
     Subscribes: /odom (nav_msgs/Odometry)
-    Subscribes: /cmd_vel (geometry_msgs/Twist)
+    Subscribes: /avoidance_decision (std_msgs/String)
     Subscribes: /ros_robot_controller/battery (std_msgs/UInt16, raw mV) --
                 converted to a rough High/Medium/Low estimate assuming a 2S
                 Li-ion pack (6.0V empty - 8.4V full); not a precise SoC.
@@ -88,10 +90,11 @@ import os
 import time
 
 import rclpy
-from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
-from std_msgs.msg import Float32, UInt16
+from std_msgs.msg import Float32, String, UInt16
+
+from proximity_alert.decision_record import DecisionRecord
 
 
 CSV_HEADER = [
@@ -173,8 +176,8 @@ class TrialLogger(Node):
         self.odom_sub = self.create_subscription(
             Odometry, "/odom", self.odom_callback, 10
         )
-        self.cmd_vel_sub = self.create_subscription(
-            Twist, "/cmd_vel", self.cmd_vel_callback, 10
+        self.decision_sub = self.create_subscription(
+            String, "/avoidance_decision", self.decision_callback, 10
         )
         self.range_sub = self.create_subscription(
             Float32, "/forward_min_range", self.range_callback, 10
@@ -198,13 +201,22 @@ class TrialLogger(Node):
         self.stopped_since = None
         self.trial_num = self._count_existing_trials()
 
-        # Avoidance detection: path_tracker only ever commands a negative
-        # linear.x while in its AVOIDING state, so a reverse command seen
-        # during "moving" is an unambiguous obstacle-avoidance signal.
-        # was_reversing tracks edge transitions so multiple ticks of the
-        # same maneuver count as one event, not one per control-loop tick.
+        # Avoidance detection: counted from the /avoidance_decision stream,
+        # NOT from /cmd_vel. The old heuristic keyed on a negative linear.x,
+        # on the assumption that path_tracker only reverses while avoiding.
+        # That assumption is false: AvoidanceController._strafe commands
+        # linear.x == 0.0 (avoidance.py:412), so a strafe-only encounter --
+        # the most common kind -- never produced a reverse edge and silently
+        # logged avoidance_events=0 despite a real STRAFE in decision_log.csv.
+        # cmd_vel cannot distinguish an avoidance strafe from the cross-track
+        # crab correction either (both are linear.y with linear.x >= 0), so
+        # the decision stream is the only unambiguous source.
+        #
+        # Counted as DISTINCT encounter_id values carrying a real maneuver, so
+        # multiple decision records within one encounter count once, and a
+        # "cleared" DRIVE/NONE record does not count at all.
         self.avoidance_events = 0
-        self.was_reversing = False
+        self._maneuver_encounters = set()
 
         # Set by odom_callback when a trial has just finished; consumed by
         # the main loop so we can safely call blocking input() outside of
@@ -269,6 +281,7 @@ class TrialLogger(Node):
         layout_id="",
         outcome="",
         cause="",
+        trial_end_epoch=None,
     ):
         self.trial_num += 1
         error = odom_distance_m - ground_truth_m
@@ -292,11 +305,21 @@ class TrialLogger(Node):
         obstacle_count_str = (
             str(obstacle_count) if obstacle_count is not None else ""
         )
+        # The moment the ROBOT stopped, not the moment this row was written.
+        # Writing happens only after the operator answers every interactive
+        # prompt (~9 of them under track_obstacle_outcome), observed at 3-4
+        # minutes -- stamping write time made rows impossible to correlate
+        # against decision_log.csv or scan_trace.jsonl by time.
+        stamp = time.strftime(
+            "%Y-%m-%d %H:%M:%S",
+            time.localtime(trial_end_epoch) if trial_end_epoch is not None
+            else time.localtime(),
+        )
         with open(self.csv_path, "a", newline="") as f:
             writer = csv.writer(f)
             writer.writerow(
                 [
-                    time.strftime("%Y-%m-%d %H:%M:%S"),
+                    stamp,
                     surface,
                     self.trial_num,
                     f"{transit_time_s:.3f}",
@@ -326,14 +349,29 @@ class TrialLogger(Node):
 
     # ---------- Odometry / state machine ----------
 
-    def cmd_vel_callback(self, msg: Twist):
+    def _reset_avoidance_tracking(self):
+        self.avoidance_events = 0
+        self._maneuver_encounters = set()
+
+    def decision_callback(self, msg: String):
+        """Count distinct avoidance encounters seen during a trial.
+
+        A malformed or schema-drifted message must never take the logger down
+        mid-trial -- the trial's own measurements stay valid, we just cannot
+        attribute this one record, so it is logged and skipped (same policy as
+        decision_logger).
+        """
         if self.state != "moving":
-            self.was_reversing = False
             return
-        is_reversing = msg.linear.x < 0.0
-        if is_reversing and not self.was_reversing:
-            self.avoidance_events += 1
-        self.was_reversing = is_reversing
+        try:
+            rec = DecisionRecord.from_json(msg.data)
+        except Exception as exc:  # noqa: BLE001 - never fatal to a live trial
+            self.get_logger().warning(f"Unparseable decision record skipped: {exc}")
+            return
+        if rec.chosen_maneuver in ("", "NONE", None):
+            return
+        self._maneuver_encounters.add(rec.encounter_id)
+        self.avoidance_events = len(self._maneuver_encounters)
 
     def range_callback(self, msg: Float32):
         self.last_min_range = msg.data
@@ -354,8 +392,7 @@ class TrialLogger(Node):
                 self.start_pos = pos
                 self.start_time = now
                 self.stopped_since = None
-                self.avoidance_events = 0
-                self.was_reversing = False
+                self._reset_avoidance_tracking()
                 self.get_logger().info("Trial started (robot began moving).")
 
         elif self.state == "moving":
@@ -375,6 +412,7 @@ class TrialLogger(Node):
                         self.avoidance_events,
                         self.last_min_range,
                         self.last_battery_mv,
+                        self.stopped_since,
                     )
                     self.state = "idle"
                     avoid_note = (
@@ -405,6 +443,7 @@ def main(args=None):
                     avoidance_events,
                     lidar_stop_range_m,
                     battery_mv,
+                    trial_end_epoch,
                 ) = node.pending_trial
                 node.pending_trial = None
                 avoid_note = (
@@ -524,6 +563,7 @@ def main(args=None):
                         layout_id,
                         outcome,
                         cause,
+                        trial_end_epoch,
                     )
     except KeyboardInterrupt:
         pass
