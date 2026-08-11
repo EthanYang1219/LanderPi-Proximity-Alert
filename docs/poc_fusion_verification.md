@@ -5778,3 +5778,87 @@ pending the stopping-distance measurement.
 `git diff --stat -- proximity_alert/` → empty. The frozen package and the
 research-data pipeline are untouched. No robot motion was commanded for any part
 of this work.
+
+## 2026-08-12 — Floor test run 1: stopping distance measured, option (a) fails
+
+**Result: option (a) is INFEASIBLE on this evidence.** One armed run executed
+safely; the measured stopping distance exceeds the feasibility limit, and the
+measurement is a lower bound.
+
+### What was actually demonstrated
+
+| Quantity | Value |
+|---|---|
+| Range at the triggering scan | 0.7940 m |
+| Settled range | 0.7350 m (sd 0.2 mm, n=15) |
+| **Stopping distance (trigger-to-rest)** | **59.0 mm** |
+| Feasibility limit for option (a) | 45.1 mm |
+| Verdict | **OVER by 13.9 mm** |
+
+59.0 mm is a **lower bound**, not an estimate. In this run the stop command
+followed the triggering scan by one control-loop iteration. The deployed stack
+additionally has the costmap update, the monitor tick and the gate in between,
+all of which add distance. The real figure is larger by an unmeasured amount.
+
+Since the feasible band is empty for any d ≥ 45.1 mm, and the true value is
+≥ 59.0 mm, **no `window_forward_m` satisfies both constraints.** Option (a)
+cannot be made to work by choosing a better window.
+
+### Why the first reported number (66.6 mm, VOID) was wrong twice
+
+Both the value and the verdict were artifacts of the reduction method.
+
+*The value.* The original metric fit the approach line and evaluated it at the
+stop-command clock time. The LD19 assembles a rotation over ~0.1 s, so its
+forward beam is sampled at an unknown but **constant** phase. A constant stamp
+offset is invisible in a fitted slope and fully present in any range-versus-clock
+comparison. Re-reducing run 1 under different assumed `t_cmd` values moved the
+answer between **44.6 and 57.2 mm** — straddling the 45.1 mm decision threshold
+purely on a timestamp convention that was never verified. Differencing two range
+readings from the same sensor cancels the offset identically, whatever it is.
+
+*The verdict.* The run was voided for a fitted speed of 0.1612 m/s against a
+commanded 0.20. But odom twist read a rock-steady 0.2001–0.2017 m/s while the
+LiDAR ground truth was 0.1819 m/s: the robot was steady, the **wheels were
+slipping ~10%**. Voiding for that discards a good measurement and hides the slip.
+Validity is now steadiness across per-block speeds; shortfall against the
+commanded speed is reported separately as the slip finding it is.
+
+### Detection provenance
+
+Not applicable — no fusion stack was running. This is a direct LiDAR range
+measurement against a flat wall, by design: `/scan_raw`, median over a ±5° cone.
+The poc_fusion gate, costmap and monitor were all confirmed absent before the run.
+
+### Safety status
+
+Nominal throughout. Direction guard passed (1.822 → 1.499 m at 2.0 s). Zero was
+commanded at 0.7940 m; the robot came to rest with ~0.675 m of gripper clearance,
+never approaching the 0.45 m abort threshold. Scans clean: dt = 0.100 s for
+124/127 intervals, one 0.2 s gap. All exit paths published repeated zeros.
+
+### Secondary findings
+
+- **~10% wheel slippage.** Commanded 0.20 m/s yields ~0.18 m/s on the ground.
+  Odom over-reports and cannot be used as ground truth for distance. Belongs in
+  the paper's limitations.
+- **Geometry confirmed independently.** TF `base_link → end_effector_link`
+  x = 0.123 m against the operator's ruler 0.1328 m to the jaw tip — two methods
+  agreeing within 10 mm, residual in the expected direction.
+- **Odom cross-check was unusable** in run 1 because only `odom_x` was logged;
+  the robot's heading is not aligned with the odom frame, so Δx read −0.6526 m
+  against 0.8730 m of real forward travel. Now logs `odom_y` as well.
+
+### Pending — NOT claimed
+
+- **Runs 2 and 3 not executed.** Single-run evidence. Blocked on battery
+  (6.988 V now, against 7.432 V for run 1) and on repositioning: preflight
+  correctly refuses at the current 0.7350 m start, below the 1.40 m minimum.
+- The costmap **clearing** question is still unmeasured and still gates any
+  actuating A→B run.
+
+### Test status
+
+`cd poc_fusion && python3 -m pytest test -q` → **162 passed, 2 skipped**.
+`git diff --stat -- proximity_alert/` → empty; the frozen package and the
+research-data pipeline remain untouched.
