@@ -5563,3 +5563,104 @@ fusion claim remains unverified and is still blocked behind Task 10a (camera pos
 
 Evidence: `docs/poc_fusion_data/task9_part2_wall_events_2026-08-11.csv`
 (4136 rows, all recorded channels merged on one timeline).
+
+## Depth-contribution bench test, Phase 0 — **GATE FAILED, test stopped** (2026-08-11 ~05:0x HKT / 2026-08-10 ~21:0x UTC)
+
+Executed per
+[2026-08-11-depth-contribution-bench-test-design.md](../superpowers/specs/2026-08-11-depth-contribution-bench-test-design.md).
+Phase 0's gate failed, so Phases 1–4 did **not** run. The robot did not move at
+any point; the `poc_fusion` stack was never launched, because the gate is decided
+by geometry alone.
+
+### The measurement the repository had never recorded
+
+```
+$ ros2 run tf2_ros tf2_echo base_footprint lidar_frame
+- Translation: [0.073, 0.000, 0.093]
+- Rotation: in RPY (degree) [0.000, -0.000, 0.000]
+```
+
+The LD19 scan plane is **horizontal** (identity rotation) at **z = 0.093 m** per
+TF. Physical ruler check, floor to the centre of the spinning optical window:
+**8.6 ± 0.1 cm**.
+
+**TF overstates the true scan-plane height by 7 mm.** Recorded as a URDF
+inaccuracy. It has no marking consequence — the `scan` source's height filter is
+0.0–2.0 m, so a 7 mm shift changes nothing about which cells are marked — but any
+future height-sensitive work must use the measured value, not TF. Not chased
+further; out of scope here.
+
+`/scan_raw` geometry, for the record: `frame_id lidar_frame`, 503 beams,
+`angle_increment` 0.01249 rad, `range_min` 0.02 m, `range_max` 25.0 m,
+`scan_time` 0.1005 s (~9.95 Hz).
+
+### The gate
+
+| Bound | Value | Source |
+|---|---|---|
+| lower — depth will not mark below this | **0.100 m** | `pointcloud: min_obstacle_height`, `costmap_params.yaml` |
+| upper — LiDAR returns above this | **0.086 ± 0.001 m** | measured |
+| **band width** | **−0.014 m** | — |
+
+The band is **inverted**. Required width was ≥ 0.04 m. Using the TF value instead
+of the measured one gives −0.007 m — negative either way, so the conclusion does
+not depend on which figure is used.
+
+### What follows, for an object of height h
+
+| Object height | LiDAR returns? | Depth marks? |
+|---|---|---|
+| `h < 0.086 m` | no | no — below the floor filter |
+| `0.086 – 0.100 m` | **yes** | no |
+| `h ≥ 0.100 m` | **yes** | yes |
+
+**There is no object height at which depth marks and the LiDAR does not.** For
+floor-standing obstacles, H1 is not merely unproven at this configuration — it is
+**unfalsifiable by construction**. This is a stronger statement than Task 9
+Part 2's, which showed only that depth did not contribute at one detection
+distance.
+
+The margin is not close. Reaching a 0.04 m band needs the LiDAR at ≥ 0.14 m,
+which is 5.4 cm above the measured height — **54× the measurement uncertainty**.
+No plausible measurement error rescues it.
+
+### H1 (floor-standing obstacles): **FAIL** — premise void
+
+Per the spec's own definition: "FAIL … the LiDAR-only ablation also detects it
+because the object intersects the scan plane." Every object depth can mark
+intersects the scan plane. The ablation arm was not run because its outcome is
+determined by geometry, and running it would produce a confirmatory number rather
+than evidence.
+
+### H2: **NOT TESTED**
+
+H2 is only meaningful if H1 passes — there is nothing for LiDAR clearing to erase
+if depth never contributes a unique mark. The clearing hypothesis from the design
+doc §2 remains **open and unmeasured**, including the Phase 0.5 question of how
+`/scan_raw` encodes no-return beams. Not resolved here; not assumed either way.
+
+### Finding: a blind zone for both sensors
+
+**Any obstacle shorter than 0.086 m is invisible to the entire POC** — no LiDAR
+return, and depth's points discarded by the floor filter before they can mark.
+This is a property of the current configuration, independent of fusion, and is a
+more consequential safety result than the fusion question that prompted the test.
+Recorded, not fixed.
+
+### Finding: depth's marking band is redundant with LiDAR by construction
+
+Depth is permitted to mark 0.10–0.99 m. The LiDAR already covers everything above
+0.086 m. For floor-standing obstacles the two bands overlap almost completely, so
+the fused configuration adds no coverage over the LiDAR-only control for that
+obstacle class. The one region where depth could still add coverage is an
+**overhang**: an object whose lowest point is above the scan plane but inside
+depth's markable band, which the scan plane passes beneath. That class was not
+tested here.
+
+### What was NOT changed
+
+`min_obstacle_height` was **not** lowered to manufacture a testable band. It
+exists to reject floor returns from a camera pitched ~40° at the floor, and Task 8
+verified that filter. Lowering it to make this test runnable would have
+invalidated both this test and Task 8's verification. No parameter, threshold or
+config was modified. `proximity_alert` untouched.

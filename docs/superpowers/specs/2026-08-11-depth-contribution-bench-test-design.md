@@ -1,7 +1,7 @@
 # Depth-contribution bench test — design
 
 **Date:** 2026-08-11
-**Status:** approved, not yet executed
+**Status:** Phase 0 executed 2026-08-11 — gate FAILED, Phases 1-4 not run. See `docs/poc_fusion_verification.md`.
 **Relates to:** Task 11 (validation), Task 15 (fusion benefit A/B) of
 [2026-08-05-lidar-depth-costmap-fusion.md](../plans/2026-08-05-lidar-depth-costmap-fusion.md)
 **Motivated by:** Task 9 Part 2, which established that the POC's only
