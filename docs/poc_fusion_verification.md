@@ -5125,8 +5125,15 @@ video to capture.
 
 The reported figure is a **lower bound on true physical-entry-to-stop latency**.
 It is **not** end-to-end, and it is **not** stop-completion latency — it ends when
-the Bool flips, not when the wheels have stopped. The wheel-stop segment is
-unmeasured because Task 9 Step 3 has not run.
+the Bool flips, not when the wheels have stopped.
+
+**Superseded 2026-08-11:** this section previously said the wheel-stop segment was
+"unmeasured because Task 9 Step 3 has not run". Step 3 and Part 2 have both since
+run, and Part 2 measured that segment directly: **Bool `True` → last non-zero
+`/cmd_vel` = 3.5 ms**, gate latch at 28.9 ms. The command-path segment is
+therefore small next to the 75.4 ms perception figure. It is still not
+mechanical stop-completion time — that would need the wheels observed, not the
+commands — so the end-to-end figure remains a lower bound.
 
 ### Step 4: check against the budget
 
@@ -5142,6 +5149,52 @@ exposure and the wheel-stop segment, **the true physical latency is higher by an
 unmeasured amount**. The 2.6× margin is against the lower bound, not against the
 real number. Task 13's CPU figures are not yet collected, so the latency/compute
 tradeoff is not yet visible.
+
+### Open question raised by Task 9 Part 2: is this depth's latency, or just a recent depth frame?
+
+Task 9 Part 2 measured that at the operating 40° pose, depth reaches only
+**0.668 m** in the forward corridor, and that a floor-standing obstacle detected
+at 0.921 m was detected by **LiDAR alone**, with zero depth points at that range.
+That raises a question about the figure above that was not asked when it was
+taken.
+
+`latency_recorder_node` measures `transition_time − stamp of the newest
+`/poc_fusion/depth_cleaned` frame that arrived before the transition`. That is
+the correct construction **if depth caused the transition**. If LiDAR caused it,
+the selected frame is merely the most recent one, and the number is depth-frame
+recency rather than a causal latency.
+
+Re-examining the archived 35-sample set makes this sharper rather than safer:
+
+| Quantity | min | median | max |
+|---|---|---|---|
+| Reported latency | 42.0 ms | 75.4 ms | 116.4 ms |
+| `depth_cleaned` transport (stamp → received) | 36.7 ms | 42.1 ms | 70.5 ms |
+| **Age of the selected frame at the edge** | **0.6 ms** | **27.3 ms** | **70.6 ms** |
+
+The selected frame was never more than **70.6 ms** old. `/poc_fusion/depth_cleaned`
+was therefore running at roughly **14 Hz** — the healthy upstream image rate, not
+the ~2–4 Hz point-cloud rate. But that is exactly what makes the measurement
+unable to answer the question: at 14 Hz a very recent depth frame is *always*
+available, whether or not depth contributed anything. **Temporal adjacency here
+carries no causal information.**
+
+Note also that roughly **half** of the reported latency is transport from camera
+stamp to `depth_cleaned` arrival (42.1 ms of 75.4 ms median), which is upstream of
+everything this POC adds.
+
+**Status: detection provenance for the Task 12 dataset is UNVERIFIED.** The
+obstacle presentation distance was not recorded during that run, so it cannot be
+determined after the fact whether those 35 edges were inside depth's ~0.67 m
+measured reach. This is recorded as an open question, not resolved by assumption
+in either direction. The p95 ≤ 300 ms budget result stands as stated **for the
+pipeline as configured**; what is not established is that the number describes the
+depth path specifically.
+
+**Cheapest way to close it:** re-run the Task 12 collection with the obstacle
+placed inside the measured depth envelope (≤ 0.6 m) and log the presentation
+distance per edge, or run the same collection twice — once fused, once
+LiDAR-only — and compare. Neither is required for controlled floor testing.
 
 ### Sample set archived
 
