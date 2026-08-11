@@ -9,10 +9,12 @@ import pytest
 from poc_fusion.lib.stopping_distance import (
     analyse_run,
     approach_deadline_s,
+    block_speeds,
     fit_approach,
     is_closing,
     settled_range,
-    speed_is_valid,
+    speed_is_steady,
+    trigger_to_rest_m,
 )
 
 SCAN_DT = 0.1          # 10 Hz, matching the LD19
@@ -116,10 +118,33 @@ def test_settle_window_uses_median_so_one_dropout_cannot_move_it():
             == pytest.approx(0.036, abs=1e-9))
 
 
-def test_speed_validity_rejects_a_run_that_was_not_at_speed():
-    assert speed_is_valid(0.200, 0.20, 0.03)
-    assert speed_is_valid(0.225, 0.20, 0.03)
-    assert not speed_is_valid(0.120, 0.20, 0.03)
+def test_steadiness_accepts_a_steady_run_that_missed_the_commanded_speed():
+    """Run 1: odom said a rock-steady 0.2001 m/s, LiDAR ground truth said
+    0.1819 m/s. The robot was steady; the wheels were slipping ~10%. That is
+    a usable measurement plus a separate finding, not a void run."""
+    slipping_but_steady = [0.180, 0.184, 0.181, 0.183, 0.182]
+    assert speed_is_steady(slipping_but_steady, max_spread_mps=0.03)
+
+
+def test_steadiness_rejects_a_run_still_accelerating():
+    ramping = [0.05, 0.11, 0.16, 0.19, 0.20]
+    assert not speed_is_steady(ramping, max_spread_mps=0.03)
+
+
+def test_steadiness_needs_more_than_one_block():
+    with pytest.raises(ValueError, match='at least 2'):
+        speed_is_steady([0.18], max_spread_mps=0.03)
+
+
+def test_trigger_to_rest_is_immune_to_the_scan_phase_offset():
+    """The primary metric. A constant per-scan timestamp offset shifts every
+    fit-extrapolated answer but cannot touch a difference of two ranges."""
+    # Run 1's actual numbers: triggering scan 0.7940, settled 0.7350.
+    assert trigger_to_rest_m(0.7940, 0.7350) == pytest.approx(0.0590, abs=1e-9)
+    # Whatever the phase offset is, both readings carry it identically.
+    for offset_m in (0.0, 0.009, 0.018):
+        assert (trigger_to_rest_m(0.7940 - offset_m, 0.7350 - offset_m)
+                == pytest.approx(0.0590, abs=1e-9))
 
 
 def test_closing_check_catches_a_robot_driving_the_wrong_way():
@@ -155,6 +180,47 @@ def test_approach_deadline_refuses_a_start_inside_the_trigger():
     not a zero-length approach to be waved through."""
     with pytest.raises(ValueError, match='not beyond the trigger'):
         approach_deadline_s(0.5, 0.8, SPEED, 2.5, 2.0)
+
+
+def test_block_speeds_recover_a_constant_approach_speed():
+    speeds = block_speeds(_run(0.036), T_CMD, span_s=2.0, block_s=0.5)
+    assert len(speeds) == 4
+    for s in speeds:
+        assert s == pytest.approx(SPEED, abs=1e-9)
+
+
+def test_block_speeds_expose_a_ramp_that_a_single_fit_would_average_away():
+    """The reason blocks exist. A robot still accelerating has the right
+    MEAN speed and the wrong steadiness; one global fit reports only the
+    mean and would wave the run through."""
+    samples = []
+    t, r = T_CMD - 2.0, 1.4
+    while t <= T_CMD + 1e-9:
+        samples.append((t, r))
+        v = 0.05 + 0.075 * (t - (T_CMD - 2.0))   # ramping 0.05 -> 0.20
+        r -= v * SCAN_DT
+        t += SCAN_DT
+    speeds = block_speeds(samples, T_CMD, span_s=2.0, block_s=0.5)
+    assert not speed_is_steady(speeds, max_spread_mps=0.03)
+    # The mean over the whole approach is ~0.125 m/s and perfectly plausible.
+    assert 0.10 < sum(speeds) / len(speeds) < 0.15
+
+
+def test_block_speeds_are_positive_toward_the_wall():
+    """Sign convention: closing is positive, matching approach_speed_mps."""
+    receding = [(T_CMD - 2.0 + i * SCAN_DT, 1.0 + SPEED * i * SCAN_DT)
+                for i in range(21)]
+    assert all(s < 0 for s in block_speeds(receding, T_CMD, 2.0, 0.5))
+
+
+def test_block_speeds_skip_blocks_too_sparse_to_measure():
+    """A dropout must drop that block, not fabricate a speed from one point."""
+    samples = [(t, r) for t, r in _run(0.036)
+               if not (T_CMD - 1.5 < t < T_CMD - 1.05)]
+    speeds = block_speeds(samples, T_CMD, span_s=2.0, block_s=0.5)
+    assert len(speeds) == 3
+    for s in speeds:
+        assert s == pytest.approx(SPEED, abs=1e-9)
 
 
 def test_settled_range_returns_its_sample_count_and_spread():

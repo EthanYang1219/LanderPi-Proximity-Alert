@@ -12,21 +12,35 @@ both directions. With the measured geometry (front extent 0.1328 m, LiDAR
 offset 0.0730 m, cell 0.05 m) the band is empty once d >= 0.0451 m. Task 9
 Part 2 gives 0.009 m but at 0.05 m/s; a 4x speed extrapolation is not evidence.
 
-WHAT IT MEASURES, AND WHY NOT THE OBVIOUS WAY
----------------------------------------------
-Naively: record the wall range when zero is commanded, record it again once
-stopped, subtract. That is WRONG here. The newest scan at the moment of the
-stop command is up to one scan period old, and at 0.20 m/s a 0.1 s scan age is
-0.02 m -- the same order as the quantity being measured. The bias would be
-comparable to the result.
+WHAT IT MEASURES
+----------------
+    stopping_distance = range at the TRIGGERING scan - median(settled range)
 
-So instead the approach segment is fit as a straight line r(t) = r0 - v*t over
-the second preceding the stop command, using each scan's OWN header stamp, and
-that fit is evaluated AT the stop-command time. Scan age cancels. The fitted
-`v` is a free cross-check: it must come out near 0.20 m/s, otherwise the robot
-was not at steady speed and the run is void.
+Two range readings from the same sensor, differenced. Run 1 forced this choice.
+The earlier method fit the approach and extrapolated to the stop-command clock
+time, which looks more careful and is in fact worse here: the LD19 assembles a
+rotation over ~0.1 s, so its forward beam is sampled at an unknown but CONSTANT
+phase. That offset is invisible in a fitted slope and fully present in anything
+comparing a range to a clock. On run 1 the fitted answer moved between 44.6 and
+57.2 mm purely with the assumed t_cmd -- straddling the 45.1 mm decision
+threshold on an unverified timestamp convention. Differencing two ranges
+cancels the offset exactly, whatever it is.
 
-    stopping_distance = r_fit(t_cmd) - median(r during the settle window)
+It is also the operationally meaningful number: the monitor sees ranges, not
+clock times.
+
+The result is a LOWER BOUND. Here the stop command follows the triggering scan
+by one control-loop iteration; the deployed stack additionally has the costmap
+update, the monitor tick and the gate in between. Treat it as a floor, never as
+a central value to size a margin around.
+
+VALIDITY
+--------
+The run is void if the robot was not at a STEADY speed -- a stopping distance
+is only meaningful from a constant initial speed. It is NOT void merely for
+missing the commanded speed: run 1 was rock-steady at 0.1819 m/s under a
+commanded 0.20, i.e. ~10% wheel slip. That is a usable measurement plus a
+separate finding, and is reported as such.
 
 SAFETY
 ------
@@ -72,8 +86,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'
 from poc_fusion.lib.stopping_distance import (  # noqa: E402
     analyse_run,
     approach_deadline_s,
+    block_speeds,
     is_closing,
-    speed_is_valid,
+    speed_is_steady,
+    trigger_to_rest_m,
 )
 
 # --- Fixed test parameters ------------------------------------------------
@@ -113,6 +129,13 @@ MIN_FRONT_BEAMS = 3
 
 PREFLIGHT_S = 3.0
 
+# Steadiness is what validates the run. Speed SHORTFALL against the commanded
+# value does not void it -- it is reported as a separate slip finding.
+STEADY_SPREAD_MPS = 0.05     # max spread across approach blocks; else void
+STEADY_BLOCK_S = 0.5         # block length used to judge steadiness
+STEADY_SPAN_S = 2.0          # how far back from t_cmd steadiness is judged
+SPEED_TOLERANCE_MPS = 0.03   # beyond this the slip is called out, not voided
+
 
 class StoppingDistanceRun(Node):
 
@@ -126,6 +149,7 @@ class StoppingDistanceRun(Node):
         self.last_scan_wall = None
         self.last_front = None
         self.scan_count = 0
+        self.trigger_scan_range = None
 
         self.cmd_pub = self.create_publisher(Twist, CMD_TOPIC, 1)
         self.create_subscription(
@@ -291,6 +315,7 @@ class StoppingDistanceRun(Node):
             time.sleep(period)
 
         # The stop command instant. Everything downstream is referenced here.
+        self.trigger_scan_range = self.last_front
         self._publish(0.0)
         t_cmd_wall = time.monotonic()
         t_cmd_stamp = self.samples[-1][0] + (t_cmd_wall - self.last_scan_wall)
@@ -308,7 +333,9 @@ class StoppingDistanceRun(Node):
         return t_cmd_stamp
 
 
-SPEED_TOLERANCE_MPS = 0.03   # fitted vs commanded; beyond this the run is void
+STEADY_SPREAD_MPS = 0.05     # max spread across approach blocks; else void
+STEADY_BLOCK_S = 0.5         # block length used to judge steadiness
+STEADY_SPAN_S = 2.0          # how far back from t_cmd steadiness is judged
 
 
 def main():
@@ -349,31 +376,54 @@ def main():
             print(f'INCONCLUSIVE: {exc}')
             return 3
 
+        primary = trigger_to_rest_m(node.trigger_scan_range,
+                                    result['settled_range_m'])
+        blocks = block_speeds(node.samples, t_cmd_stamp,
+                              STEADY_SPAN_S, STEADY_BLOCK_S)
+
         print('\n--- RESULT ---')
-        print(f'  fitted approach speed : '
-              f'{result["approach_speed_mps"]:.4f} m/s '
-              f'(commanded {TEST_SPEED_MPS})')
-        print(f'  fit points / resid sd : {result["fit_points"]} / '
-              f'{result["fit_residual_sd_m"]*1000:.1f} mm')
-        print(f'  range at stop command : '
-              f'{result["range_at_cmd_m"]:.4f} m (fit-corrected)')
+        print(f'  triggering scan range : '
+              f'{node.trigger_scan_range:.4f} m')
         print(f'  settled range         : '
               f'{result["settled_range_m"]:.4f} m '
               f'(sd {result["settle_sd_m"]*1000:.1f} mm, '
               f'n={result["settle_points"]})')
-        print(f'  STOPPING DISTANCE     : '
-              f'{result["stopping_distance_m"]*1000:.1f} mm')
+        print(f'  STOPPING DISTANCE     : {primary*1000:.1f} mm '
+              f'  <-- primary, and a LOWER BOUND')
+        print('    (trigger-to-rest. Immune to the LD19 scan-phase offset '
+              'because it differences two range readings, not a range '
+              'against a clock. A lower bound because the deployed stack '
+              'adds costmap + monitor + gate latency this run does not have.)')
 
-        if not speed_is_valid(result['approach_speed_mps'], TEST_SPEED_MPS,
-                              SPEED_TOLERANCE_MPS):
-            print(f'  ** VOID: fitted speed differs from the commanded '
-                  f'{TEST_SPEED_MPS} m/s by more than '
-                  f'{SPEED_TOLERANCE_MPS} m/s. The robot was not at steady '
-                  f'speed; this is not a stopping distance at {TEST_SPEED_MPS} '
-                  f'm/s. Discard the run. **')
+        print('\n  cross-checks (not the result):')
+        print(f'    fit-extrapolated    : '
+              f'{result["stopping_distance_m"]*1000:.1f} mm '
+              f'(scan-phase sensitive; do not quote)')
+        print(f'    LiDAR ground speed  : '
+              f'{result["approach_speed_mps"]:.4f} m/s '
+              f'(commanded {TEST_SPEED_MPS}); '
+              f'resid sd {result["fit_residual_sd_m"]*1000:.1f} mm '
+              f'over {result["fit_points"]} pts')
+        print(f'    block speeds        : '
+              f'{", ".join(f"{s:.3f}" for s in blocks)} m/s')
+
+        if len(blocks) < 2:
+            print('  ** INCONCLUSIVE: fewer than 2 approach blocks; '
+                  'steadiness cannot be judged. **')
+            exit_code = 3
+        elif not speed_is_steady(blocks, STEADY_SPREAD_MPS):
+            print(f'  ** VOID: block speeds spread more than '
+                  f'{STEADY_SPREAD_MPS} m/s. The robot was still changing '
+                  f'speed, so this is not a stopping distance FROM a steady '
+                  f'speed. Discard the run. **')
             exit_code = 3
         else:
-            under = result['stopping_distance_m'] < 0.0451
+            shortfall = TEST_SPEED_MPS - result['approach_speed_mps']
+            if abs(shortfall) > SPEED_TOLERANCE_MPS:
+                print(f'  NOTE: steady, but {shortfall*1000:.0f} mm/s below '
+                      f'the commanded speed -- wheel slip, reported as a '
+                      f'separate finding. The run stands.')
+            under = primary < 0.0451
             print(f'  feasibility limit     : 45.1 mm '
                   f'({"UNDER -- option (a) is feasible" if under else "OVER -- option (a) is NOT feasible"})')
     except RuntimeError as exc:
@@ -389,6 +439,10 @@ def main():
                     w.writerow([f'{t:.6f}', 'front_range_m', f'{r:.5f}'])
                 for t, x, y, vx in node.odom:
                     w.writerow([f'{t:.6f}', 'odom_x_m', f'{x:.5f}'])
+                    # y is logged too: run 1 showed x alone is useless as a
+                    # cross-check, because the robot's heading is not aligned
+                    # with the odom frame and x is only one component.
+                    w.writerow([f'{t:.6f}', 'odom_y_m', f'{y:.5f}'])
                     w.writerow([f'{t:.6f}', 'odom_vx_mps', f'{vx:.5f}'])
             print(f'Raw trace written to {args.out} '
                   f'({len(node.samples)} scan rows)')

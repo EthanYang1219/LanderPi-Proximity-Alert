@@ -3,21 +3,21 @@
 Input is a list of `(stamp_s, front_range_m)` samples spanning an approach at
 constant speed, a stop command at `t_cmd`, and a settled period afterwards.
 
-WHY NOT JUST SUBTRACT TWO READINGS
-----------------------------------
-The obvious method -- range when zero was commanded, minus range once stopped
--- carries a bias equal to the age of the newest scan at the command instant.
-At 0.20 m/s and a ~10 Hz LiDAR that is up to 0.02 m, which is the same order
-as the stopping distance itself. The bias would be comparable to the result.
+THE PRIMARY METRIC
+------------------
+`trigger_to_rest_m`: the range at the triggering scan minus the settled range.
+Two range readings from the same sensor, differenced.
 
-So the approach segment is fit as a straight line using each sample's OWN
-timestamp and evaluated AT `t_cmd`. Scan age cancels because it is carried in
-the timestamps rather than ignored.
+`fit_approach` / `analyse_run` implement an alternative that fits the approach
+and extrapolates to the stop-command clock time. That is retained as a
+CROSS-CHECK only. It looks more careful and is worse here, because the LD19
+samples its forward beam at an unknown but constant phase within each ~0.1 s
+rotation: an offset invisible in a fitted slope and fully present in anything
+that compares a range against a clock. See `trigger_to_rest_m` for the measured
+consequence on run 1.
 
-The fitted speed is not incidental -- it is the run's validity check. If the
-robot was not actually holding the commanded speed when zero was sent, the
-"stopping distance" is measuring something else, and `speed_is_valid` says so
-rather than letting a plausible-looking number through.
+Validity is `speed_is_steady` over `block_speeds`, not agreement with the
+commanded speed -- see those functions for why the distinction is load-bearing.
 """
 import statistics
 
@@ -97,13 +97,77 @@ def is_closing(start_range_m, current_range_m, min_decrease_m):
     return (start_range_m - current_range_m) >= min_decrease_m
 
 
-def speed_is_valid(fitted_speed_mps, commanded_speed_mps, tolerance_mps):
-    """Was the robot actually at the commanded speed when zero was sent?
+def trigger_to_rest_m(trigger_scan_range_m, settled_range_m):
+    """THE primary measurement: range at the triggering scan, minus rest.
 
-    If not, the measured decrease in range is not a stopping distance at that
-    speed, and the run must be discarded rather than reported.
+    WHY THIS RATHER THAN THE FIT
+    ----------------------------
+    The LD19 assembles a full rotation over ~0.1 s, so the forward beam is
+    sampled at some phase within each scan. That phase is unknown but
+    CONSTANT, which makes it invisible in the fitted slope and fully visible
+    in any quantity that compares a range against a CLOCK time. Extrapolating
+    the fit to the stop-command instant is exactly such a quantity: a constant
+    stamp offset there biases the answer by up to v * 0.1 s = 18 mm at
+    0.18 m/s, on a quantity of order 50 mm. Measured on run 1, the fit-based
+    estimate moved between 44.6 and 57.2 mm purely with the assumed t_cmd --
+    i.e. it straddled the decision threshold on a timestamp convention that
+    was never verified.
+
+    Differencing two RANGE readings from the same sensor cancels that offset
+    identically, whatever it is.
+
+    It is also the operationally meaningful number. The safety question is
+    "the monitor sees an obstacle at range X; where does the robot come to
+    rest?", and the monitor sees range readings, not clock times.
+
+    LOWER BOUND, NOT AN ESTIMATE
+    ----------------------------
+    The measured value understates the deployed system. Here the stop command
+    followed the triggering scan by one control-loop iteration; in the
+    deployed stack the costmap update, the monitor tick and the gate all sit
+    in between. So treat the result as a floor on the real stopping distance,
+    never as a central value to size a margin around.
     """
-    return abs(fitted_speed_mps - commanded_speed_mps) <= tolerance_mps
+    return trigger_scan_range_m - settled_range_m
+
+
+def block_speeds(samples, t_cmd, span_s, block_s):
+    """Closing speed within each block of the approach, endpoint-to-endpoint.
+
+    Deliberately per-block rather than one global fit: a global fit reports a
+    single average and hides an acceleration ramp inside it. Steadiness is a
+    statement about the SPREAD across blocks, so the blocks have to exist.
+    """
+    speeds = []
+    edge = t_cmd - span_s
+    while edge < t_cmd - 1e-9:
+        seg = [(t, r) for t, r in samples if edge <= t <= edge + block_s]
+        edge += block_s
+        if len(seg) < 2:
+            continue
+        dt = seg[-1][0] - seg[0][0]
+        if dt <= 0.0:
+            continue
+        speeds.append((seg[0][1] - seg[-1][1]) / dt)   # +ve = closing
+    return speeds
+
+
+def speed_is_steady(block_speeds_mps, max_spread_mps):
+    """Was the robot at a CONSTANT speed through the approach?
+
+    Deliberately NOT a comparison against the commanded speed. Run 1 showed
+    why: odom twist reported a rock-steady 0.2001 m/s while the LiDAR ground
+    truth was 0.1819 m/s. The robot was perfectly steady; the wheels were
+    slipping ~10%. Voiding that run for "not at the commanded speed" would
+    discard a good measurement and hide the slip.
+
+    Steadiness is what the measurement actually requires -- a stopping
+    distance is only meaningful from a constant initial speed. Whether that
+    speed equals the commanded one is a separate finding, reported separately.
+    """
+    if len(block_speeds_mps) < 2:
+        raise ValueError('need at least 2 blocks to judge steadiness')
+    return (max(block_speeds_mps) - min(block_speeds_mps)) <= max_spread_mps
 
 
 def analyse_run(samples, t_cmd, fit_window_s, settle_skip_s, settle_window_s):
