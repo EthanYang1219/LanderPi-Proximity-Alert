@@ -142,6 +142,13 @@ The robot's ROS 2 stack already runs in a Docker container named `MentorPi` on t
    docker exec -it -u ubuntu MentorPi zsh -lc "source ~/.zshrc && source ~/ros2_ws/install/setup.bash && ros2 run proximity_alert trial_logger --ros-args -p csv_path:=/home/ubuntu/shared/trials/granite.csv"
    ```
 
+   **Running obstacle-avoidance trials instead of a clean surface run?** Point Terminal B at `avoidance_trials.csv` with `track_obstacle_outcome:=true` — this additionally prompts for `obstacle_count`, `layout_id`, `outcome` (success/failure), and `cause` once the trial stops (see [Data collected](#data-collected)):
+
+   ```bash
+   # Terminal B (avoidance-trial variant)
+   docker exec -it -u ubuntu MentorPi zsh -lc "source ~/.zshrc && source ~/ros2_ws/install/setup.bash && ros2 run proximity_alert trial_logger --ros-args -p csv_path:=/home/ubuntu/shared/trials/avoidance_trials.csv -p track_obstacle_outcome:=true"
+   ```
+
    ```bash
    # Terminal C — log the avoidance decisions (separate CSV)
    docker exec -it -u ubuntu MentorPi zsh -lc "source ~/.zshrc && source ~/ros2_ws/install/setup.bash && ros2 run proximity_alert decision_logger --ros-args -p csv_path:=/home/ubuntu/shared/trials/decision_log.csv"
@@ -207,6 +214,10 @@ Each row appended to the CSV represents one trial:
 | `lidar_stop_range_m` | The actual LiDAR range to the closest obstacle in the forward arc at the moment the trial finalized (i.e. the real stop clearance), captured from `path_tracker`'s `/forward_min_range` topic. Useful for checking proximity-trigger accuracy against the `safety_distance` parameter and whether it varies by surface. Blank if nothing valid was in the arc at stop. **Measure `ground_truth_distance_m`/stop clearance from the LiDAR unit itself** (the rotating sensor housing), not the chassis front edge — `safety_distance` and this column are both computed against the LiDAR's own raw range, so that's the only measurement point directly comparable to them. Expect the real stop clearance to consistently undershoot the configured `safety_distance` by a few centimeters (at the defaults, `obstacle_confirm_scans=2` debounce scans at the LD19's ~10Hz rate, times `forward_speed`, accounts for ~5cm of it) — that's expected stop latency, not a measurement or code error. If your tape measurement doesn't match this logged value, that's the discrepancy worth investigating; a gap against `safety_distance` alone is not. |
 | `notes` | Freeform text entered at logging time for anything unusual observed (e.g. "motors fought each other on the turn", "oscillated near desk", "false stop") |
 | `battery_level` | Rough `High`/`Medium`/`Low` estimate captured from `/ros_robot_controller/battery` (raw millivolts) at the moment the trial finalized, assuming a 2S Li-ion pack (6.0V empty - 8.4V full). Not a precise state-of-charge reading -- just enough to flag "was the pack getting low during this session." Blank if no reading had arrived yet. |
+| `obstacle_count` | Number of obstacles present for this trial, entered at the prompt. **Blank unless `track_obstacle_outcome:=true`** — a plain surface trial (granite.csv etc.) never asks for this. |
+| `layout_id` | Short label you assign per obstacle arrangement (e.g. `layout_A`), entered at the prompt. The actual obstacle geometry for that ID lives in your own separate layout sheet, not in this CSV. Blank unless `track_obstacle_outcome:=true`. |
+| `outcome` | `success` or `failure`, entered at the prompt (validated — no other value is accepted). Blank unless `track_obstacle_outcome:=true`. |
+| `cause` | Freeform text describing why the trial succeeded or failed, entered at the prompt. Blank unless `track_obstacle_outcome:=true`. |
 
 ## Refined obstacle avoidance
 
