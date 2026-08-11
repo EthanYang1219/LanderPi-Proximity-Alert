@@ -41,7 +41,14 @@ CSV columns:
     timestamp, surface, trial_num, transit_time_s, odom_distance_m,
     ground_truth_distance_m, slippage_error_m, slippage_pct,
     avoidance_events, lidar_stop_range_m, notes, battery_level,
-    ground_truth_lateral_offset_m
+    ground_truth_lateral_offset_m, obstacle_count, layout_id, outcome, cause
+
+The last four columns (obstacle_count, layout_id, outcome, cause) are only
+ever populated when track_obstacle_outcome:=true (see Parameters below) --
+plain surface trials (granite.csv etc.) leave them blank and are prompted
+exactly as before. layout_id is a short label you assign per obstacle
+arrangement (e.g. "layout_A"); the actual obstacle geometry for that ID
+lives in your own separate layout sheet, not in this CSV.
 
 Topics:
     Subscribes: /odom (nav_msgs/Odometry)
@@ -60,6 +67,14 @@ Parameters:
     stop_confirm_duration   (float, default 1.0)  seconds of continuous
                                                     stopped-ness before a
                                                     trial is finalized
+    track_obstacle_outcome  (bool,  default False) -- when true, also prompts
+                                                    for obstacle_count,
+                                                    layout_id, outcome
+                                                    (success/failure) and
+                                                    cause per trial. Use for
+                                                    csv_path=avoidance_trials.csv;
+                                                    leave false for plain
+                                                    surface trials.
 
 Run (in a second terminal, alongside path_tracker.py):
     ros2 run <your_package> trial_logger
@@ -93,6 +108,10 @@ CSV_HEADER = [
     "notes",
     "battery_level",
     "ground_truth_lateral_offset_m",
+    "obstacle_count",
+    "layout_id",
+    "outcome",
+    "cause",
 ]
 
 # /ros_robot_controller/battery publishes raw millivolts (std_msgs/UInt16),
@@ -132,11 +151,13 @@ class TrialLogger(Node):
         self.declare_parameter("move_velocity_threshold", 0.03)
         self.declare_parameter("stop_velocity_threshold", 0.02)
         self.declare_parameter("stop_confirm_duration", 1.0)
+        self.declare_parameter("track_obstacle_outcome", False)
 
         self.csv_path = self.get_parameter("csv_path").value
         self.move_threshold = self.get_parameter("move_velocity_threshold").value
         self.stop_threshold = self.get_parameter("stop_velocity_threshold").value
         self.stop_confirm_duration = self.get_parameter("stop_confirm_duration").value
+        self.track_obstacle_outcome = self.get_parameter("track_obstacle_outcome").value
 
         # Surface defaults to the CSV filename (e.g. ".../granite.csv" ->
         # "granite") -- one CSV per surface is already this project's
@@ -244,6 +265,10 @@ class TrialLogger(Node):
         notes,
         battery_level_str,
         lateral_offset_m=None,
+        obstacle_count=None,
+        layout_id="",
+        outcome="",
+        cause="",
     ):
         self.trial_num += 1
         error = odom_distance_m - ground_truth_m
@@ -260,6 +285,12 @@ class TrialLogger(Node):
         # and on-line".
         lateral_str = (
             f"{lateral_offset_m:.4f}" if lateral_offset_m is not None else ""
+        )
+        # Blank rather than "0", "None" or a fabricated value -- these four
+        # columns are only ever populated for track_obstacle_outcome runs;
+        # a plain surface trial must leave them genuinely empty, not "0".
+        obstacle_count_str = (
+            str(obstacle_count) if obstacle_count is not None else ""
         )
         with open(self.csv_path, "a", newline="") as f:
             writer = csv.writer(f)
@@ -278,6 +309,10 @@ class TrialLogger(Node):
                     notes,
                     battery_level_str,
                     lateral_str,
+                    obstacle_count_str,
+                    layout_id,
+                    outcome,
+                    cause,
                 ]
             )
         if avoidance_events:
@@ -438,6 +473,43 @@ def main(args=None):
                         "Notes -- anything unusual? e.g. motor conflict, "
                         "oscillation, false stop (blank if none): "
                     ).strip()
+
+                    obstacle_count = None
+                    layout_id = ""
+                    outcome = ""
+                    cause = ""
+                    if node.track_obstacle_outcome:
+                        while obstacle_count is None:
+                            oc_raw = input(
+                                "Obstacle count for this trial: "
+                            ).strip()
+                            try:
+                                value = int(oc_raw)
+                            except ValueError:
+                                print(f"  '{oc_raw}' is not an integer -- try again.")
+                                continue
+                            if value < 0:
+                                print("  Obstacle count must be >= 0 -- try again.")
+                                continue
+                            obstacle_count = value
+
+                        layout_id = input(
+                            "Layout ID for this obstacle arrangement "
+                            "(e.g. 'layout_A', blank if untracked): "
+                        ).strip()
+
+                        while outcome not in ("success", "failure"):
+                            outcome = input(
+                                "Outcome -- 'success' or 'failure': "
+                            ).strip().lower()
+                            if outcome not in ("success", "failure"):
+                                print("  Enter exactly 'success' or 'failure'.")
+
+                        cause = input(
+                            f"Cause of {outcome} -- freeform "
+                            "(blank if none): "
+                        ).strip()
+
                     node._append_row(
                         node.surface,
                         transit_time_s,
@@ -448,6 +520,10 @@ def main(args=None):
                         notes,
                         battery_level_str,
                         lateral_offset_m,
+                        obstacle_count,
+                        layout_id,
+                        outcome,
+                        cause,
                     )
     except KeyboardInterrupt:
         pass

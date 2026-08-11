@@ -60,6 +60,10 @@ def test_append_row_includes_lidar_stop_range_and_keeps_existing_columns():
         "notes",
         "battery_level",
         "ground_truth_lateral_offset_m",
+        "obstacle_count",
+        "layout_id",
+        "outcome",
+        "cause",
     ]
     by_col = dict(zip(header, row))
     assert by_col["lidar_stop_range_m"] == "0.2800"
@@ -67,6 +71,51 @@ def test_append_row_includes_lidar_stop_range_and_keeps_existing_columns():
     assert by_col["notes"] == "clean run"
     assert by_col["battery_level"] == "High"
     assert by_col["ground_truth_lateral_offset_m"] == "0.0500"
+    # A plain surface trial (no track_obstacle_outcome) leaves these blank,
+    # not "0" or fabricated -- genuinely untracked, not "0 obstacles".
+    assert by_col["obstacle_count"] == ""
+    assert by_col["layout_id"] == ""
+    assert by_col["outcome"] == ""
+    assert by_col["cause"] == ""
+
+
+def test_append_row_records_obstacle_outcome_fields_when_provided():
+    rclpy.init()
+    fd, path = tempfile.mkstemp(suffix=".csv")
+    os.close(fd)
+    os.remove(path)
+
+    node = _fresh_logger(path)
+    node._append_row(
+        surface="avoidance",
+        transit_time_s=6.1,
+        odom_distance_m=2.0,
+        ground_truth_m=2.0,
+        avoidance_events=1,
+        lidar_stop_range_m=0.22,
+        notes="",
+        battery_level_str="High",
+        lateral_offset_m=None,
+        obstacle_count=2,
+        layout_id="layout_A",
+        outcome="success",
+        cause="strafed clear on first attempt",
+    )
+
+    with open(path, newline="") as f:
+        rows = list(csv.reader(f))
+
+    node.destroy_node()
+    rclpy.shutdown()
+    os.remove(path)
+    if os.path.exists("trial_log.csv"):
+        os.remove("trial_log.csv")
+
+    by_col = dict(zip(rows[0], rows[1]))
+    assert by_col["obstacle_count"] == "2"
+    assert by_col["layout_id"] == "layout_A"
+    assert by_col["outcome"] == "success"
+    assert by_col["cause"] == "strafed clear on first attempt"
 
 
 def test_ensure_header_migrates_stale_short_header_and_pads_old_rows():
@@ -121,11 +170,12 @@ def test_ensure_header_migrates_stale_short_header_and_pads_old_rows():
         "odom_distance_m", "ground_truth_distance_m", "slippage_error_m",
         "slippage_pct", "avoidance_events", "lidar_stop_range_m", "notes",
         "battery_level", "ground_truth_lateral_offset_m",
+        "obstacle_count", "layout_id", "outcome", "cause",
     ]
     assert rows[0] == canonical
     assert len(rows[1]) == len(canonical)          # old row padded, not left short
     assert rows[1][:8] == old_row                  # original data untouched
-    assert rows[1][8:] == ["", "", "", "", ""]      # padded blank, not fabricated
+    assert rows[1][8:] == [""] * (len(canonical) - 8)  # padded blank, not fabricated
     assert len(rows[2]) == len(canonical)           # new row same width
     by_col = dict(zip(canonical, rows[2]))
     assert by_col["notes"] == "PID tuning"
