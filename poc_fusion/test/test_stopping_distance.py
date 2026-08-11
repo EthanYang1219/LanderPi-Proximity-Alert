@@ -8,7 +8,9 @@ import pytest
 
 from poc_fusion.lib.stopping_distance import (
     analyse_run,
+    approach_deadline_s,
     fit_approach,
+    is_closing,
     settled_range,
     speed_is_valid,
 )
@@ -118,6 +120,41 @@ def test_speed_validity_rejects_a_run_that_was_not_at_speed():
     assert speed_is_valid(0.200, 0.20, 0.03)
     assert speed_is_valid(0.225, 0.20, 0.03)
     assert not speed_is_valid(0.120, 0.20, 0.03)
+
+
+def test_closing_check_catches_a_robot_driving_the_wrong_way():
+    """The direction guard. If the scan-angle convention were reversed the
+    robot would drive away from the wall; range would RISE, not fall."""
+    # Driving toward the wall: range falls. Closing.
+    assert is_closing(start_range_m=1.82, current_range_m=1.60,
+                      min_decrease_m=0.10)
+    # Driving away: range rises. Not closing -> abort.
+    assert not is_closing(start_range_m=1.82, current_range_m=2.10,
+                          min_decrease_m=0.10)
+    # Stationary (wheels slipping, motors not engaging): not closing.
+    assert not is_closing(start_range_m=1.82, current_range_m=1.82,
+                          min_decrease_m=0.10)
+    # Moving, but not yet far enough to be conclusive.
+    assert not is_closing(start_range_m=1.82, current_range_m=1.77,
+                          min_decrease_m=0.10)
+
+
+def test_approach_deadline_scales_with_the_distance_to_cover():
+    near = approach_deadline_s(1.0, 0.8, SPEED, slack_factor=2.5, slack_s=2.0)
+    far = approach_deadline_s(3.0, 0.8, SPEED, slack_factor=2.5, slack_s=2.0)
+    assert far > near
+    # 1.822 m start, 0.80 m trigger => 1.022 m at 0.20 m/s = 5.11 s nominal.
+    actual = approach_deadline_s(1.822, 0.8, SPEED, 2.5, 2.0)
+    assert actual == pytest.approx(5.11 * 2.5 + 2.0, abs=1e-6)
+    # It must be a real bound, not a formality: well under the old flat 20 s.
+    assert actual < 20.0
+
+
+def test_approach_deadline_refuses_a_start_inside_the_trigger():
+    """Placing the robot already closer than the trigger is a setup error,
+    not a zero-length approach to be waved through."""
+    with pytest.raises(ValueError, match='not beyond the trigger'):
+        approach_deadline_s(0.5, 0.8, SPEED, 2.5, 2.0)
 
 
 def test_settled_range_returns_its_sample_count_and_spread():

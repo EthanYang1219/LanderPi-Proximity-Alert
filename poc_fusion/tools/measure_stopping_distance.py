@@ -36,11 +36,15 @@ SAFETY
   * The STM32 latches the last commanded velocity forever. Every exit path --
     normal, abort, exception, SIGINT -- goes through _hard_stop(), which
     publishes a zero Twist repeatedly, not once.
-  * Aborts on: wall closer than ABORT_RANGE_M, scan older than
-    SCAN_STALE_S, or approach longer than MAX_APPROACH_S.
-  * Refuses to move without --arm. Without it the script only measures and
-    reports, so the operator can verify the LiDAR's forward direction against
-    a tape measure before anything moves.
+  * Aborts on: wall closer than ABORT_RANGE_M; scan older than SCAN_STALE_S;
+    approach longer than its DERIVED deadline; or the range failing to fall
+    by CLOSING_MIN_M within CLOSING_CHECK_S.
+  * That last one is the direction guard, and it is why this run does not
+    depend on a human cross-check. A stable forward cone proves the beam
+    sees a flat surface; it does NOT prove the beam points along the robot's
+    +x. Rather than trust the URDF, the TF rotation and the LD19 driver to
+    agree, the run asserts the consequence: range must fall, or it aborts.
+  * Refuses to move without --arm.
 
 The wall is never reachable: zero is commanded at 0.80 m of LiDAR range, the
 gripper sits 0.06 m ahead of the LiDAR, and the expected stopping distance is
@@ -67,6 +71,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'
 
 from poc_fusion.lib.stopping_distance import (  # noqa: E402
     analyse_run,
+    approach_deadline_s,
+    is_closing,
     speed_is_valid,
 )
 
@@ -86,7 +92,16 @@ ABORT_RANGE_M = 0.45         # any reading below this aborts immediately
 MIN_START_RANGE_M = 1.40     # need room to reach steady speed before trigger
 MAX_START_RANGE_M = 3.00     # beyond this the beam spread makes the fit noisy
 
-MAX_APPROACH_S = 20.0        # approach longer than this is a fault, not a run
+# The approach deadline is DERIVED from the distance actually to be covered
+# (see lib.stopping_distance.approach_deadline_s), not fixed, so the runaway
+# window scales with the run. From 1.822 m this is ~14.8 s rather than a flat 20.
+APPROACH_SLACK_FACTOR = 2.5  # covers the acceleration ramp / speed shortfall
+APPROACH_SLACK_S = 2.0       # covers fixed startup latency
+
+# Direction guard: by this long into the approach the range must have fallen
+# by at least this much, or the robot is not driving at the measured wall.
+CLOSING_CHECK_S = 2.0
+CLOSING_MIN_M = 0.10
 SCAN_STALE_S = 0.5           # no fresh scan for this long -> abort
 FIT_WINDOW_S = 1.0           # approach segment used for the linear fit
 HOLD_ZERO_S = 2.0            # keep publishing zeros after the stop command
@@ -218,27 +233,51 @@ class StoppingDistanceRun(Node):
                            f'in the cone, or the wall is not flat/normal')
         return True, med
 
-    def approach_and_stop(self):
+    def approach_and_stop(self, start_range_m):
         """Drive at TEST_SPEED_MPS until the trigger range, then command zero.
 
-        Returns (t_cmd_wall, t_cmd_stamp_basis) or raises RuntimeError.
+        Returns the stop-command instant on the scan-stamp clock, or raises
+        RuntimeError on any abort condition.
         """
         period = 1.0 / CONTROL_HZ
+        deadline = approach_deadline_s(start_range_m, TRIGGER_RANGE_M,
+                                       TEST_SPEED_MPS, APPROACH_SLACK_FACTOR,
+                                       APPROACH_SLACK_S)
         t_start = time.monotonic()
+        closing_checked = False
         print(f'Driving at {TEST_SPEED_MPS} m/s; zero at '
-              f'{TRIGGER_RANGE_M} m; abort at {ABORT_RANGE_M} m.')
+              f'{TRIGGER_RANGE_M} m; abort at {ABORT_RANGE_M} m; '
+              f'deadline {deadline:.1f} s.')
 
         while True:
             rclpy.spin_once(self, timeout_sec=0.005)
             now = time.monotonic()
+            elapsed = now - t_start
 
             if self.last_scan_wall is None or \
                     now - self.last_scan_wall > SCAN_STALE_S:
                 raise RuntimeError('scan went stale during the approach')
-            if now - t_start > MAX_APPROACH_S:
+            if elapsed > deadline:
                 raise RuntimeError(
-                    f'approach exceeded {MAX_APPROACH_S} s without reaching '
-                    f'the trigger range')
+                    f'approach exceeded its {deadline:.1f} s deadline without '
+                    f'reaching the trigger range')
+
+            # Direction guard: assert the consequence rather than trusting
+            # the URDF, the TF rotation and the driver to agree.
+            if not closing_checked and elapsed > CLOSING_CHECK_S:
+                closing_checked = True
+                if not is_closing(start_range_m, self.last_front,
+                                  CLOSING_MIN_M):
+                    raise RuntimeError(
+                        f'ABORT: after {CLOSING_CHECK_S} s of driving the '
+                        f'front range moved {start_range_m - self.last_front:+.3f} m '
+                        f'(needed at least -{CLOSING_MIN_M} m). The robot is '
+                        f'NOT closing on the measured wall -- the forward cone '
+                        f'may not point along +x, or the wheels are not '
+                        f'driving. Nothing further is assumed.')
+                print(f'  closing check OK at {elapsed:.1f} s: '
+                      f'{start_range_m:.3f} -> {self.last_front:.3f} m')
+
             if self.last_front is not None and self.last_front < ABORT_RANGE_M:
                 raise RuntimeError(
                     f'ABORT: front range {self.last_front:.3f} m is inside '
@@ -300,7 +339,7 @@ def main():
                   're-run with --arm.')
             return 0
 
-        t_cmd_stamp = node.approach_and_stop()
+        t_cmd_stamp = node.approach_and_stop(start_range_m=info)
         try:
             result = analyse_run(node.samples, t_cmd_stamp,
                                  fit_window_s=FIT_WINDOW_S,
