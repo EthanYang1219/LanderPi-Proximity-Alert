@@ -38,11 +38,13 @@ So the question this test answers is not "does the robot stop". It is:
 
 ## 2. The two hypotheses
 
-**H1 — Coverage.** The LD19 has a fixed scan plane. An object shorter than that
-plane is invisible to it (the failure mode behind the 2026-07-22 pedestal-desk
-collision). Depth, at the 40° pose, sees the floor from 0.114 m outward and marks
-obstacles in the 0.10–0.99 m height band. So a **low object below the scan plane**
-should be seen by depth and missed by LiDAR.
+**H1 — Coverage.** The LD19 scans in a fixed plane. An object whose body **does
+not intersect that scan plane** produces no LaserScan return (the failure mode
+behind the 2026-07-22 pedestal-desk collision). This is deliberately *not* phrased
+as "invisible to LiDAR" — the claim under test is narrow and specific: **does the
+LD19's 2D scan plane produce an obstacle return from this object?** Depth, at the
+40° pose, marks obstacles in the 0.10–0.99 m height band. So a **low object below
+the scan plane** should be observed by depth and not by the scan.
 
 **H2 — Clearing erases that coverage.** From `costmap_params.yaml`:
 
@@ -93,15 +95,16 @@ Measure, do not assume:
 1. TF `base_footprint` → LiDAR frame. The **z translation is the scan-plane
    height** — a number the repository has never recorded.
 2. Physical ruler check of the same height, floor to scan plane.
-3. Re-measure depth's forward-corridor reach (the 0.668 m figure assumes the arm
-   has not sagged since 2026-08-11).
+3. **Depth reach within the target height band** — see below.
 4. Re-confirm the camera pose per Task 10 Step 1 (±1° tolerance).
+5. **Scan no-return encoding and effective clearing ranges** — see below.
 
-Yields the target obstacle height band:
+Items 1–2 yield the target obstacle height band:
 
 ```
 lower = 0.10 m                      (pointcloud min_obstacle_height)
-upper = LiDAR scan-plane height     (above this, LiDAR sees it; test is void)
+upper = LiDAR scan-plane height     (above this, the object intersects the
+                                     scan plane and the test is void)
 ```
 
 **Gate:** if `upper − lower < 0.04 m`, the discriminating obstacle class does not
@@ -109,6 +112,35 @@ physically exist at this pose. Report that and stop. Do **not** lower
 `min_obstacle_height` to widen the band — that parameter exists to reject floor
 returns, and changing it to manufacture a testable object would invalidate both
 this test and Task 8's floor-filter verification.
+
+#### 0.3 Depth reach must be measured in the target band, not on the floor
+
+The 0.668 m figure from Task 9 Part 2 is the reach of the **forward corridor as a
+whole**, dominated by floor returns. It does not establish reach for a raised
+object. Because of projection and occlusion geometry, usable reach in the
+0.10 m → scan-plane interval may differ substantially from reach at floor level.
+
+Measure instead: **the forward distance range over which `/poc_fusion/points`
+yields valid points with `0.10 m ≤ z ≤ scan-plane height` in the forward
+corridor.** That interval, not the floor figure, is what constrains object
+placement. If it excludes the intended 0.45 m placement, the placement moves to
+fit the measurement — not the other way round.
+
+#### 0.5 What does a no-return beam look like, and how far does clearing reach?
+
+This determines whether Phase 4 Placement A is a no-clearing condition at all
+(§4 Phase 4). `nav2_costmap_2d::ObstacleLayer` drops `inf` LaserScan returns
+unless `inf_is_valid` is set, so those beams clear nothing — but a driver that
+reports no-return as `0.0` or as `range_max` produces beams that **do** clear, out
+to the raytrace range. Record, from live data and the running node:
+
+- the value `/scan_raw` carries for beams with no return (`inf`, `0.0`,
+  `range_max`, or something else), and what fraction of beams that is
+- `inf_is_valid`, `raytrace_max_range`, `obstacle_max_range`, `raytrace_min_range`
+  as **effectively in force** — `costmap_params.yaml` declares none of them, so
+  nav2 defaults apply and must be read off the node rather than assumed
+
+Nothing here is changed. These are read to make Phase 4 interpretable.
 
 ### Phase 1 — Empty-floor baseline (negative control)
 
@@ -122,26 +154,50 @@ If the empty floor produces marks, every later measurement is noise. Stop.
 
 ### Phase 2 — Object present, fused config as shipped
 
-Object at **0.45 m** — inside depth's reach, inside the 1.0 m window. Four
-independent measurements, robot stationary:
+**Placement at 0.45 m is a designed parameter, not an arbitrary one:** it sits
+comfortably inside the depth coverage measured in Phase 0.3 while remaining well
+within the monitor's 1.0 m detection window, so neither limit is marginal. If
+Phase 0.3 returns a target-band reach below ~0.55 m, the placement moves inward to
+preserve that margin, and the new value is recorded with its reason.
+
+**Define the object ROI before recording anything.** Measure the object's footprint
+in `base_footprint` — near and far x, left and right y — from its physical
+placement. Every count below is reported **inside this ROI**, with the
+forward-window total kept as a secondary diagnostic. A bare "37 lethal cells" does
+not establish that the cells are the object; cells inside its footprint do.
+
+Five measurements, robot stationary:
 
 | # | Measurement | Source |
 |---|---|---|
-| 1 | depth points on the object | `/poc_fusion/points` → TF → `base_footprint`, counted in the object footprint and height band |
-| 2 | lethal cells in the forward window | `/costmap/costmap_raw` |
-| 3 | monitor state → `OBSTACLE` | `/costmap_app/monitor_status` |
-| 4 | **persistence of the mark over ≥30 s** | time series of #2, reported as duty cycle |
+| 1 | depth points in ROI ∩ target height band; plus their centroid and z range | `/poc_fusion/points` → TF → `base_footprint` |
+| 2 | **lethal cells inside the object ROI** | `/costmap/costmap_raw` |
+| 3 | lethal cells in the forward window, and the bounding box of all lethal cells (secondary) | `/costmap/costmap_raw` |
+| 4 | monitor state | `/costmap_app/monitor_status` |
+| 5 | **persistence of #2 over ≥30 s** | time series, reported as duty cycle |
 
-Measurement 4 tests H2. **A mark that appears and is erased 100 ms later is not
-detection**, and reporting only "cells were marked" would hide that. The reported
-figure is the fraction of samples in which the object's cells were lethal, plus
-the longest continuous marked and unmarked runs.
+Measurement 5 tests H2. **A mark that appears and is erased 100 ms later is not
+detection**, and reporting only "cells were marked" would hide that. Report the
+fraction of samples in which ROI cells were lethal, plus the longest continuous
+marked and unmarked runs.
+
+**Measurement 4 is integration evidence, not a fusion verdict.** Depth marking the
+costmap and the monitor raising `OBSTACLE` are two different claims, and the
+second is not a prerequisite for the first. If depth marks the object but the
+monitor stays `CLEAR` because the object's cells fall outside its exact window,
+that is a monitor/window finding — **not** evidence that fusion failed. The two
+are reported separately and never collapsed into one verdict.
 
 ### Phase 3 — LiDAR-only control (ablation), static
 
 Same object, same position, a control config differing from the fused config in
-exactly one line (`observation_sources: "scan"`), per Task 15 Step 1. Diff the two
-files and record the diff.
+exactly one line (`observation_sources: "scan"`), per Task 15 Step 1.
+
+**Diff the two files and require the diff to be exactly that one line** — commit
+the diff as evidence. If any other line differs, the ablation is confounded and
+the control must be regenerated from the fused config before Phase 3 runs. The
+`pointcloud:` block itself stays present but unreferenced, so the only change is
+which sources the layer consumes.
 
 Expect: **0 lethal cells**, monitor `CLEAR`.
 
@@ -156,16 +212,33 @@ means anything.
 
 ### Phase 4 — The clearing test
 
-Same object, two placements, fused config:
+Same object, two placements, fused config, full Phase 2 measurement set for each:
 
-| Placement | Behind the object | Prediction under H2 |
+| Placement | Behind the object |
+|---|---|
+| **A** | no intentional rear return — ~2.5 m of clear floor |
+| **B** | flat wall ~1.5 m behind |
+
+**Placement A is an empirical control, not an assumed no-clearing condition.**
+An open-space scan does not guarantee that no raytracing occurs: if the LD19
+encodes no-return as `0.0` or `range_max` rather than `inf`, those beams are
+valid observations and the `ObstacleLayer` clears along them out to
+`raytrace_max_range` — straight through the object's cells, with no wall
+involved. Phase 0.5 measures which case holds; A then measures whether clearing
+actually occurs under the real scan configuration, rather than presuming it does
+not.
+
+Interpretation is therefore a 2×2, and three of the four cells are informative:
+
+| A | B | Interpretation |
 |---|---|---|
-| **A** | open space, no return within LiDAR range | marks persist |
-| **B** | wall ~1.5 m behind | LiDAR raytraces through the object's cells → **marks erased** |
+| persists | erased | Strong evidence the **rear return** causes the additional clearing. H2 supported, mechanism isolated. |
+| erased | erased | Clearing occurs **even without a rear wall**. H2 remains plausible, but the wall-specific mechanism is **not** isolated — cross-check against Phase 0.5's no-return encoding. |
+| persists | persists | Proposed clearing mechanism **not supported**. H2 fails. |
+| unstable | unstable | Investigate before interpreting. Do not report a verdict. |
 
-Report the Phase 2 measurement set for each. A persists / B fails isolates LiDAR
-clearing as the mechanism. Both persisting falsifies H2, which is equally a
-result worth having.
+The "erased / erased" row is the reason A must be measured rather than assumed:
+without it, that outcome would be misread as the wall having done the damage.
 
 ## 5. What must not happen
 
@@ -180,17 +253,59 @@ result worth having.
 - If the causal chain cannot be established from the recorded data, the result is
   **INCONCLUSIVE**, not a pass.
 
-## 6. Deliverables
+## 6. Verdicts
 
-- Per-condition CSV time series of lethal-cell counts, committed under
-  `docs/poc_fusion_data/`.
+H1 and H2 are judged **separately**, and neither depends on the monitor firing.
+
+### H1 — depth adds coverage the scan plane does not
+
+| | |
+|---|---|
+| **PASS** | Depth yields valid points on the object within the target height band and ROI, **and** the Phase 3 LiDAR-only ablation yields no corresponding lethal cells. |
+| **FAIL** | Depth yields no valid object observations in the band, **or** the LiDAR-only ablation also marks the object — meaning the object intersects the scan plane and the premise is void. |
+| **INCONCLUSIVE** | Depth points exist but cannot be reliably associated with the object, or costmap attribution is ambiguous. |
+
+### H2 — LiDAR clearing suppresses depth-derived obstacle cells under the tested configuration
+
+| | |
+|---|---|
+| **PASS** | Depth marks appear, but under the clearing condition they are measurably erased or reduced relative to the control condition. |
+| **FAIL** | Depth marks persist despite the clearing condition. |
+| **INCONCLUSIVE** | Costmap behaviour is unstable, or clearing cannot be distinguished from another cause. |
+
+H2 is only meaningful if H1 passes: there is nothing to erase otherwise.
+
+## 7. Deliverables
+
+- Per-condition CSV time series of ROI and forward-window lethal-cell counts,
+  committed under `docs/poc_fusion_data/`.
+- **A raw depth-evidence sample per condition** — not the full 30 s cloud, which
+  would be unmanageably large, but enough to reconstruct the H1 claim
+  independently: transformed XYZ, timestamp, in-ROI / in-band classification, and
+  valid-point count, for a few representative frames. Plus a `/scan_raw` sample
+  covering the object's bearing, so the "no scan return" claim is checkable rather
+  than asserted.
 - A new dated entry appended to `docs/poc_fusion_verification.md`. Previous
   evidence is not overwritten.
-- The LiDAR-only control config, committed as an additive control file that leaves
-  the fused config untouched.
-- A determination on H1 and H2 separately, each PASS / FAIL / INCONCLUSIVE.
+- The LiDAR-only control config **and its one-line diff**, committed as additive
+  control artifacts that leave the fused config untouched.
+- Separate determinations for H1 and H2, each PASS / FAIL / INCONCLUSIVE.
 
-## 7. Operator setup
+## 8. Time-box
+
+This is research validation running against a two-day POC deadline whose priority
+is **A → obstacle → avoidance → B → video**. This test must not consume that time.
+
+**If Phase 0 or Phase 1 fails its gate, stop and record the finding.** If the
+measurements do not come together within a single controlled block, stop and
+record the state reached. Do not debug toward a passing result.
+
+The design is deliberately built so that **"depth does not contribute" is an
+acceptable scientific outcome**. That is what keeps this from becoming a rabbit
+hole: there is no result here that needs to be forced, and a clean negative is
+publishable evidence about the 40° pose rather than a failure to be fixed.
+
+## 9. Operator setup
 
 Target height is issued after Phase 0. Object requirements:
 
@@ -203,7 +318,7 @@ Target height is issued after Phase 0. Object requirements:
 Placement A needs ~2.5 m of clear floor behind the object. Placement B needs a
 flat wall ~1.5 m behind it.
 
-## 8. Out of scope
+## 10. Out of scope
 
 - Overhanging obstacles. At the 40° pose nothing above 0.246 m is ever in frame,
   so the overhang class is not testable until Task 10a.
