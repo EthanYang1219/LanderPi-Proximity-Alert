@@ -9,10 +9,14 @@ millimeter, just close enough to be reproducible on a later date.
 **Assumptions carried from [README.md](../README.md):** `target_distance
 ≈ 2.0 m` (A→B), `safety_distance = 0.20 m` (front stop threshold),
 `max_obstacle_width = 0.75 m` (above this, the controller treats the
-obstacle as "wide" and turns instead of strafing). Use a box with a
-**consistent cross-section at the LiDAR's mounted height** — no pedestal
-desks, chair legs, or other thin/overhanging obstacles (see the
-[LiDAR blind-spot limitation](../README.md#project-overview) in the README).
+obstacle as "wide" and turns instead of strafing). Default to a box with a
+**consistent cross-section at the LiDAR's mounted height** — the README
+documents a real collision caused by a pedestal desk whose thin/gapped
+legs were invisible to the LiDAR's fixed scan plane (see the
+[LiDAR blind-spot limitation](../README.md#project-overview)). Layout C
+below deliberately uses chairs instead and carries a **mandatory static
+verification step before any motion trial** for exactly this reason —
+do not skip it.
 
 All distances are measured **from point A, along the taped A→B line**,
 and lateral offset is measured **from that line**, `+` = right, `-` = left,
@@ -44,8 +48,12 @@ matching the sign convention already used for
 
 ## Layout C — wide, centered (new maneuver type)
 
-- **Obstacle:** wide obstacle, width > 0.75 m (e.g. two boxes placed
-  side by side spanning the corridor, or a board/panel)
+- **Obstacle:** 1-2 chairs (4-legged), either a single chair turned to
+  present its widest side, or 2 chairs placed side by side / linked to
+  jointly exceed 0.75 m of effective width. No wide box was available, so
+  this substitutes chairs for the "wall-like, wide" case — see the
+  **mandatory verification step** below before this layout is used in any
+  motion trial.
 - **Target position:** ~1.0 m from A, centered on the line
 - **Purpose:** every trial run so far (today's two, plus Layout A/B above)
   is expected to produce `STRAFE`. This layout is the only one in the set
@@ -53,7 +61,32 @@ matching the sign convention already used for
   type is worth more to the paper than a third narrow-obstacle repeat
 - **Expected controller behavior:** `ASSESS` → `TURN` → `DRIVE_PAST` →
   `DRIVE` (cleared)
+
+### Required: static LiDAR verification before this layout's first motion trial
+
+Chair legs are exactly the shape that caused the documented pedestal-desk
+collision (thin, gapped, possibly outside the scan plane) — do not assume
+detection just because the chair "looks wide" to a person. Before running
+the robot into this layout for the first time:
+
+1. Place the chair(s) with **no robot motion**.
+2. From the robot's static position, check the live LiDAR return against
+   the chair at a few distances the robot will actually pass through
+   during approach — e.g. `ros2 topic echo /scan_raw` filtered to the
+   forward arc, or watch `scan_trace.jsonl`'s `sectors.front` value, at
+   roughly 1.0 m, 0.5 m, and 0.3 m standoff.
+3. Confirm the front-arc range **drops to a plausible finite value**
+   (not `inf` / `range_max`) as the chair enters that standoff — i.e. the
+   chair is actually visible to the LiDAR at the height it's mounted at,
+   not just to a person looking at it.
+4. Only run the live avoidance trial once detection is confirmed at all
+   three standoffs. If any standoff shows no detection, reposition the
+   chair (turn it, add a second linked chair, lower/raise nothing — the
+   LiDAR height is fixed) and re-verify before proceeding; do not run the
+   motion trial on an unconfirmed layout.
+
 - **Actual placement (fill in when taped):**
+- **Verification result (fill in before first motion trial):**
 
 ## Layout D — narrow, late encounter
 
