@@ -1,0 +1,219 @@
+# poc_fusion costmap parameters.
+#
+# Task 0 (environment preflight) wrote ONLY the scan_topic key below, verified
+# live against the robot on 2026-08-07 (see docs/poc_fusion_verification.md,
+# Step 2). Task 6 fills in the rest of the nav2_costmap_2d parameter set.
+#
+# This key is the single source of truth for the LiDAR scan topic. No other
+# file in this plan may hard-code /scan or /scan_raw as a literal — everything
+# reads it from here. If the topic ever changes, this is the only line that
+# changes. Because plain ROS 2 parameter YAML has no cross-key substitution,
+# poc_fusion.launch.py loads this key at launch-description-generation time
+# (yaml.safe_load) and injects it as a parameter override for the LaserScan
+# observation source's `topic` parameter — see the "Task 6" section there.
+# The override KEY is derived from this file (plugins -> the ObstacleLayer
+# block -> observation_sources -> the source whose data_type is LaserScan),
+# not restated in Python, so renaming the layer or the source below moves
+# the override with it instead of silently orphaning it. The static block
+# below intentionally leaves that source's `topic` key unset/empty so there
+# is exactly one place the literal string /scan_raw can appear.
+scan_topic: /scan_raw
+
+# --- Standalone nav2_costmap_2d node ---------------------------------------
+#
+# This POC runs ONLY the `nav2_costmap_2d` executable (a single
+# Costmap2DROS lifecycle node) — no planner, no controller, no BT navigator,
+# no map server, no AMCL. Fusing LiDAR + depth into one obstacle layer is the
+# entire scope; the avoidance/return-to-path logic lives in the pre-existing
+# proximity_alert stack and is out of scope here.
+#
+# Key path verified LIVE, not assumed: `ros2 run nav2_costmap_2d
+# nav2_costmap_2d` (no name/namespace override) produces a node whose own
+# startup log reads `[costmap.costmap]` and which appears in `ros2 node list`
+# as `/costmap/costmap` — i.e. namespace "costmap", name "costmap". This
+# mirrors nav2_bringup's own local_costmap/local_costmap double-nesting
+# convention. poc_fusion.launch.py's costmap Node action deliberately does
+# NOT pass `name=` or `namespace=` overrides, so it reproduces this exact
+# default — see docs/poc_fusion_verification.md, Task 6, for the pasted
+# `ros2 node list` proof and the matching `ros2 param get` readback that
+# confirms the parameters below actually loaded under this key path (a
+# mismatched key path is the classic silent failure: the costmap would run
+# on nav2_costmap_2d's built-in defaults with no error).
+costmap:
+  costmap:
+    ros__parameters:
+      # --- Step 1: geometry / timing --------------------------------------
+      global_frame: odom
+      # global_frame stays odom (not base_link): this is Nav2's own shipped
+      # default (nav2_bringup/params/nav2_params.yaml, local_costmap section)
+      # and, more importantly, ObservationBuffer transforms each observation
+      # INTO global_frame at observation TIME. A body-fixed global frame
+      # (base_link) would corrupt persisted camera marks under rotation —
+      # a mark from a moment ago would appear to swing around with the
+      # robot instead of staying fixed in the world, which is exactly wrong
+      # for anything that persists observations across ticks (see
+      # observation_persistence below). Reviewed decision, design doc §5.3.
+      robot_base_frame: base_link
+      rolling_window: true
+      width: 3
+      height: 3
+      resolution: 0.05
+      update_frequency: 10.0
+      # publish_frequency matches update_frequency (10.0), NOT the lower
+      # rate nav2_bringup's own example uses (2.0). The Task 8 stop monitor
+      # is driven by costmap PUBLICATIONS, so the publish interval is a hard
+      # latency floor on top of everything upstream of it. At 5 Hz (200 ms
+      # between publishes) an obstacle arriving just after a publish would
+      # wait up to 200 ms before the monitor could even see it — on its own
+      # that would have consumed the entire Task 12 latency budget before
+      # any processing happened. 10 Hz halves the worst case to 100 ms.
+      # This does NOT claim publishing at 10 Hz is free — the actual
+      # CPU/publish cost this adds is measured in Task 13, not assumed here.
+      publish_frequency: 10.0
+      transform_tolerance: 0.3
+
+      plugins: ["obstacle_layer"]
+
+      # --- Step 2: two observation sources ---------------------------------
+      obstacle_layer:
+        plugin: "nav2_costmap_2d::ObstacleLayer"
+        enabled: true
+        observation_sources: "scan pointcloud"
+
+        scan:
+          # topic intentionally left unset here — poc_fusion.launch.py
+          # injects it from the scan_topic key above as a parameter
+          # override so this literal never appears twice. See the header
+          # comment on scan_topic.
+          data_type: "LaserScan"
+          clearing: true
+          marking: true
+          # observation_persistence: 0.0 — a LaserScan sweep is a
+          # single-instant 2D reading; there is nothing to persist between
+          # scans the way there is for the point cloud below, and holding
+          # stale LiDAR marks would just double-count what the next scan
+          # already reports fresh.
+          observation_persistence: 0.0
+          # --- Height filter: MANDATORY on this source, not optional -------
+          # nav2 Humble declares min_obstacle_height/max_obstacle_height
+          # PER OBSERVATION SOURCE, and the per-source max defaults to 0.0 —
+          # NOT to the layer-level default of 2.0. Confirmed live on this
+          # machine, not taken on faith: with these two keys absent,
+          # `ros2 param get /costmap/costmap obstacle_layer.scan.max_obstacle_height`
+          # returns `Double value is: 0.0` (docs/poc_fusion_verification.md,
+          # "Task 6 fix round 1").
+          #
+          # ObservationBuffer filters points by z AFTER transforming them
+          # into global_frame (odom). The LD19's scan plane sits at odom
+          # z = 0.093 (measured live: odom->lidar_frame z = +0.0927, which
+          # is base_link->lidar_frame z = +0.0387 plus odom->base_link
+          # z = +0.0540; see the Task 1 TF section of the verification doc).
+          # NOTE that 0.093 is height above the ODOM ORIGIN, not above the
+          # floor -- the floor itself is at odom z ~= +0.048 (see the
+          # pointcloud source's height-filter comment below), so the scan
+          # plane is only ~0.045 m above the actual floor. An earlier
+          # version of this comment called 0.093 a height "above the floor";
+          # that was wrong, though it does not change the conclusion drawn
+          # from it, because the filter compares against odom z regardless.
+          # 0.093 > 0.0, so with the per-source max left
+          # at its 0.0 default EVERY LiDAR point is discarded and the LiDAR
+          # marks nothing at all — a valid, active, correctly-framed,
+          # correctly-sized, ALL-FREE costmap with no error anywhere. That
+          # is verbatim the failure CONSTRAINTS.md line 37 calls "the most
+          # expensive silent failure available here", and it is what the
+          # first Task 6 commit (164fa8b) actually shipped.
+          #
+          # min_obstacle_height: 0.0 — the scan is a single fixed plane at
+          # 0.093 m, so there are no ground returns to reject on this source
+          # (unlike the point cloud below); 0.0 keeps the whole plane while
+          # still rejecting anything that transforms to below the floor.
+          # max_obstacle_height: 2.0 — matches nav2_bringup's own shipped
+          # params/nav2_params.yaml, which sets exactly this on its scan
+          # source for exactly this reason (verified on this machine:
+          # /opt/ros/humble/share/nav2_bringup/params/nav2_params.yaml:212).
+          # The scan plane is far inside [0.0, 2.0], so the filter admits
+          # the whole scan and there is no margin question to tune.
+          min_obstacle_height: 0.0
+          max_obstacle_height: 2.0
+
+        pointcloud:
+          topic: /poc_fusion/points
+          data_type: "PointCloud2"
+          clearing: true
+          marking: true
+          # observation_persistence: 0.3s (~4 frames at the point cloud's
+          # measured upstream rate of 14.7 Hz -- see
+          # docs/poc_fusion_verification.md Task 5), reduced from an earlier
+          # draft's 0.5s (~7 frames, itself a correction of an even earlier
+          # "2-3 frames" estimate). NOTE: /poc_fusion/points itself
+          # currently publishes at only ~3-7 Hz, not 14.7 Hz -- that
+          # sustained low rate is a MEASURED, NOT-ISOLATED system
+          # constraint (Task 5, ratified by the user; do not re-derive or
+          # re-explain it here). This persistence window is sized off the
+          # 14.7 Hz UPSTREAM rate deliberately, because persistence exists
+          # to bridge gaps BETWEEN individual point cloud frames once they
+          # arrive, not to compensate for the publish rate of the topic
+          # itself -- if the ~3-7 Hz rate later proves to need a longer
+          # persistence window, that is a Task 11 tuning question against
+          # real trial data, not something to guess at here.
+          #
+          # Why 0.3s and not longer: persisted marks live in `odom`, so
+          # they are only as good as odometry, and this platform's mecanum
+          # wheel slip is the very thing the surface trials measure. On
+          # metal and granite, drift during a sharp holonomic rotation
+          # smears persisted marks into free space, and the cluster-area
+          # trigger cannot tell a ghost mark from a real obstacle. 0.3s is
+          # a starting point, not a derived bound -- Task 11 Step 5a derives
+          # the real bound from the trial CSVs.
+          observation_persistence: 0.3
+          # --- Step 3: height filter, to exclude ground returns ----------
+          #
+          # THESE BOUNDS ARE IN odom, NOT ABOVE THE FLOOR. That distinction
+          # is the whole point of the values below, and getting it wrong is
+          # what the first version of this block did.
+          #
+          # ObservationBuffer transforms each observation into global_frame
+          # (odom, line 46) and only THEN compares z against these two keys.
+          # On this platform odom->base_link z is a FIXED +0.0540 m (measured
+          # live: 860 lookups over 20 s, min == max == 0.054000,
+          # std 1.3e-17), and the camera measures the floor plane at
+          # base_link z ~= -0.006. So THE FLOOR SITS AT odom z ~= +0.048 --
+          # comfortably ABOVE a 0.03 threshold.
+          #
+          # The original min_obstacle_height: 0.03 was therefore below the
+          # floor it was written to reject, and the camera marked bare floor
+          # as obstacle. MEASURED on the live stack, one 200961-point frame
+          # of /poc_fusion/points, same instant, two frames of reference:
+          #     expressed in base_link: 1984 / 200961 points (1.0%) pass
+          #     expressed in odom:    200596 / 200961 points (99.8%) pass
+          # The consequence was visible end to end: with the scene empty
+          # (nearest LiDAR return anywhere 1.735 m, nothing inside +/-20 deg
+          # of forward closer than 9.987 m) the stop monitor reported
+          # OBSTACLE in 147 of 147 status samples and never once reached
+          # CLEAR. The costmap's lethal-cell set churned 34.6 cells per
+          # publication on a STATIONARY robot in an unchanged scene, swinging
+          # 14..123 cells with only 10 stable -- the camera marking floor and
+          # the LiDAR's clearing raytrace erasing it, racing each other.
+          # Full capture: docs/poc_fusion_verification.md, "Task 8".
+          #
+          # min_obstacle_height: 0.10 -- floor plane + margin, in odom.
+          # Measured floor-plane noise in odom on that frame: median +0.048,
+          # p95 +0.0791, max +0.0884. 0.10 clears the observed maximum by
+          # ~12 mm, which puts the MINIMUM DETECTABLE OBSTACLE at roughly
+          # 0.052 m tall (0.10 - 0.048). That capability limit is a chosen
+          # trade-off, ratified by the user against these numbers, not a
+          # derived bound: floor noise has so far been measured on ONE
+          # surface only. The granite and metal trial surfaces are exactly
+          # what Task 11 re-measures, and if their floor noise is worse this
+          # is the key that moves.
+          #
+          # max_obstacle_height: 0.99 -- the camera's coverage ceiling of
+          # 0.94 m ABOVE THE FLOOR (camera mounted 0.246 m above the floor,
+          # tilted ~40 degrees below horizontal; CONSTRAINTS.md "Verified
+          # topic and hardware facts"), expressed in odom: 0.048 + 0.94 =
+          # 0.988, rounded to 0.99. Above that the camera's FOV at its
+          # current pose does not reliably see anything, so admitting noise
+          # from that range buys nothing. The 0.94 figure itself is
+          # unchanged -- only the frame it is expressed in is corrected.
+          min_obstacle_height: 0.10
+          max_obstacle_height: 0.99

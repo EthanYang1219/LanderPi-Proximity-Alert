@@ -1,5 +1,5 @@
 import math
-from proximity_alert.avoidance import AvoidanceController, AvoidanceConfig
+from proximity_alert.avoidance import AvoidanceController, AvoidanceConfig, _distance
 
 
 def _sectors(front=5.0, fl=5.0, fc=5.0, fr=5.0, left=5.0, right=5.0, rear=5.0):
@@ -27,7 +27,8 @@ def _blocked_front(cfg):
 def test_drives_straight_when_clear():
     c = AvoidanceController(_cfg())
     c.set_goal_heading(0.0)
-    out = c.step(_sectors(), obstacle=None, gap_bearing=None, current_yaw=0.0, now=0.0)
+    out = c.step(_sectors(), obstacle=None, gap_bearing=None, current_yaw=0.0,
+                 current_pos=(0.0, 0.0), now=0.0)
     assert out.state == "DRIVE"
     assert out.linear_x > 0.0
 
@@ -39,9 +40,9 @@ def test_confirm_scans_debounce_before_assess():
     c.set_goal_heading(0.0)
     obst = {"span_deg": 10.0, "y_lo": -0.05, "y_hi": 0.05, "preferred_side": 1.0}
     front = _blocked_front(cfg)
-    out1 = c.step(_sectors(front=front, fc=front), obst, None, 0.0, 0.0)
+    out1 = c.step(_sectors(front=front, fc=front), obst, None, 0.0, (0.0, 0.0), 0.0)
     assert out1.state == "DRIVE" and out1.linear_x == 0.0
-    out2 = c.step(_sectors(front=front, fc=front), obst, None, 0.0, 0.1)
+    out2 = c.step(_sectors(front=front, fc=front), obst, None, 0.0, (0.0, 0.0), 0.1)
     assert out2.state in ("STRAFE", "TURN")
 
 
@@ -56,7 +57,7 @@ def test_assess_chooses_strafe_for_narrow_obstacle_with_clear_side():
     c.set_goal_heading(0.0)
     obst = {"span_deg": 10.0, "y_lo": -0.05, "y_hi": 0.05, "preferred_side": 1.0}
     front = _blocked_front(cfg)
-    out = c.step(_sectors(front=front, fc=front, left=1.5), obst, None, 0.0, 0.0)
+    out = c.step(_sectors(front=front, fc=front, left=1.5), obst, None, 0.0, (0.0, 0.0), 0.0)
     assert out.state == "STRAFE"
     assert out.linear_y > 0.0            # strafing left (+)
     assert out.decision.chosen_maneuver == "STRAFE"
@@ -68,7 +69,10 @@ def test_assess_chooses_turn_when_side_blocked():
     c.set_goal_heading(0.0)
     obst = {"span_deg": 10.0, "y_lo": -0.05, "y_hi": 0.05, "preferred_side": 1.0}
     front = _blocked_front(cfg)
-    out = c.step(_sectors(front=front, fc=front, left=0.15, right=1.5), obst, None, 0.0, 0.0)
+    # BOTH sides must be below strafe_side_clearance_min: _assess() tries the
+    # preferred side and then falls back to the other, so leaving one side open
+    # would (correctly) strafe that way instead of turning.
+    out = c.step(_sectors(front=front, fc=front, left=0.15, right=0.15), obst, None, 0.0, (0.0, 0.0), 0.0)
     assert out.state == "TURN"
 
 
@@ -79,7 +83,7 @@ def test_assess_chooses_turn_when_obstacle_too_wide():
     c.set_goal_heading(0.0)
     obst = {"span_deg": 80.0, "y_lo": -0.6, "y_hi": 0.6, "preferred_side": 1.0}
     front = _blocked_front(cfg)
-    out = c.step(_sectors(front=front, fc=front, left=2.0), obst, None, 0.0, 0.0)
+    out = c.step(_sectors(front=front, fc=front, left=2.0), obst, None, 0.0, (0.0, 0.0), 0.0)
     assert out.state == "TURN"
 
 
@@ -97,7 +101,7 @@ def test_assess_strafes_past_close_narrow_box_despite_wide_angular_span():
     c.set_goal_heading(0.0)
     obst = {"span_deg": 65.0, "y_lo": -0.15, "y_hi": 0.15, "preferred_side": -1.0}
     front = _blocked_front(cfg)
-    out = c.step(_sectors(front=front, fc=front, fr=front, right=1.5), obst, None, 0.0, 0.0)
+    out = c.step(_sectors(front=front, fc=front, fr=front, right=1.5), obst, None, 0.0, (0.0, 0.0), 0.0)
     assert out.state == "STRAFE"
     assert out.linear_y < 0.0            # strafing right (-)
     assert out.decision.chosen_maneuver == "STRAFE"
@@ -111,8 +115,8 @@ def test_strafe_completes_to_drive_when_front_clears():
     c.set_goal_heading(0.0)
     obst = {"span_deg": 10.0, "y_lo": -0.05, "y_hi": 0.05, "preferred_side": 1.0}
     front = _blocked_front(cfg)
-    c.step(_sectors(front=front, fc=front, left=1.5), obst, None, 0.0, 0.0)  # -> STRAFE
-    out = c.step(_sectors(front=5.0), None, None, 0.0, 0.4)                  # front now clear
+    c.step(_sectors(front=front, fc=front, left=1.5), obst, None, 0.0, (0.0, 0.0), 0.0)  # -> STRAFE
+    out = c.step(_sectors(front=5.0), None, None, 0.0, (0.0, 0.0), 0.4)                  # front now clear
     assert out.state == "DRIVE"
 
 
@@ -129,7 +133,8 @@ def test_escalates_to_recover_then_halt():
     seen = set()
     out = None
     for _ in range(40):
-        out = c.step(blocked, obst, gap_bearing=None, current_yaw=0.0, now=t)
+        out = c.step(blocked, obst, gap_bearing=None, current_yaw=0.0,
+                     current_pos=(0.0, 0.0), now=t)
         seen.add(out.state)
         t += 2.0
     assert "RECOVER" in seen
@@ -148,51 +153,13 @@ def test_recover_commits_toward_gap_when_available():
     t = 0.0
     out = None
     for _ in range(6):
-        out = c.step(blocked, obst, gap_bearing=math.radians(40), current_yaw=0.0, now=t)
+        out = c.step(blocked, obst, gap_bearing=math.radians(40), current_yaw=0.0,
+                     current_pos=(0.0, 0.0), now=t)
         t += 2.0
         if out.state == "RECOVER":
             break
     assert out.state == "RECOVER"
     assert out.angular_z != 0.0
-
-
-def test_blip_during_cooldown_resumes_same_encounter():
-    # A brief clear scan within clear_drive_duration shouldn't close the
-    # encounter -- re-blocking should resume the SAME encounter_id.
-    # strafe_speed/strafe_timeout pinned so the maneuver actually completes and
-    # returns to DRIVE -- this test's fake yaw never advances, so TURN could
-    # never reach its target and the cooldown clock would never start. See
-    # comment in test_assess_chooses_strafe_for_narrow_obstacle_with_clear_side.
-    cfg = _cfg(obstacle_confirm_scans=1, clear_drive_duration=3.0,
-               strafe_speed=0.25, strafe_timeout=1.5)
-    c = AvoidanceController(cfg)
-    c.set_goal_heading(0.0)
-    obst = {"span_deg": 10.0, "y_lo": -0.05, "y_hi": 0.05, "preferred_side": 1.0}
-    front = _blocked_front(cfg)
-    c.step(_sectors(front=front, fc=front, left=1.5), obst, None, 0.0, 0.0)  # encounter A
-    id_a = c.encounter_id
-    c.step(_sectors(front=5.0), None, None, 0.0, 0.4)                       # brief clear
-    out = c.step(_sectors(front=front, fc=front, left=1.5), obst, None, 0.0, 1.0)
-    assert out.decision.encounter_id == id_a
-
-
-def test_detection_after_cooldown_is_new_encounter():
-    # A clean-drive stretch >= clear_drive_duration DOES close the encounter --
-    # the next obstacle should start a new encounter_id.
-    # strafe_speed/strafe_timeout pinned -- see comment in
-    # test_blip_during_cooldown_resumes_same_encounter.
-    cfg = _cfg(obstacle_confirm_scans=1, clear_drive_duration=1.0,
-               strafe_speed=0.25, strafe_timeout=1.5)
-    c = AvoidanceController(cfg)
-    c.set_goal_heading(0.0)
-    obst = {"span_deg": 10.0, "y_lo": -0.05, "y_hi": 0.05, "preferred_side": 1.0}
-    front = _blocked_front(cfg)
-    c.step(_sectors(front=front, fc=front, left=1.5), obst, None, 0.0, 0.0)  # encounter A
-    id_a = c.encounter_id
-    for t in (0.4, 1.0, 2.0, 3.5):
-        c.step(_sectors(front=5.0), None, None, 0.0, t)
-    out = c.step(_sectors(front=front, fc=front, left=1.5), obst, None, 0.0, 4.0)
-    assert out.decision.encounter_id == id_a + 1
 
 
 # ---------- reverse-arc geometry (turn_radius / rear_taper_zone) ----------
@@ -207,7 +174,8 @@ def _turning(cfg, rear):
     obst = {"span_deg": 80.0, "y_lo": -0.6, "y_hi": 0.6, "preferred_side": 1.0}
     front = _blocked_front(cfg)
     s = _sectors(front=front, fc=front, left=0.15, right=0.15, rear=rear)
-    out = c.step(s, obst, gap_bearing=None, current_yaw=0.0, now=0.0)
+    out = c.step(s, obst, gap_bearing=None, current_yaw=0.0,
+                 current_pos=(0.0, 0.0), now=0.0)
     assert out.state == "TURN", f"expected TURN, got {out.state}"
     return out
 
@@ -258,3 +226,519 @@ def test_taper_does_not_exceed_full_speed_with_open_rear():
                rear_clearance_min=0.25, rear_taper_zone=0.20)
     out = _turning(cfg, rear=float("inf"))
     assert math.isclose(out.linear_x, -0.375, rel_tol=1e-9)
+
+
+# --- cross-track (return-to-line) crab correction ---
+
+def test_no_crab_unless_asked():
+    # Regression guard: a controller nobody calls set_lateral_correction on
+    # must behave exactly as it did before the feature existed.
+    c = AvoidanceController(_cfg())
+    c.set_goal_heading(0.0)
+    out = c.step(_sectors(), None, None, 0.0, (0.0, 0.0), 0.0)
+    assert out.linear_y == 0.0
+
+
+def test_crab_applied_while_driving():
+    c = AvoidanceController(_cfg(cross_track_ramp_time=0.0))
+    c.set_goal_heading(0.0)
+    c.set_lateral_correction(-0.10)
+    out = c.step(_sectors(), None, None, 0.0, (0.0, 0.0), 0.0)
+    assert out.state == "DRIVE"
+    assert out.linear_y == -0.10
+    assert out.linear_x > 0.0        # still driving forward, not just sliding
+
+
+def test_crab_does_not_disturb_heading_or_speed():
+    # The crab is an independent axis: it must not bleed into forward speed
+    # or the heading hold.
+    c = AvoidanceController(_cfg(cross_track_ramp_time=0.0))
+    c.set_goal_heading(0.0)
+    plain = c.step(_sectors(), None, None, 0.0, (0.0, 0.0), 0.0)
+
+    c2 = AvoidanceController(_cfg(cross_track_ramp_time=0.0))
+    c2.set_goal_heading(0.0)
+    c2.set_lateral_correction(-0.10)
+    crabbed = c2.step(_sectors(), None, None, 0.0, (0.0, 0.0), 0.0)
+
+    assert crabbed.linear_x == plain.linear_x
+    assert crabbed.angular_z == plain.angular_z
+
+
+def test_ramp_fades_the_crab_in_over_time():
+    cfg = _cfg(cross_track_ramp_time=1.0)
+    c = AvoidanceController(cfg)
+    c.set_goal_heading(0.0)
+    c.set_lateral_correction(-0.10)
+    at_entry = c.step(_sectors(), None, None, 0.0, (0.0, 0.0), 0.0)
+    midway = c.step(_sectors(), None, None, 0.0, (0.0, 0.0), 0.5)
+    settled = c.step(_sectors(), None, None, 0.0, (0.0, 0.0), 2.0)
+    assert at_entry.linear_y == 0.0                    # starts from nothing
+    assert midway.linear_y == -0.05                    # half ramped
+    assert settled.linear_y == -0.10                   # clamped at full
+
+
+def test_no_crab_while_confirming_an_obstacle():
+    # The confirming tick deliberately holds still; crabbing through it
+    # would move the robot while it is deciding whether it is blocked.
+    cfg = _cfg(obstacle_confirm_scans=2, cross_track_ramp_time=0.0)
+    c = AvoidanceController(cfg)
+    c.set_goal_heading(0.0)
+    c.set_lateral_correction(-0.10)
+    obst = {"span_deg": 10.0, "y_lo": -0.05, "y_hi": 0.05, "preferred_side": 1.0}
+    front = _blocked_front(cfg)
+    out = c.step(_sectors(front=front, fc=front), obst, None, 0.0, (0.0, 0.0), 0.0)
+    assert out.state == "DRIVE" and out.linear_x == 0.0
+    assert out.linear_y == 0.0
+
+
+def _strafe_then_clear(cfg, correction, inside_flank):
+    """Drive the controller into a leftward STRAFE, then clear the front so
+    it completes back to DRIVE, and return that completing output.
+
+    _locked_dir ends up +1 (dodged left), so the obstacle is on the RIGHT
+    and a correction back toward the right is the gated direction.
+    """
+    c = AvoidanceController(cfg)
+    c.set_goal_heading(0.0)
+    obst = {"span_deg": 10.0, "y_lo": -0.05, "y_hi": 0.05, "preferred_side": 1.0}
+    front = _blocked_front(cfg)
+    out = c.step(_sectors(front=front, fc=front, left=1.5), obst, None, 0.0, (0.0, 0.0), 0.0)
+    assert out.state == "STRAFE"
+    c.set_lateral_correction(correction)
+    # Front now clear -> _strafe completes to DRIVE on this tick.
+    return c, c.step(_sectors(left=1.5, right=inside_flank), None, None, 0.0, (0.0, 0.0), 0.5)
+
+
+def _strafe_cfg(**kw):
+    base = dict(obstacle_confirm_scans=1, strafe_speed=0.25, strafe_timeout=1.5,
+                cross_track_ramp_time=0.0)
+    base.update(kw)
+    return _cfg(**base)
+
+
+def test_crab_blocked_toward_the_obstacle_just_avoided():
+    # The limit-cycle guard. A strafe makes no forward progress, so on
+    # completion the robot is level with the obstacle -- crabbing back
+    # toward it would re-block the front and strafe out again, forever.
+    cfg = _strafe_cfg()
+    c, out = _strafe_then_clear(cfg, correction=-0.10,
+                                inside_flank=cfg.pass_clearance - 0.1)
+    assert out.state == "DRIVE"
+    assert out.linear_y == 0.0
+
+
+def test_crab_allowed_away_from_the_obstacle_just_avoided():
+    # Moving further from the obstacle can only increase clearance, so it is
+    # never gated even with the flank still close.
+    cfg = _strafe_cfg()
+    c, out = _strafe_then_clear(cfg, correction=+0.10,
+                                inside_flank=cfg.pass_clearance - 0.1)
+    assert out.linear_y == +0.10
+
+
+def test_crab_toward_obstacle_allowed_once_the_flank_is_clear():
+    cfg = _strafe_cfg()
+    c, out = _strafe_then_clear(cfg, correction=-0.10,
+                                inside_flank=cfg.pass_clearance + 0.5)
+    assert out.linear_y == -0.10
+
+
+def test_crab_ungated_once_the_encounter_closes():
+    # After clear_drive_distance of confirmed-clear driving there is no
+    # remembered obstacle left to protect, so the correction runs unrestricted
+    # even back toward where the obstacle used to be.
+    cfg = _strafe_cfg(clear_drive_distance=0.3, encounter_close_confirm_scans=1)
+    c, out = _strafe_then_clear(cfg, correction=-0.10,
+                                inside_flank=cfg.pass_clearance - 0.1)
+    assert out.linear_y == 0.0                       # gated at first
+    flank = _sectors(right=cfg.pass_clearance - 0.1)
+    c.step(flank, None, None, 0.0, (0.0, 0.0), 1.0)   # streak=1, start_pos=(0,0)
+    for i, x in enumerate((0.1, 0.2)):               # sub-jump-threshold increments
+        c.step(flank, None, None, 0.0, (x, 0.0), 1.5 + i * 0.5)
+    late = c.step(flank, None, None, 0.0, (0.3, 0.0), 3.0)   # 0.3m >= 0.3m -> closes
+    assert late.linear_y == -0.10                    # encounter closed, gate lifted
+
+
+def test_maneuvers_never_see_the_crab():
+    # A correction arriving mid-strafe must not bend the strafe: the
+    # maneuver states own linear_y outright.
+    cfg = _strafe_cfg()
+    c = AvoidanceController(cfg)
+    c.set_goal_heading(0.0)
+    obst = {"span_deg": 10.0, "y_lo": -0.05, "y_hi": 0.05, "preferred_side": 1.0}
+    front = _blocked_front(cfg)
+    c.step(_sectors(front=front, fc=front, left=1.5), obst, None, 0.0, (0.0, 0.0), 0.0)
+    c.set_lateral_correction(-0.10)
+    out = c.step(_sectors(front=front, fc=front, left=1.5), obst, None, 0.0, (0.0, 0.0), 0.1)
+    assert out.state == "STRAFE"
+    assert out.linear_y == +cfg.strafe_speed     # full strafe, uncontaminated
+
+
+# ---------- distance-based encounter close ----------
+
+
+def test_distance_helper_straight_line():
+    assert _distance((0.0, 0.0), (3.0, 4.0)) == 5.0
+
+
+def test_config_has_distance_based_encounter_fields():
+    cfg = AvoidanceConfig()
+    assert cfg.clear_drive_distance == 0.3
+    assert cfg.encounter_close_confirm_scans == 3
+    assert cfg.odom_jump_threshold == 0.15
+    assert not hasattr(cfg, "clear_drive_duration")
+
+
+def _enter_encounter(c, obst=None):
+    """Drives one confirmed obstacle detection so the controller is inside
+    an encounter (matches whatever obstacle_confirm_scans the config uses)."""
+    obst = obst or {"span_deg": 10.0, "y_lo": -0.05, "y_hi": 0.05, "preferred_side": 1.0}
+    out = None
+    for i in range(c.config.obstacle_confirm_scans):
+        out = c.step(_sectors(front=0.15, fc=0.15, left=1.5), obst, None, 0.0, (0.0, 0.0), float(i))
+    return out
+
+
+def test_streak_below_confirm_scans_does_not_start_distance():
+    c = AvoidanceController(_cfg(encounter_close_confirm_scans=3, clear_drive_distance=0.3))
+    c.set_goal_heading(0.0)
+    _enter_encounter(c)
+    # only 2 consecutive clear scans (< encounter_close_confirm_scans=3), far enough
+    # displacement-wise that it WOULD close if distance tracking had started
+    c.step(_sectors(front=5.0), None, None, 0.0, (0.0, 0.0), 10.0)   # maneuver -> DRIVE
+    c.step(_sectors(front=5.0), None, None, 0.0, (0.0, 0.0), 10.1)   # streak=1
+    out = c.step(_sectors(front=5.0), None, None, 0.0, (1.0, 0.0), 10.2)  # streak=2
+    assert out.decision is None or out.decision.encounter_id == c.encounter_id  # still same encounter, not yet closed
+    assert c._in_encounter is True
+
+
+def test_encounter_closes_once_distance_threshold_reached():
+    c = AvoidanceController(_cfg(encounter_close_confirm_scans=2, clear_drive_distance=0.3))
+    c.set_goal_heading(0.0)
+    _enter_encounter(c)
+    # Increments stay under odom_jump_threshold (0.15) so they read as real
+    # travel, not a discontinuity -- a single 0.3m hop would be rejected as a
+    # jump before it could ever close the encounter.
+    c.step(_sectors(front=5.0), None, None, 0.0, (0.0, 0.0), 10.0)  # maneuver -> DRIVE
+    c.step(_sectors(front=5.0), None, None, 0.0, (0.0, 0.0), 10.1)  # streak=1
+    c.step(_sectors(front=5.0), None, None, 0.0, (0.0, 0.0), 10.2)  # streak=2, start_pos=(0,0)
+    c.step(_sectors(front=5.0), None, None, 0.0, (0.1, 0.0), 10.3)  # 0.1m
+    c.step(_sectors(front=5.0), None, None, 0.0, (0.2, 0.0), 10.4)  # 0.2m < 0.3m, not yet
+    assert c._in_encounter is True
+    c.step(_sectors(front=5.0), None, None, 0.0, (0.3, 0.0), 10.5)  # 0.3m >= 0.3m
+    assert c._in_encounter is False
+    assert c.consecutive_avoid_count == 0
+    assert c.cumulative_strafe == 0.0
+
+
+def test_block_before_distance_threshold_preserves_same_encounter():
+    c = AvoidanceController(_cfg(encounter_close_confirm_scans=2, clear_drive_distance=0.3,
+                                  obstacle_confirm_scans=1))
+    c.set_goal_heading(0.0)
+    _enter_encounter(c)
+    id_a = c.encounter_id
+    c.step(_sectors(front=5.0), None, None, 0.0, (0.0, 0.0), 10.0)  # streak=1
+    c.step(_sectors(front=5.0), None, None, 0.0, (0.0, 0.0), 10.1)  # streak=2, start_pos set
+    c.step(_sectors(front=5.0), None, None, 0.0, (0.1, 0.0), 10.2)  # 0.1m, not closed yet
+    obst = {"span_deg": 10.0, "y_lo": -0.05, "y_hi": 0.05, "preferred_side": 1.0}
+    out = c.step(_sectors(front=0.15, fc=0.15, left=1.5), obst, None, 0.0, (0.15, 0.0), 10.3)  # blocked again
+    assert out.decision.encounter_id == id_a  # same encounter, not reset
+
+
+def test_detection_after_sufficient_clear_distance_is_new_encounter():
+    c = AvoidanceController(_cfg(encounter_close_confirm_scans=2, clear_drive_distance=0.3,
+                                  obstacle_confirm_scans=1))
+    c.set_goal_heading(0.0)
+    _enter_encounter(c)
+    id_a = c.encounter_id
+    c.step(_sectors(front=5.0), None, None, 0.0, (0.0, 0.0), 10.0)  # maneuver -> DRIVE
+    c.step(_sectors(front=5.0), None, None, 0.0, (0.0, 0.0), 10.1)  # streak=1
+    c.step(_sectors(front=5.0), None, None, 0.0, (0.0, 0.0), 10.2)  # streak=2, start_pos=(0,0)
+    for i, x in enumerate((0.1, 0.2, 0.3)):     # sub-jump-threshold increments
+        c.step(_sectors(front=5.0), None, None, 0.0, (x, 0.0), 10.3 + i * 0.1)
+    assert c._in_encounter is False             # closed: 0.3m >= 0.3m
+    obst = {"span_deg": 10.0, "y_lo": -0.05, "y_hi": 0.05, "preferred_side": 1.0}
+    out = c.step(_sectors(front=0.15, fc=0.15, left=1.5), obst, None, 0.0, (0.3, 0.0), 10.7)
+    assert out.decision.encounter_id == id_a + 1
+
+
+def test_interrupted_clear_periods_do_not_sum():
+    c = AvoidanceController(_cfg(encounter_close_confirm_scans=1, clear_drive_distance=0.3,
+                                  obstacle_confirm_scans=1))
+    c.set_goal_heading(0.0)
+    _enter_encounter(c)
+    c.step(_sectors(front=5.0), None, None, 0.0, (0.0, 0.0), 10.0)   # streak=1, start_pos=(0,0)
+    c.step(_sectors(front=5.0), None, None, 0.0, (0.15, 0.0), 10.1)  # 0.15m clear
+    obst = {"span_deg": 10.0, "y_lo": -0.05, "y_hi": 0.05, "preferred_side": 1.0}
+    c.step(_sectors(front=0.15, fc=0.15, left=1.5), obst, None, 0.0, (0.15, 0.0), 10.2)  # blocked -> resets
+    c.step(_sectors(front=5.0), None, None, 0.0, (0.15, 0.0), 10.3)   # streak=1 again, start_pos=(0.15,0)
+    out = c.step(_sectors(front=5.0), None, None, 0.0, (0.30, 0.0), 10.4)  # only 0.15m this stretch
+    assert c._in_encounter is True   # 0.15m + 0.15m must NOT have summed to 0.3m
+
+
+def test_none_position_never_advances_tracking():
+    c = AvoidanceController(_cfg(encounter_close_confirm_scans=1, clear_drive_distance=0.3))
+    c.set_goal_heading(0.0)
+    _enter_encounter(c)
+    for t in range(10, 20):
+        c.step(_sectors(front=5.0), None, None, 0.0, None, float(t))
+    assert c._in_encounter is True  # never closes without a real position
+
+
+def test_discontinuous_position_jump_aborts_measurement():
+    c = AvoidanceController(_cfg(encounter_close_confirm_scans=1, clear_drive_distance=0.3,
+                                  odom_jump_threshold=0.15, obstacle_confirm_scans=1))
+    c.set_goal_heading(0.0)
+    _enter_encounter(c)
+    # The measurement must already be ACTIVE when the jump arrives -- otherwise
+    # the jump is merely adopted as the first tracked position and the detector
+    # is never exercised at all.
+    c.step(_sectors(front=5.0), None, None, 0.0, (0.0, 0.0), 10.0)   # maneuver -> DRIVE
+    c.step(_sectors(front=5.0), None, None, 0.0, (0.0, 0.0), 10.1)   # streak=1, start_pos=(0,0)
+    c.step(_sectors(front=5.0), None, None, 0.0, (0.1, 0.0), 10.2)   # 0.1m of real travel
+    c.step(_sectors(front=5.0), None, None, 0.0, (5.0, 0.0), 10.3)   # 5m jump -- discontinuity, not real motion
+    assert c._in_encounter is True  # must NOT have closed off a bogus 5m "clear distance"
+    assert c._clean_drive_start_pos is None  # measurement abandoned, not advanced
+    # Post-jump: several small, realistic increments (each well under
+    # odom_jump_threshold) summing past clear_drive_distance -- NOT one big
+    # step, which would itself look like another discontinuity rather than
+    # real incremental travel.
+    c.step(_sectors(front=5.0), None, None, 0.0, (5.0, 0.0), 10.4)    # streak restarts here, start_pos=(5,0)
+    c.step(_sectors(front=5.0), None, None, 0.0, (5.11, 0.0), 10.5)   # +0.11m
+    c.step(_sectors(front=5.0), None, None, 0.0, (5.22, 0.0), 10.6)   # +0.11m (0.22m total)
+    c.step(_sectors(front=5.0), None, None, 0.0, (5.33, 0.0), 10.7)   # +0.11m (0.33m total >= 0.3m)
+    assert c._in_encounter is False
+
+
+def test_encounter_closes_at_exactly_the_distance_threshold():
+    c = AvoidanceController(_cfg(encounter_close_confirm_scans=1, clear_drive_distance=0.3,
+                                  obstacle_confirm_scans=1))
+    c.set_goal_heading(0.0)
+    _enter_encounter(c)
+    c.step(_sectors(front=5.0), None, None, 0.0, (0.0, 0.0), 10.0)   # maneuver -> DRIVE
+    c.step(_sectors(front=5.0), None, None, 0.0, (0.0, 0.0), 10.1)   # streak=1, start_pos=(0,0)
+    c.step(_sectors(front=5.0), None, None, 0.0, (0.1, 0.0), 10.2)
+    c.step(_sectors(front=5.0), None, None, 0.0, (0.2, 0.0), 10.3)
+    assert c._in_encounter is True                                   # 0.2m, still short
+    c.step(_sectors(front=5.0), None, None, 0.0, (0.3, 0.0), 10.4)   # exactly 0.30m, not over
+    assert c._in_encounter is False  # >= threshold must close, not only strictly >
+
+
+def test_clear_driving_after_closure_does_not_reaccumulate():
+    c = AvoidanceController(_cfg(encounter_close_confirm_scans=1, clear_drive_distance=0.3,
+                                  obstacle_confirm_scans=1))
+    c.set_goal_heading(0.0)
+    _enter_encounter(c)
+    # First tick completes the maneuver back to DRIVE; the rest accumulate.
+    for i, x in enumerate((0.0, 0.0, 0.1, 0.2, 0.3)):   # closes on the last one
+        c.step(_sectors(front=5.0), None, None, 0.0, (x, 0.0), 10.0 + i * 0.1)
+    assert c._in_encounter is False
+    # Continuing to drive clear afterward must not touch any tracking state
+    # (it's a no-op once outside an encounter) -- no crash, no stale state.
+    c.step(_sectors(front=5.0), None, None, 0.0, (1.0, 0.0), 10.5)
+    out = c.step(_sectors(front=5.0), None, None, 0.0, (2.0, 0.0), 10.6)
+    assert out.state == "DRIVE"
+    assert c._in_encounter is False
+
+
+# ---------- mid-maneuver invalidation: STRAFE ----------
+
+def _strafe_entry_cfg():
+    # strafe_speed/strafe_timeout pinned so STRAFE is actually reachable --
+    # see the comment in test_assess_chooses_strafe_for_narrow_obstacle_with_clear_side.
+    return _cfg(obstacle_confirm_scans=2, strafe_speed=0.25, strafe_timeout=1.5)
+
+
+def _enter_strafe(c, cfg):
+    """Two blocked DRIVE ticks (obstacle_confirm_scans=2) -> _assess() -> STRAFE."""
+    obst = {"span_deg": 10.0, "y_lo": -0.05, "y_hi": 0.05, "preferred_side": 1.0}
+    front = _blocked_front(cfg)
+    blocked = _sectors(front=front, fc=front, left=1.5)
+    c.step(blocked, obst, None, 0.0, (0.0, 0.0), 0.0)          # confirming
+    out = c.step(blocked, obst, None, 0.0, (0.0, 0.0), 0.1)    # -> _assess -> STRAFE
+    assert out.state == "STRAFE", f"setup failed, got {out.state}"
+    assert c.consecutive_avoid_count == 1
+    return obst
+
+
+def test_strafe_aborts_when_flank_closing_sustained():
+    cfg = _strafe_entry_cfg()
+    c = AvoidanceController(cfg)
+    c.set_goal_heading(0.0)
+    obst = _enter_strafe(c, cfg)
+    # Flank drops below strafe_side_clearance_min (0.20) for 2 consecutive ticks.
+    # front held at 0.25: above safety_distance so it is not "blocked", below
+    # clear_threshold (0.30) so the strafe does not complete -- isolating the flank.
+    # Right is closed too, so the re-assess cannot simply strafe the other way
+    # (_assess falls back to the opposite side) -- this keeps the test isolating
+    # the abort itself rather than the direction chosen afterwards.
+    closing = _sectors(front=0.25, left=0.15, right=0.15)
+    c.step(closing, obst, None, 0.0, (0.0, 0.0), 0.2)          # count=1
+    out = c.step(closing, obst, None, 0.0, (0.0, 0.0), 0.3)    # count=2 -> abort
+    assert c.consecutive_avoid_count == 2                       # _assess() ran again
+    assert out.state == "TURN"   # both sides < strafe_side_clearance_min -> can't re-strafe
+
+
+def test_strafe_does_not_abort_on_single_close_reading():
+    cfg = _strafe_entry_cfg()
+    c = AvoidanceController(cfg)
+    c.set_goal_heading(0.0)
+    obst = _enter_strafe(c, cfg)
+    out = c.step(_sectors(front=0.25, left=0.15), obst, None, 0.0, (0.0, 0.0), 0.2)
+    assert out.state == "STRAFE"
+    assert c.consecutive_avoid_count == 1      # no re-assess -- only one close tick
+
+
+def test_strafe_abort_counter_resets_on_clear_tick():
+    cfg = _strafe_entry_cfg()
+    c = AvoidanceController(cfg)
+    c.set_goal_heading(0.0)
+    obst = _enter_strafe(c, cfg)
+    c.step(_sectors(front=0.25, left=0.15), obst, None, 0.0, (0.0, 0.0), 0.2)   # count=1
+    c.step(_sectors(front=0.25, left=1.5), obst, None, 0.0, (0.0, 0.0), 0.3)    # count=0
+    out = c.step(_sectors(front=0.25, left=0.15), obst, None, 0.0, (0.0, 0.0), 0.4)  # count=1
+    assert out.state == "STRAFE"
+    assert c.consecutive_avoid_count == 1      # never reached 2 consecutive
+
+
+def test_strafe_does_not_abort_on_blocked_front_alone():
+    # Regression guard for the removed absolute-front term. front <= safety_distance
+    # is the NORMAL condition throughout a strafe (it is why the strafe started), so
+    # a wide-open flank must keep the maneuver running no matter how close front is.
+    cfg = _strafe_entry_cfg()
+    c = AvoidanceController(cfg)
+    c.set_goal_heading(0.0)
+    obst = _enter_strafe(c, cfg)
+    blocked_front_open_flank = _sectors(front=0.10, left=1.5)
+    for i, t in enumerate((0.2, 0.3, 0.4, 0.5)):
+        out = c.step(blocked_front_open_flank, obst, None, 0.0, (0.0, 0.0), t)
+        assert out.state == "STRAFE", f"aborted on tick {i} with an open flank"
+    assert c.consecutive_avoid_count == 1      # never re-assessed
+
+
+def test_aborted_maneuver_replans_and_resumes_driving():
+    """Reproduces the 2026-08-03/04 obstacle collisions that motivated this check.
+
+    WHY THIS TEST EXISTS. Across one hardware session the robot made contact
+    with the same box obstacle three separate times -- trials 2, 7 and 10 in
+    trials/lateral_offset_trials.csv ("ran over the tape measurement", "two
+    obstacles, a box and chair in order", "touched the box slightly").
+    decision_log.csv shows the mechanism directly: at 19:10:00->19:10:02 a
+    STRAFE ran for ~2s (cumulative_strafe_m 0.0 -> 0.41) while left_clearance_m
+    collapsed from 0.369m to 0.150m. That is below strafe_side_clearance_min
+    (0.20m) -- the very threshold whose satisfaction authorized the strafe in
+    the first place -- and nothing was watching it. The controller committed to
+    an escape corridor on one pre-maneuver LiDAR snapshot and never re-checked
+    it, so it drove into a gap that had already closed.
+
+    A real box has corners: the clearance measured from the approach angle is
+    not the clearance along the strafe path. That discovery only arrives
+    mid-maneuver, which is why a pre-maneuver check cannot catch it.
+
+    WHAT IT LOCKS. The isolated tests above each pin one behavior in isolation;
+    this one walks the whole failure end to end -- strafe commits, flank closes,
+    maneuver aborts, hazard passes, controller re-plans and drives on -- and
+    asserts the abort is RECOVERABLE rather than merely detected. The recovery
+    assertions matter as much as the abort: a check that stalls the robot or
+    escalates it to RECOVER/HALT every time an obstacle brushes past would pass
+    an abort-only test while being useless on hardware.
+
+    This test is non-vacuous by construction. Stub out the flank check in
+    _strafe() and it fails at the first assertion with STRAFE != TURN: the
+    controller keeps strafing into the closing flank, exactly as it did on
+    hardware. If you are here because this test broke, the regression is real.
+
+    Scope note: only STRAFE has mid-maneuver invalidation. TURN deliberately
+    has none -- every logged TURN pivoted into 2.3-4.9m of open space, so the
+    evidence never supported one. See "Why TURN carries no check" in
+    docs/superpowers/specs/2026-08-04-mid-maneuver-clearance-check-design.md.
+    """
+    cfg = _strafe_entry_cfg()
+    c = AvoidanceController(cfg)
+    c.set_goal_heading(0.0)
+    obst = _enter_strafe(c, cfg)
+    encounter = c.encounter_id
+
+    # Second obstacle appears alongside: the flank we committed to closes. Both
+    # sides are closed so the re-plan is forced onto TURN -- with only the left
+    # closed, _assess() would (correctly) fall back to strafing right instead,
+    # which is a different scenario than the one this test walks.
+    closing = _sectors(front=0.25, left=0.15, right=0.15)
+    c.step(closing, obst, None, 0.0, (0.0, 0.0), 0.2)
+    out = c.step(closing, obst, None, 0.0, (0.0, 0.0), 0.3)
+    assert out.state == "TURN"          # aborted the strafe, re-planned as a turn
+
+    # Both obstacles clear. TURN runs out its turn_timeout (1.5s) and hands off to
+    # DRIVE_PAST, which needs front >= clear_threshold and inside flank >=
+    # pass_clearance sustained for clear_confirm_time (0.5s) before completing.
+    clear = _sectors(front=5.0, left=5.0, right=5.0)
+    c.step(clear, None, None, 0.0, (0.0, 0.0), 0.4)     # still turning
+    c.step(clear, None, None, 0.0, (0.0, 0.0), 2.0)     # timeout -> DRIVE_PAST
+    out = c.step(clear, None, None, 0.0, (0.0, 0.0), 2.7)   # clear_confirm_time met
+
+    assert out.state == "DRIVE"
+    assert out.linear_x > 0.0                       # actually driving again
+    assert c.encounter_id == encounter              # same encounter throughout
+    assert c.has_recovered_this_encounter is False  # never escalated to RECOVER
+    assert c.consecutive_avoid_count <= cfg.max_avoid_attempts
+
+
+# ---------- strafe direction fallback (both-sides feasibility) ----------
+
+def _fallback_cfg():
+    # Same pinning rationale as _strafe_entry_cfg: keep max_strafe_distance
+    # (0.40) consistent with max_cumulative_strafe so these tests exercise the
+    # direction choice, not today's tuning.
+    return _cfg(obstacle_confirm_scans=1, strafe_speed=0.20, strafe_timeout=2.0)
+
+
+def test_strafe_falls_back_to_other_side_when_preferred_side_too_far():
+    """Real geometry from the 2026-08-05 five-obstacle run, encounter 1.
+
+    The robot met a flat obstacle face whose left edge sat 8cm left of centre
+    but which extended 30cm to the right. size_obstacle picks preferred_side
+    from far-field openness only -- the right was wide open (2.1m) beyond the
+    obstacle, so it preferred RIGHT. Clearing rightward needed
+    corridor_half - y_lo = 0.438m, past max_strafe_distance (0.40), so
+    strafe_ok failed and the robot turned instead. Strafing LEFT needed only
+    y_hi + corridor_half = 0.218m and had 0.65m of room.
+
+    Every one of the six TURN commits that night had a feasible opposite side.
+    """
+    cfg = _fallback_cfg()
+    c = AvoidanceController(cfg)
+    c.set_goal_heading(0.0)
+    obst = {"span_deg": 68.0, "y_lo": -0.303, "y_hi": 0.083, "preferred_side": -1.0}
+    front = _blocked_front(cfg)
+    out = c.step(_sectors(front=front, fc=front, left=0.650, right=2.109),
+                 obst, None, 0.0, (0.0, 0.0), 0.0)
+    assert out.state == "STRAFE", f"expected STRAFE, got {out.state}"
+    assert out.linear_y > 0.0, "should strafe LEFT (the feasible side)"
+
+
+def test_strafe_keeps_preferred_side_when_it_is_feasible():
+    # Regression guard: the fallback must not change the direction chosen when
+    # the preferred side already works.
+    cfg = _fallback_cfg()
+    c = AvoidanceController(cfg)
+    c.set_goal_heading(0.0)
+    obst = {"span_deg": 10.0, "y_lo": -0.05, "y_hi": 0.05, "preferred_side": 1.0}
+    front = _blocked_front(cfg)
+    out = c.step(_sectors(front=front, fc=front, left=1.5, right=1.5),
+                 obst, None, 0.0, (0.0, 0.0), 0.0)
+    assert out.state == "STRAFE"
+    assert out.linear_y > 0.0, "preferred side was left and feasible"
+
+
+def test_turn_still_chosen_when_neither_side_is_feasible():
+    # Regression guard: the fallback must not make STRAFE reachable when the
+    # obstacle genuinely blocks both directions.
+    cfg = _fallback_cfg()
+    c = AvoidanceController(cfg)
+    c.set_goal_heading(0.0)
+    obst = {"span_deg": 120.0, "y_lo": -0.60, "y_hi": 0.60, "preferred_side": 1.0}
+    front = _blocked_front(cfg)
+    out = c.step(_sectors(front=front, fc=front, left=0.10, right=0.10),
+                 obst, None, 0.0, (0.0, 0.0), 0.0)
+    assert out.state == "TURN", f"expected TURN, got {out.state}"

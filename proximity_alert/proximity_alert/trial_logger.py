@@ -13,11 +13,13 @@ For each trial it records:
     - odom_distance_m     : straight-line distance from start to end
                              odometry position (drift-affected estimate)
 
-It also watches /cmd_vel during the trial to detect whether path_tracker's
-obstacle-avoidance state (AVOIDING) ever triggered -- that state is the
-only place a negative linear.x is ever commanded, so a reverse command
-during the trial window is an unambiguous signal the robot swerved
-around something instead of driving a clean A->B line. Trials with
+It also watches /avoidance_decision during the trial and counts how many
+distinct avoidance encounters the controller actually committed to, which is
+an unambiguous signal the robot swerved around something instead of driving
+a clean A->B line. (It does NOT infer this from /cmd_vel: a STRAFE commands
+linear.x == 0.0, so reverse-detection missed strafe-only encounters entirely,
+and a crab correction is indistinguishable from a strafe on /cmd_vel.)
+Trials with
 avoidance_events > 0 measure something different (avoidance-affected
 slippage) than a clean run and must not be silently pooled with clean
 trials in the stats -- see avoidance_events below.
@@ -27,7 +29,10 @@ csv_path=".../granite.csv" -> surface="granite") -- override with the
 `surface` parameter if the filename doesn't match (e.g. a shared/misc log).
 
 Then, at the terminal, it prompts you for:
-    - ground_truth_distance_m (read off your tape-measure marks by eye)
+    - ground_truth_distance_m        (read off your tape-measure marks by eye)
+    - ground_truth_lateral_offset_m  (tape-measured lateral offset from the
+                                       A->B line, blank if not measured;
+                                       + = right, - = left)
     - notes                (freeform, optional -- e.g. "motors fought each
                              other on the turn", "oscillated near desk")
 
@@ -37,11 +42,19 @@ manual spreadsheet wrangling.
 CSV columns:
     timestamp, surface, trial_num, transit_time_s, odom_distance_m,
     ground_truth_distance_m, slippage_error_m, slippage_pct,
-    avoidance_events, lidar_stop_range_m, notes, battery_level
+    avoidance_events, lidar_stop_range_m, notes, battery_level,
+    ground_truth_lateral_offset_m, obstacle_count, layout_id, outcome, cause
+
+The last four columns (obstacle_count, layout_id, outcome, cause) are only
+ever populated when track_obstacle_outcome:=true (see Parameters below) --
+plain surface trials (granite.csv etc.) leave them blank and are prompted
+exactly as before. layout_id is a short label you assign per obstacle
+arrangement (e.g. "layout_A"); the actual obstacle geometry for that ID
+lives in your own separate layout sheet, not in this CSV.
 
 Topics:
     Subscribes: /odom (nav_msgs/Odometry)
-    Subscribes: /cmd_vel (geometry_msgs/Twist)
+    Subscribes: /avoidance_decision (std_msgs/String)
     Subscribes: /ros_robot_controller/battery (std_msgs/UInt16, raw mV) --
                 converted to a rough High/Medium/Low estimate assuming a 2S
                 Li-ion pack (6.0V empty - 8.4V full); not a precise SoC.
@@ -56,6 +69,14 @@ Parameters:
     stop_confirm_duration   (float, default 1.0)  seconds of continuous
                                                     stopped-ness before a
                                                     trial is finalized
+    track_obstacle_outcome  (bool,  default False) -- when true, also prompts
+                                                    for obstacle_count,
+                                                    layout_id, outcome
+                                                    (success/failure) and
+                                                    cause per trial. Use for
+                                                    csv_path=avoidance_trials.csv;
+                                                    leave false for plain
+                                                    surface trials.
 
 Run (in a second terminal, alongside path_tracker.py):
     ros2 run <your_package> trial_logger
@@ -69,10 +90,11 @@ import os
 import time
 
 import rclpy
-from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
-from std_msgs.msg import Float32, UInt16
+from std_msgs.msg import Float32, String, UInt16
+
+from proximity_alert.decision_record import DecisionRecord
 
 
 CSV_HEADER = [
@@ -88,6 +110,11 @@ CSV_HEADER = [
     "lidar_stop_range_m",
     "notes",
     "battery_level",
+    "ground_truth_lateral_offset_m",
+    "obstacle_count",
+    "layout_id",
+    "outcome",
+    "cause",
 ]
 
 # /ros_robot_controller/battery publishes raw millivolts (std_msgs/UInt16),
@@ -127,11 +154,13 @@ class TrialLogger(Node):
         self.declare_parameter("move_velocity_threshold", 0.03)
         self.declare_parameter("stop_velocity_threshold", 0.02)
         self.declare_parameter("stop_confirm_duration", 1.0)
+        self.declare_parameter("track_obstacle_outcome", False)
 
         self.csv_path = self.get_parameter("csv_path").value
         self.move_threshold = self.get_parameter("move_velocity_threshold").value
         self.stop_threshold = self.get_parameter("stop_velocity_threshold").value
         self.stop_confirm_duration = self.get_parameter("stop_confirm_duration").value
+        self.track_obstacle_outcome = self.get_parameter("track_obstacle_outcome").value
 
         # Surface defaults to the CSV filename (e.g. ".../granite.csv" ->
         # "granite") -- one CSV per surface is already this project's
@@ -147,8 +176,8 @@ class TrialLogger(Node):
         self.odom_sub = self.create_subscription(
             Odometry, "/odom", self.odom_callback, 10
         )
-        self.cmd_vel_sub = self.create_subscription(
-            Twist, "/cmd_vel", self.cmd_vel_callback, 10
+        self.decision_sub = self.create_subscription(
+            String, "/avoidance_decision", self.decision_callback, 10
         )
         self.range_sub = self.create_subscription(
             Float32, "/forward_min_range", self.range_callback, 10
@@ -172,13 +201,22 @@ class TrialLogger(Node):
         self.stopped_since = None
         self.trial_num = self._count_existing_trials()
 
-        # Avoidance detection: path_tracker only ever commands a negative
-        # linear.x while in its AVOIDING state, so a reverse command seen
-        # during "moving" is an unambiguous obstacle-avoidance signal.
-        # was_reversing tracks edge transitions so multiple ticks of the
-        # same maneuver count as one event, not one per control-loop tick.
+        # Avoidance detection: counted from the /avoidance_decision stream,
+        # NOT from /cmd_vel. The old heuristic keyed on a negative linear.x,
+        # on the assumption that path_tracker only reverses while avoiding.
+        # That assumption is false: AvoidanceController._strafe commands
+        # linear.x == 0.0 (avoidance.py:412), so a strafe-only encounter --
+        # the most common kind -- never produced a reverse edge and silently
+        # logged avoidance_events=0 despite a real STRAFE in decision_log.csv.
+        # cmd_vel cannot distinguish an avoidance strafe from the cross-track
+        # crab correction either (both are linear.y with linear.x >= 0), so
+        # the decision stream is the only unambiguous source.
+        #
+        # Counted as DISTINCT encounter_id values carrying a real maneuver, so
+        # multiple decision records within one encounter count once, and a
+        # "cleared" DRIVE/NONE record does not count at all.
         self.avoidance_events = 0
-        self.was_reversing = False
+        self._maneuver_encounters = set()
 
         # Set by odom_callback when a trial has just finished; consumed by
         # the main loop so we can safely call blocking input() outside of
@@ -238,6 +276,12 @@ class TrialLogger(Node):
         lidar_stop_range_m,
         notes,
         battery_level_str,
+        lateral_offset_m=None,
+        obstacle_count=None,
+        layout_id="",
+        outcome="",
+        cause="",
+        trial_end_epoch=None,
     ):
         self.trial_num += 1
         error = odom_distance_m - ground_truth_m
@@ -249,11 +293,33 @@ class TrialLogger(Node):
             if lidar_stop_range_m is not None and math.isfinite(lidar_stop_range_m)
             else ""
         )
+        # Not every trial measures a lateral offset (only offset trials do) --
+        # blank rather than fabricate a 0.0 that would misread as "measured
+        # and on-line".
+        lateral_str = (
+            f"{lateral_offset_m:.4f}" if lateral_offset_m is not None else ""
+        )
+        # Blank rather than "0", "None" or a fabricated value -- these four
+        # columns are only ever populated for track_obstacle_outcome runs;
+        # a plain surface trial must leave them genuinely empty, not "0".
+        obstacle_count_str = (
+            str(obstacle_count) if obstacle_count is not None else ""
+        )
+        # The moment the ROBOT stopped, not the moment this row was written.
+        # Writing happens only after the operator answers every interactive
+        # prompt (~9 of them under track_obstacle_outcome), observed at 3-4
+        # minutes -- stamping write time made rows impossible to correlate
+        # against decision_log.csv or scan_trace.jsonl by time.
+        stamp = time.strftime(
+            "%Y-%m-%d %H:%M:%S",
+            time.localtime(trial_end_epoch) if trial_end_epoch is not None
+            else time.localtime(),
+        )
         with open(self.csv_path, "a", newline="") as f:
             writer = csv.writer(f)
             writer.writerow(
                 [
-                    time.strftime("%Y-%m-%d %H:%M:%S"),
+                    stamp,
                     surface,
                     self.trial_num,
                     f"{transit_time_s:.3f}",
@@ -265,27 +331,40 @@ class TrialLogger(Node):
                     range_str,
                     notes,
                     battery_level_str,
+                    lateral_str,
+                    obstacle_count_str,
+                    layout_id,
+                    outcome,
+                    cause,
                 ]
             )
-        if avoidance_events:
-            self.get_logger().warn(
-                f"Trial {self.trial_num} logged with {avoidance_events} "
-                "avoidance event(s) -- this run is NOT a clean A->B line, "
-                "flag it before pooling with clean-run slippage stats."
-            )
-        else:
-            self.get_logger().info(f"Trial {self.trial_num} logged to {self.csv_path}")
+        self.get_logger().info(f"Trial {self.trial_num} logged to {self.csv_path}")
 
     # ---------- Odometry / state machine ----------
 
-    def cmd_vel_callback(self, msg: Twist):
+    def _reset_avoidance_tracking(self):
+        self.avoidance_events = 0
+        self._maneuver_encounters = set()
+
+    def decision_callback(self, msg: String):
+        """Count distinct avoidance encounters seen during a trial.
+
+        A malformed or schema-drifted message must never take the logger down
+        mid-trial -- the trial's own measurements stay valid, we just cannot
+        attribute this one record, so it is logged and skipped (same policy as
+        decision_logger).
+        """
         if self.state != "moving":
-            self.was_reversing = False
             return
-        is_reversing = msg.linear.x < 0.0
-        if is_reversing and not self.was_reversing:
-            self.avoidance_events += 1
-        self.was_reversing = is_reversing
+        try:
+            rec = DecisionRecord.from_json(msg.data)
+        except Exception as exc:  # noqa: BLE001 - never fatal to a live trial
+            self.get_logger().warning(f"Unparseable decision record skipped: {exc}")
+            return
+        if rec.chosen_maneuver in ("", "NONE", None):
+            return
+        self._maneuver_encounters.add(rec.encounter_id)
+        self.avoidance_events = len(self._maneuver_encounters)
 
     def range_callback(self, msg: Float32):
         self.last_min_range = msg.data
@@ -306,8 +385,7 @@ class TrialLogger(Node):
                 self.start_pos = pos
                 self.start_time = now
                 self.stopped_since = None
-                self.avoidance_events = 0
-                self.was_reversing = False
+                self._reset_avoidance_tracking()
                 self.get_logger().info("Trial started (robot began moving).")
 
         elif self.state == "moving":
@@ -327,11 +405,11 @@ class TrialLogger(Node):
                         self.avoidance_events,
                         self.last_min_range,
                         self.last_battery_mv,
+                        self.stopped_since,
                     )
                     self.state = "idle"
                     avoid_note = (
-                        f" ({self.avoidance_events} avoidance event(s) -- "
-                        "not a clean run)"
+                        f" ({self.avoidance_events} avoidance event(s))"
                         if self.avoidance_events
                         else ""
                     )
@@ -357,10 +435,11 @@ def main(args=None):
                     avoidance_events,
                     lidar_stop_range_m,
                     battery_mv,
+                    trial_end_epoch,
                 ) = node.pending_trial
                 node.pending_trial = None
                 avoid_note = (
-                    f", avoidance_events={avoidance_events} (NOT a clean run)"
+                    f", avoidance_events={avoidance_events}"
                     if avoidance_events
                     else ""
                 )
@@ -401,10 +480,67 @@ def main(args=None):
                     ground_truth_m = value
 
                 if ground_truth_m is not None:
+                    # Optional -- only offset trials measure this. Blank means
+                    # "not measured", not "measured as zero", so it stays
+                    # None rather than being coerced to 0.0.
+                    lateral_offset_m = None
+                    lateral_entered = False
+                    while not lateral_entered:
+                        lat_raw = input(
+                            "Ground-truth lateral offset in m, + = right / "
+                            "- = left (blank if not measured): "
+                        ).strip()
+                        if lat_raw == "":
+                            lateral_entered = True
+                            continue
+                        try:
+                            lateral_offset_m = float(lat_raw)
+                        except ValueError:
+                            print(f"  '{lat_raw}' is not a number -- try again.")
+                            continue
+                        lateral_entered = True
+
                     notes = input(
                         "Notes -- anything unusual? e.g. motor conflict, "
                         "oscillation, false stop (blank if none): "
                     ).strip()
+
+                    obstacle_count = None
+                    layout_id = ""
+                    outcome = ""
+                    cause = ""
+                    if node.track_obstacle_outcome:
+                        while obstacle_count is None:
+                            oc_raw = input(
+                                "Obstacle count for this trial: "
+                            ).strip()
+                            try:
+                                value = int(oc_raw)
+                            except ValueError:
+                                print(f"  '{oc_raw}' is not an integer -- try again.")
+                                continue
+                            if value < 0:
+                                print("  Obstacle count must be >= 0 -- try again.")
+                                continue
+                            obstacle_count = value
+
+                        layout_id = input(
+                            "Layout ID for this obstacle arrangement "
+                            "(e.g. 'layout_A', blank if untracked): "
+                        ).strip()
+
+                        while outcome not in ("success", "failure"):
+                            outcome = input(
+                                "Outcome -- 'success' or 'failure': "
+                            ).strip().lower()
+                            if outcome not in ("success", "failure"):
+                                print("  Enter exactly 'success' or 'failure'.")
+
+                        cause = input(
+                            f"Cause of {outcome} -- freeform "
+                            "(blank if none): "
+                        ).strip()
+
                     node._append_row(
                         node.surface,
                         transit_time_s,
@@ -414,6 +550,12 @@ def main(args=None):
                         lidar_stop_range_m,
                         notes,
                         battery_level_str,
+                        lateral_offset_m,
+                        obstacle_count,
+                        layout_id,
+                        outcome,
+                        cause,
+                        trial_end_epoch,
                     )
     except KeyboardInterrupt:
         pass

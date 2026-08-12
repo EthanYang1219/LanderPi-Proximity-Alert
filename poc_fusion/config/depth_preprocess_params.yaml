@@ -1,0 +1,34 @@
+# depth_preprocess_node parameters (Task 4).
+#
+# ROI ("self-arm ROI"): the box of the depth frame occupied by the robot's
+# own arm, which self-occludes part of the camera's view. Pixels inside the
+# box are invalidated (set to 0) before the point cloud is built, so the
+# arm itself is never reported as an obstacle.
+#
+# `roi_profile` selects one of `roi_profiles` by name. Only `default` exists
+# right now, deliberately spanning the FULL frame with zero-width bounds
+# (row_min == row_max, col_min == col_max) -- i.e. it masks NOTHING. This is
+# the Task 4 "start permissive" placeholder: Task 11 measures and replaces
+# it with the real arm-occlusion box once the arm's operating pose is fixed.
+#
+# Task 10a will add a second named profile here for the overhang-test pose;
+# that profile is intentionally not built yet (YAGNI). Adding one is NOT a
+# YAML-only change: depth_preprocess_node.py only calls declare_parameter()
+# for `roi_profiles.default.*` (rclpy requires every parameter name to be
+# declared before get_parameter() can read it, and this node does not use
+# automatically_declare_parameters_from_overrides), so a second profile also
+# needs four more declare_parameter() calls in the node for its bounds.
+depth_preprocess_node:
+  ros__parameters:
+    depth_image_topic: /ascamera/camera_publisher/depth0/image_raw
+    depth_cleaned_topic: /poc_fusion/depth_cleaned
+    debug_image_topic: /poc_fusion/debug_image
+    expected_encoding: mono16
+    median_kernel_size: 3
+    roi_profile: default
+    roi_profiles:
+      default:
+        row_min: 0
+        row_max: 0
+        col_min: 0
+        col_max: 0

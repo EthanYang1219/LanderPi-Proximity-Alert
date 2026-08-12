@@ -1,0 +1,154 @@
+# Trial metadata --- fusion-costmap physical POC
+#
+# Records the CONFIGURATION of the run. Measurements live in the CSVs and are
+# not duplicated here (a few are cross-referenced for quick orientation only,
+# and are marked as such --- the CSV is always authoritative).
+#
+# Fill in every TODO before the robot moves. Defaults below are transcribed
+# from the repo's config files; VERIFY them against what is actually deployed
+# in the container, because the deployed tree can lag the host tree.
+
+trial:
+  id: TODO                      # trial_001, trial_002, ... global, never reused
+  date: TODO                    # YYYY-MM-DD
+  time_local: TODO              # HH:MM, host clock (HKT / UTC+8)
+  operator: TODO
+  result: TODO                  # SUCCESS | FAIL | INCONCLUSIVE
+  purpose: TODO                 # one line: what this run was meant to show
+
+# --- Software provenance --------------------------------------------------
+# `git rev-parse HEAD` and `git rev-parse --abbrev-ref HEAD` on the HOST.
+# deployed_commit is what scripts/deploy_poc_fusion.sh last pushed into the
+# container; if it differs from git_commit, the run did NOT test HEAD.
+software:
+  git_commit: TODO
+  git_branch: feature/poc-fusion-costmap
+  deployed_commit: TODO
+  working_tree_clean: TODO      # true | false --- false means unreproducible
+  ros_distro: humble
+
+# --- Course ----------------------------------------------------------------
+# Point A and B are the taped floor marks. Measure the A-B separation with a
+# tape; do not derive it from odom (odom drift is the thing being measured).
+course:
+  point_a_description: TODO     # e.g. "taped X, lab north wall"
+  point_b_description: TODO
+  a_to_b_distance_m: TODO       # tape measure, meters
+  surface: TODO                 # carpet | granite | wood | other
+  lateral_offset_tolerance_m: TODO   # how far off the B mark still counts
+
+# --- Obstacle --------------------------------------------------------------
+# `layout_id` groups trials that used an identical setup so they can be
+# compared. Invent a short stable name and reuse it exactly.
+obstacle:
+  layout_id: TODO               # e.g. "box-center-1m"
+  type: TODO                    # e.g. "cardboard box", "none" for a control run
+  material_finish: TODO         # matte / glossy / dark --- affects IR return
+  width_m: TODO
+  depth_m: TODO
+  height_m: TODO                # NOTE: below 0.086 m is invisible to BOTH sensors
+  distance_from_a_m: TODO       # along the A->B line
+  lateral_offset_from_line_m: TODO   # +left / -right, 0 = centered
+  visible_to_lidar: TODO        # true | false --- true iff height > 0.086 m
+  visible_to_depth: TODO        # true | false --- depth marks only 0.10-0.99 m
+
+# --- Motion / avoidance parameters ----------------------------------------
+# Defaults from proximity_alert/proximity_alert/avoidance.py (AvoidanceConfig).
+# NOTE: the vendor app-control node clamps /cmd_vel to +/-0.20 m/s, so
+# forward_speed and strafe_speed above 0.20 are not actually delivered.
+motion:
+  forward_speed_mps: 0.20
+  strafe_speed_mps: 0.20
+  strafe_timeout_s: 2.0
+  max_strafe_distance_m: 0.40         # strafe_speed * strafe_timeout
+  max_cumulative_strafe_m: 1.25
+  safety_distance_m: 0.20             # LiDAR front range that triggers a maneuver
+  clear_margin_m: 0.10
+  clear_threshold_m: 0.30             # safety_distance + clear_margin
+  obstacle_confirm_scans: 2
+  corridor_margin_m: 0.05
+  control_rate_hz: 20.0
+  cross_track_kp: 0.6
+  cross_track_max_speed_mps: 0.10
+
+# --- Robot geometry --------------------------------------------------------
+# Measured 2026-08-12, +/- 0.001 m. The GRIPPER is the frontmost point, not
+# the chassis --- the arm protrudes 0.032 m past the chassis front. That makes
+# the arm's parked pose a safety-relevant configuration, because it sets the
+# lower bound on window_forward_m. If the arm is moved or sags between runs,
+# re-measure; do not carry this value forward unchecked.
+geometry:
+  front_extent_from_base_link_m: 0.1328   # to the gripper
+  chassis_front_from_base_link_m: 0.101
+  overall_width_m: 0.170
+  half_width_m: 0.085
+  arm_parked_pose_verified: TODO          # true | false --- check before the run
+  arm_protrusion_past_chassis_m: 0.032
+
+# --- LiDAR -----------------------------------------------------------------
+lidar:
+  model: LD19
+  scan_topic: /scan_raw
+  frame: lidar_frame
+  scan_plane_height_m: 0.086          # MEASURED 2026-08-11 (TF reports 0.093)
+  mounting: fixed horizontal          # identity rotation in base_footprint
+
+# --- Depth camera ----------------------------------------------------------
+depth_camera:
+  camera_info_topic: /ascamera/camera_publisher/depth0/camera_info
+  points_topic: /poc_fusion/points
+  mount_height_m: 0.246
+  tilt_below_horizontal_deg: 40
+  measured_forward_corridor_reach_m: 0.668   # 2026-08-11, floor-standing
+  points_rate_hz: TODO                # observed during THIS run, ~4 Hz typical
+
+# --- Fusion costmap --------------------------------------------------------
+# From poc_fusion/config/costmap_params.yaml.
+costmap:
+  global_frame: odom
+  robot_base_frame: base_link
+  resolution_m: TODO                  # read from the deployed config
+  scan_min_obstacle_height_m: 0.0
+  scan_max_obstacle_height_m: 2.0
+  pointcloud_min_obstacle_height_m: 0.10
+  pointcloud_max_obstacle_height_m: 0.99
+  pointcloud_observation_persistence_s: 0.3
+
+# --- Stop monitor / gate ---------------------------------------------------
+# From poc_fusion/config/stop_monitor_params.yaml.
+# window_forward_m is measured from the base_link origin, NOT from the LiDAR
+# (which sits +0.073 m forward). A LiDAR range of 0.20 m is ~0.273 m here.
+stop_monitor:
+  window_forward_m: 1.0
+  window_half_width_m: 0.135
+  lethal_threshold: 253
+  min_occupancy_fraction: 0.30
+  min_cluster_area_cm2: 100.0
+  costmap_staleness_bound_s: 0.75
+
+gate:
+  publish_cmd_vel: TODO               # true = gate actuates; false = observe only
+  cmd_vel_in_topic: /cmd_vel_raw
+  cmd_vel_out_topic: /cmd_vel_unsafe
+  motion_watchdog_running: TODO       # MUST be true for any actuating run
+  watchdog_timeout_s: 0.5
+
+# --- Log slicing -----------------------------------------------------------
+# The shared logs carry no trial ID; this window is how the folder was cut.
+slicing:
+  source_trial_csv: TODO              # e.g. trials/carpet.csv
+  trial_csv_row_timestamp: TODO       # the row's `timestamp` == window end
+  slice_pad_s: 10.0
+  window_start_utc: TODO
+  window_end_utc: TODO
+
+# --- Provenance ------------------------------------------------------------
+# Do NOT write LIDAR or DEPTH here on the grounds that the fusion stack was
+# running. That is not evidence. UNVERIFIED is the correct default.
+detection:
+  provenance: UNVERIFIED              # LIDAR | DEPTH | BOTH | UNVERIFIED
+  provenance_basis: TODO              # ablation run? measurement? none?
+  ablation_performed: false
+
+# --- Anything else needed to reproduce the run -----------------------------
+notes: TODO

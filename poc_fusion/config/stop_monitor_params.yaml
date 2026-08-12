@@ -1,0 +1,215 @@
+# costmap_stop_monitor_node parameters (Task 7).
+#
+# This node's authoritative output is a TRI-STATE (CLEAR / OBSTACLE /
+# UNKNOWN), not a boolean. See poc_fusion/lib/monitor_state.py for why, and
+# docs/poc_fusion_verification.md "Task 7" for the live evidence behind every
+# measured number quoted below.
+costmap_stop_monitor_node:
+  ros__parameters:
+
+    # --- Input topic ------------------------------------------------------
+    #
+    # /costmap/costmap_raw (nav2_msgs/Costmap), NOT /costmap/costmap
+    # (nav_msgs/OccupancyGrid). This is a correction to the Task 7 brief's
+    # Step 1, forced by two independently MEASURED facts:
+    #
+    #  1. COST SCALE. OccupancyGrid carries costs rescaled to 0..100 by
+    #     Costmap2DPublisher's translation table; costmap_raw carries the raw
+    #     0..255 costs. Reading one message of each off the SAME live costmap
+    #     node gave, verbatim, `min=0 max=100` with lethal cells at `100` on
+    #     /costmap/costmap and `min=0 max=254` with lethal cells at `254` on
+    #     /costmap/costmap_raw (pasted in the verification doc). The brief's
+    #     `lethal_threshold: 253` is a RAW cost value -- against the rescaled
+    #     OccupancyGrid nothing could ever reach it, and the monitor would
+    #     have reported CLEAR forever with no error anywhere. That is the
+    #     same class of silent failure CONSTRAINTS.md warns about.
+    #
+    #  2. PUBLICATION. MEASURED, NOT EXPLAINED: over 90 s a VOLATILE
+    #     subscriber to /costmap/costmap received 0 messages while the same
+    #     process's subscriber to /costmap/costmap_raw received 568; a
+    #     separate 20 s `ros2 topic hz /costmap/costmap` printed no line at
+    #     all. A TRANSIENT_LOCAL subscriber does get /costmap/costmap's
+    #     RETAINED message, and on this stack that retained message was
+    #     stamped 510 s older than the concurrently-retained costmap_raw
+    #     message. `ros2 param get /costmap/costmap always_send_full_costmap`
+    #     returned False, which is consistent with this, but that parameter
+    #     was NOT flipped and re-measured, so it is recorded as a correlate
+    #     and not as an isolated cause.
+    #
+    # Consuming costmap_raw therefore keeps `lethal_threshold: 253` meaningful
+    # AND leaves Task 6's reviewed costmap configuration completely untouched.
+    costmap_topic: /costmap/costmap_raw
+
+    # The costmap lifecycle node, as seen on the graph. Used to build BOTH
+    # `<node>/get_state` (polled) and `<node>/transition_event` (subscribed).
+    # Verified live to be `costmap/costmap` (Task 6).
+    costmap_lifecycle_node: /costmap/costmap
+
+    # --- Output topics ----------------------------------------------------
+    #
+    # status_topic carries the authoritative tri-state and is published on a
+    # fixed timer whether or not costmaps are arriving -- silence must never
+    # be the only symptom of a degraded monitor.
+    status_topic: /costmap_app/monitor_status
+    # obstacle_detected_topic is the DERIVED std_msgs/Bool compatibility
+    # output for Task 9 and Task 12. In UNKNOWN the node publishes NOTHING
+    # here -- not False. See monitor_state.should_publish_bool().
+    obstacle_detected_topic: /costmap_app/obstacle_detected
+    marker_topic: /costmap_app/window_marker
+    depth_cleaned_topic: /poc_fusion/depth_cleaned
+
+    # --- Frames -----------------------------------------------------------
+    #
+    # The costmap frame is taken from the incoming message header, never
+    # configured, so it cannot drift out of sync with the costmap's own
+    # global_frame. Only the body frame is named here. REP-103: +x forward.
+    robot_base_frame: base_link
+
+    # --- Step 4: window geometry and detection thresholds -----------------
+    #
+    # window_forward_m: 1.0 EXCEEDS the depth camera's measured coverage
+    # ceiling of 0.94 m (camera 0.246 m above the floor, tilted ~40 deg below
+    # horizontal -- CONSTRAINTS.md). The far ~6 cm of the window is therefore
+    # LiDAR-ONLY. This is intentional: the window is sized against stopping
+    # distance, not against camera coverage. It is recorded here, and in the
+    # published status message's `fusion_coverage_m` field, so that a trigger
+    # occurring at ~1 m is never written up as a camera detection.
+    window_forward_m: 1.0
+    # CHANGED 2026-08-12: 0.3 -> 0.135. Derived, not tuned; the derivation is
+    # `lib/window_bounds.max_window_half_width_m` and the deployed value is
+    # held to it by `test/test_window_bounds.py`.
+    #
+    #   robot half-width      0.085  (measured: 0.170 m outer wheel to outer
+    #                                 wheel; URDF axle y +/-0.0738 leaves
+    #                                 0.0112 m of wheel beyond the axle plane)
+    # + swept-path clearance  0.025  (stated design margin, half a cell)
+    # + half a costmap cell   0.025  (window_mask tests cell CENTRES and the
+    #                                 grid is a rolling window in odom, so the
+    #                                 effective edge jitters under the robot)
+    # = 0.135
+    #
+    # WHY 0.3 WAS WRONG, not merely generous: the frozen avoidance
+    # controller's `front` is the MINIMUM over a 180 deg arc
+    # (`front_arc_deg: 180.0`), so an obstacle at 60 deg bearing and 0.20 m
+    # range sits at roughly base_link x=0.17, y=0.17 -- inside a +/-0.3 m
+    # window. It therefore stayed in the window throughout the very STRAFE
+    # that was clearing it, holding the gate closed for the whole maneuver.
+    # At 0.135 a 0.15 m-wide obstacle leaves the window after ~0.21 m of
+    # strafe, against `max_strafe_distance` 0.40 m. At 0.3 it needed ~0.375 m
+    # -- marginal against that same 0.40 m cap.
+    #
+    # This narrows the backstop to the robot's own swept path, which is the
+    # only question it exists to answer: "is the robot about to hit this?"
+    window_half_width_m: 0.135
+    # 253 == nav2's INSCRIBED_INFLATED_OBSTACLE; 254 == LETHAL_OBSTACLE. A
+    # threshold of 253 catches both. Raw cost scale -- see costmap_topic.
+    lethal_threshold: 253
+    min_occupancy_fraction: 0.30
+    min_cluster_area_cm2: 100.0
+
+    # --- Requirement 3: staleness bound, chosen from MEASURED rates -------
+    #
+    # /costmap/costmap_raw, measured over one continuous 90.15 s subscription
+    # on the live stack: 562 messages, 561 inter-arrival intervals,
+    # mean 0.1565 s (6.389 Hz), median 0.1561 s, min 0.0947 s, p95 0.2292 s,
+    # p99 0.2441 s, max (worst observed gap) 0.2612 s.
+    #
+    # Captured output for this run is pasted in docs/poc_fusion_verification.md
+    # under "Task 7 -- Step 2". (The configured update/publish frequency is
+    # 10 Hz. The ~6.4 Hz vs 10 Hz shortfall is a MEASURED, NOT-ISOLATED system
+    # constraint already ratified for this project -- used here as an input,
+    # never explained.)
+    #
+    # 0.75 s is 2.87x the worst gap actually observed (0.2612 s) and 4.79x the
+    # measured mean interval, so reaching it means roughly five consecutive
+    # publications were missed.
+    #
+    # PROVENANCE NOTE -- an earlier version of this comment sized the bound
+    # against a 0.467 s worst gap (from a `ros2 topic hz` run) and a 0.3417 s
+    # 90 s-run maximum, and argued that a 10 Hz-derived ~0.40 s bound "would
+    # have flapped" because 0.467 s exceeds it. Those figures came from the
+    # Task 7 implementer session, which died; its evidence did not survive.
+    # The re-measurement above reproduces the DISTRIBUTION SHAPE closely
+    # (562 vs 568 messages, 6.389 vs 6.309 Hz) but its worst gap is 0.2612 s
+    # -- it does NOT reproduce 0.3417 s or 0.467 s. So the "0.40 s would have
+    # flapped" argument is NOT supported by reproducible evidence and has been
+    # withdrawn rather than restated: against this run's data a 0.40 s bound
+    # would not have flapped. 0.75 s is retained because it is comfortably
+    # clear of the observed distribution either way, not because of that
+    # argument. Any future re-derivation should re-measure rather than trust
+    # the withdrawn figures.
+    costmap_staleness_bound_s: 0.75
+
+    # --- Requirement 2: positive liveness ---------------------------------
+    #
+    # How often to re-confirm the costmap lifecycle node is ACTIVE via its
+    # get_state service. transition_event is also subscribed for immediate
+    # notification, but polling is what makes the confirmation POSITIVE: a
+    # node that dies without emitting a transition still stops answering.
+    lifecycle_query_period_s: 1.0
+    lifecycle_query_timeout_s: 0.5
+
+    # How often the status topic is published, independent of costmap
+    # arrivals. 5 Hz.
+    status_publish_period_s: 0.2
+
+    # --- Step 7: camera-health watchdog (a SEPARATE degradation axis) -----
+    #
+    # No frame on depth_cleaned_topic for this long => fusion is no longer
+    # contributing and the costmap is LiDAR-only. Logged loudly and reported
+    # in the status message, but the node does NOT halt: degrading to the
+    # proven sensor is correct for a stop-trigger POC; degrading silently is
+    # not. This never forces the costmap tri-state to UNKNOWN -- a LiDAR-only
+    # costmap is still a valid costmap.
+    camera_timeout_s: 2.0
+
+    # The depth camera's measured coverage ceiling (CONSTRAINTS.md "Verified
+    # topic and hardware facts"), carried as a parameter purely so the
+    # status message can report `fusion_coverage_m` =
+    # min(window_forward_m, this) and `lidar_only_beyond_m` = this. It
+    # gates NO detection logic -- the costmap's own obstacle_layer height
+    # filter (costmap_params.yaml, pointcloud max_obstacle_height) is what
+    # actually bounds the camera's contribution. Restating it here is for
+    # the trial record only.
+    #
+    # This value stays 0.94 because it is measured ABOVE THE FLOOR, which
+    # is the frame a trial write-up cares about. The costmap key it mirrors
+    # reads 0.99 rather than 0.94 because nav2 applies that filter in odom,
+    # whose origin sits 0.054 m below base_link and ~0.048 m below the
+    # floor. Same physical ceiling, two frames -- see the Task 8 height
+    # -filter comment in costmap_params.yaml for the measurement.
+    camera_coverage_ceiling_m: 0.94
+
+    # --- Step 3: grid-rotation assumption ---------------------------------
+    #
+    # window_mask() maps grid indices to world coordinates by pure
+    # translation, which is only valid for an unrotated grid. nav2_costmap_2d
+    # never rotates its grid; this tolerance makes that the one explicitly
+    # checked assumption instead of an implicit one.
+    origin_orientation_tol: 0.001
+
+    # --- Step 2: retry period for the TF at the costmap's stamp -----------
+    #
+    # The lookup is ALWAYS made at the costmap message's OWN stamp -- there
+    # is no fallback to the latest pose, which would evaluate the window at
+    # the wrong place. This is only how often an as-yet-unavailable
+    # transform for that same stamp is re-attempted.
+    #
+    # It is not optional. The costmap stamps a message at publish time, and
+    # that stamp is routinely a few ms AHEAD of the newest odom->base_link
+    # transform. MEASURED live with the lookup done directly in the
+    # subscription callback: the monitor stayed in UNKNOWN(tf_lookup_failed)
+    # for an entire 30 s run and NEVER reached CLEAR; observed steady-state
+    # stamp-ahead-of-TF margins were 8.7, 7.7 and 18.1 ms. Blocking in the
+    # callback instead (TransformListener spin_thread=True + a 0.15 s
+    # blocking timeout) was also measured and was WORSE -- the buffer fell
+    # ~2.4 s behind and the node still never left UNKNOWN. That regression
+    # was NOT isolated to a single cause; it was abandoned rather than
+    # explained, because the non-blocking retry needs neither mechanism.
+    #
+    # 0.05 s is ~2.8x the largest observed stamp-ahead margin (18.1 ms) and
+    # is ~1/3 of the measured 0.1585 s mean costmap interval, so a message
+    # normally gets two or three attempts before its successor arrives. It
+    # also bounds the added rising-edge latency Task 12 will measure: at
+    # most one retry period, and zero whenever TF is already ahead.
+    tf_retry_period_s: 0.05

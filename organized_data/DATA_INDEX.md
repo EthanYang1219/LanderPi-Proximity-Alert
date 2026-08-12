@@ -13,6 +13,15 @@ definitions and context, see the `README.md` in each subfolder.
 | `floor_test_log.csv` | `processed/` | Original hand-maintained PID/safety-distance tuning log (legacy schema) | manual |
 | `wood_floor_test_log.csv` | `processed/` | Separate per-surface (wood) hand-maintained tuning log, expanded schema | manual |
 
+## Fusion-costmap POC trials
+
+Trials for the fusion-costmap POC are organized differently — one
+self-contained folder per run, slicing the shared logs above by time window
+and adding the run configuration those logs never captured. See
+[docs/poc_trials/README.md](../docs/poc_trials/README.md). The full folders
+live outside git at `/home/pi/poc_trials/`; only each trial's `README.md` and
+`trial_metadata.yaml` are committed.
+
 ## Where the live data actually is
 
 `raw/` and `processed/` here are **copies**, taken 2026-07-29, for a clean
