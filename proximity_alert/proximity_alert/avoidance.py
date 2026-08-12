@@ -69,7 +69,7 @@ class AvoidanceConfig: # All measurements are in meters or m/s for the speed. Al
     rear_clearance_min: float = 0.10       # How much room is required behind before it's allowed to back up. Turn it down and it'll reverse with less space behind it
     turn_radius: float = 0.15               # Shape of the backup-while-turning arc. 0 = a tight near-in-place pivot; turn it up for a wider, longer sweeping arc instead
     rear_taper_zone: float = 0.15           # Smooths out the backup motion as rear space runs low, instead of cutting it off abruptly. 0 = hard cutoff, which can look like a little stutter; turn it up to fade out smoothly instead
-    pass_clearance: float = 0.35           # Room required on the near side before the robot considers itself past the obstacle
+    pass_clearance: float = 0.40           # Room required on the near side before the robot considers itself past the obstacle
     max_drive_past_distance: float = 0.80  # How far it'll drive past an obstacle before giving up and re-checking. Turn it up to be more patient with wide obstacles, at the cost of drifting further off-line
     heading_kp: float = 5.0               # How hard it steers back toward the target direction. Turn it up and it corrects faster, but too high makes it swing back and forth instead of settling
     heading_ki: float = 0.05                # Corrects small lingering aim error that heading_kp alone won't fully clear. Turn it up to squeeze out drift more aggressively, but too high causes overshoot after a turn
