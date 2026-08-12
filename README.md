@@ -13,7 +13,13 @@ The system drives a mobile robot from a fixed point A to point B, reactively sto
 - [Setup](#setup)
 - [Usage](#usage)
 - [Data collected](#data-collected)
+- [Running the tests](#running-the-tests)
 - [Parameters](#parameters)
+- [Motion watchdog and emergency stop](#motion-watchdog-and-emergency-stop)
+- [Lateral offset trials (`lateral_offset_trials.csv`)](#lateral-offset-trials-lateral_offset_trialscsv)
+- [Obstacle audio alert](#obstacle-audio-alert)
+- [Three logs, all on your computer](#three-logs-all-on-your-computer)
+- [Reconciling floor_test_log.csv](#reconciling-floor_test_logcsv)
 - [Roadmap](#roadmap)
 - [Troubleshooting](#troubleshooting)
 - [Authors](#authors)
@@ -57,28 +63,49 @@ The buzzer is intentionally not wired into the current nodes — it is a separat
 
 ```
 .
-├── proximity_alert/            # The ROS 2 package (ament_python)
+├── proximity_alert/            # ROS 2 package (ament_python) -- the A->B driving + avoidance stack
 │   ├── package.xml
 │   ├── setup.py / setup.cfg
+│   ├── test/                         # pytest suite (see Running the tests below)
 │   └── proximity_alert/
 │       ├── path_tracker.py           # Drives A -> B, reactive LiDAR obstacle avoidance, and plays the obstacle audio alert (on by default)
-│       ├── avoidance.py              # Pure, ROS-free obstacle-avoidance state machine
+│       ├── avoidance.py              # Pure, ROS-free obstacle-avoidance state machine (AvoidanceConfig lives here)
+│       ├── scan_utils.py             # Pure LiDAR helpers: forward-arc minimum, sector reduction, obstacle sizing, gap selection
+│       ├── nav_utils.py              # Pure navigation geometry helpers (along-track / cross-track)
 │       ├── trial_logger.py           # Logs transit time, odometry distance, ground truth per trial
 │       ├── decision_logger.py        # Logs each avoidance decision to its own CSV
+│       ├── decision_record.py        # Pure record type for one decision-log row
 │       ├── floor_test_reconcile.py   # Fills floor_test_log.csv's Time/Stop-clearance from real trial data
 │       ├── scan_trace_record.py      # Pure JSON-Lines record for one raw scan tick
 │       ├── scan_trace_logger.py      # Logs every raw LiDAR scan continuously, for post-hoc miss diagnosis
 │       ├── audio_trigger.py          # Pure once-per-encounter trigger logic for the obstacle audio alert (used by path_tracker.py)
 │       ├── motion_watchdog.py        # Fail-safe cmd_vel forwarder -- forces a stop the instant its input goes stale
 │       └── motion_watchdog_logic.py  # Pure decision logic for motion_watchdog (used by motion_watchdog.py)
+├── poc_fusion/                 # ROS 2 package (ament_python) -- the LiDAR + depth-camera costmap fusion POC
+│   ├── config/                       # YAML params for each node below
+│   ├── launch/poc_fusion.launch.py
+│   ├── test/                         # pytest suite (see Running the tests below)
+│   ├── tools/measure_stopping_distance.py
+│   └── poc_fusion/
+│       ├── depth_preprocess_node.py      # Cleans/downsamples the depth stream before it reaches the costmap
+│       ├── costmap_stop_monitor_node.py  # Watches the fused costmap and decides when to stop
+│       ├── stop_action_node.py           # Executes the stop
+│       ├── latency_recorder_node.py      # Records end-to-end detection latency
+│       └── lib/                          # Pure, ROS-free logic backing each node (unit-tested without ROS)
+├── scripts/deploy_poc_fusion.sh  # Host -> container deploy helper
+├── docs/                       # Design specs, verification logs, trial layouts
+├── organized_data/             # Browsable snapshot of trials/ (data files gitignored, READMEs tracked)
 ├── trials/                     # CSVs, gitignored (not committed) -- see below
 │   ├── floor_test_log.csv      # Hand-maintained PID/safety-distance tuning session report
 │   ├── lateral_offset_trials.csv  # Hand-maintained return-to-line (cross-track) trial report
-│   ├── granite.csv             # -> symlink to /home/pi/docker/tmp/trials/granite.csv
+│   ├── avoidance_trials.csv    # -> symlink to /home/pi/docker/tmp/trials/avoidance_trials.csv
+│   ├── granite.csv             # -> symlink (same pattern; also carpet.csv, wood.csv per surface)
 │   ├── decision_log.csv        # -> symlink to /home/pi/docker/tmp/trials/decision_log.csv
 │   └── scan_trace.jsonl        # -> symlink to /home/pi/docker/tmp/trials/scan_trace.jsonl
 └── README.md
 ```
+
+The two packages are independent: `proximity_alert` is what the A→B trials run on, `poc_fusion` is the depth/LiDAR fusion proof of concept. Neither imports the other.
 
 `trials/granite.csv`, `trials/decision_log.csv`, and `trials/scan_trace.jsonl` are symlinks into the container's bind-mounted shared folder (see [Three logs](#three-logs-all-on-your-computer) below) — they exist purely so all three logs show up directly in this repo's VS Code Explorer/file tree instead of requiring you to browse to `/home/pi/docker/tmp/trials/` separately. They live-update as the nodes write to them. If you log a new surface (e.g. `hpl.csv` for plastic laminate), symlink it the same way:
 
@@ -230,6 +257,24 @@ Each row appended to the CSV represents one trial:
 - **HALT** — stop and flag; re-check each tick.
 
 The LiDAR is reduced each scan into FRONT (+ front sub-sectors), LEFT, RIGHT, and REAR clearances. Every decision is published as a JSON record on `/avoidance_decision` and logged by `decision_logger` (see [Data collected](#data-collected)). Set `disable_avoidance:=true` to halt on any obstacle with no turn/strafe (used for the clean go-and-stop distance runs).
+
+## Running the tests
+
+Both packages carry a pytest suite. **There is no working top-level test command** — running `pytest` from the repo root fails collection on every module, because each package's imports resolve only from inside that package's own directory. Run each suite from its package root:
+
+```bash
+cd /home/pi/Desktop/LanderPi-Proximity-Alert/poc_fusion && python3 -m pytest test/ -q
+```
+
+`poc_fusion` is ROS-free throughout and runs clean on the host.
+
+**`proximity_alert` needs one extra flag on the host.** Six of its test modules import `rclpy`, which exists only inside the `MentorPi` container. A collection error aborts the *entire* pytest run by default — so the plain command runs **zero** tests on the host rather than skipping those six. Add `--continue-on-collection-errors` so the rest still run:
+
+```bash
+cd /home/pi/Desktop/LanderPi-Proximity-Alert/proximity_alert && python3 -m pytest test/ -q --continue-on-collection-errors
+```
+
+Expect `6 errors` from the `rclpy` modules — that is the host environment, not a regression. The pure-logic modules (`avoidance`, `scan_utils`, `nav_utils`, `audio_trigger`, `motion_watchdog_logic`, the record types) are ROS-free by design and do run here. **This is not a full pass:** to actually exercise the six ROS modules, run the same command inside the container (`docker exec -u ubuntu MentorPi ...`, see [Setup](#setup)).
 
 ## Parameters
 
@@ -453,7 +498,7 @@ later "trial start" moment. Place the robot at point A **first**, then launch
 |---|---|---|
 | `csv_path` | `/home/ubuntu/shared/trials/decision_log.csv` | Output CSV for the avoidance decision log (host path — see below) |
 
-### Motion watchdog and emergency stop
+## Motion watchdog and emergency stop
 
 **The STM32 holds the last commanded velocity forever — there is no motion watchdog anywhere else on this platform.** `path_tracker` publishing a final zero `Twist` as it exits (`publish_stop()`) is not enough on its own: it only runs if the process gets a clean shutdown. If it's orphaned, SIGKILLed, or its last message is simply dropped, nothing ever corrects the latched command and the robot keeps moving indefinitely on whatever it was last told to do. This happened twice on hardware — once for ~8 minutes, once mid-avoidance doing a backwards turning arc after Ctrl+C had already returned the terminal to a prompt.
 
@@ -475,7 +520,7 @@ docker exec -u ubuntu MentorPi bash -c "source /opt/ros/humble/setup.bash && ros
 
 Leave this running (Ctrl+C to stop *it*, once the robot is confirmed stopped) — a single `--once` publish can be beaten by a stale process still actively publishing nonzero commands in a race; a sustained `-r 20` republish wins that race instead of hoping to.
 
-### Lateral offset trials (`lateral_offset_trials.csv`)
+## Lateral offset trials (`lateral_offset_trials.csv`)
 
 No node measures ground-truth cross-track offset — it can only ever be read off a tape measure on the floor, so [`trials/lateral_offset_trials.csv`](trials/lateral_offset_trials.csv) is a hand-maintained sheet, same pattern as `floor_test_log.csv` (header row, one row per session, blank cells you fill in after each run — not written by any ROS node).
 
@@ -501,7 +546,7 @@ The sheet is built around one comparison: **what you measured on the floor vs. w
 | `Centering Outcome` | `Completed`, `Timed Out`, or `Not Triggered` — reflects the `driving` → `centering` → `arrived_target_distance` sequence on `/path_tracker/status` (see [Arrival status](#arrival-status-path_trackerstatus)) |
 | `Notes`, `Bugs/Issues`, `Battery level` | Same as the other sheets |
 
-### Obstacle audio alert
+## Obstacle audio alert
 
 `path_tracker` plays `wav_path` through the USB speaker (`aplay`, non-blocking) the first time an obstacle encounter enters a non-`DRIVE` state — once per `encounter_id`, not on every escalation step (strafe → turn → recover → halt) within it, and never during ordinary clear-path driving. It's on by default (`audio_alert_enabled:=true`); set `-p audio_alert_enabled:=false` to turn it off. This uses the same trigger logic (`audio_trigger.py`) as the original standalone `obstacle_audio` prototype node, now folded directly into `path_tracker` so it runs with no extra terminal — a non-blocking `aplay` call can never stall the control loop.
 
@@ -525,7 +570,7 @@ docker exec -u ubuntu MentorPi aplay -D plughw:2,0 /home/ubuntu/shared/audio/obs
 
 **To use your own dialogue clip:** drop a WAV file at `/home/pi/docker/tmp/audio/obstacle_alert.wav` on the Pi (create the `audio/` folder if it doesn't exist yet) — that's the host side of the same bind mount the CSV/JSONL logs already use, so it lands at `/home/ubuntu/shared/audio/obstacle_alert.wav` inside the container automatically, with no container restart needed. See `docs/superpowers/specs/2026-07-24-obstacle-audio-alert-design.md` for the original design (the trigger logic it describes is unchanged; only which node calls it moved).
 
-### Three logs, all on your computer
+## Three logs, all on your computer
 
 The logs are deliberately kept in **separate files** so the motion/slippage data, the avoidance-decision data, and the raw scan data stay clean and independently analyzable:
 
@@ -533,9 +578,9 @@ The logs are deliberately kept in **separate files** so the motion/slippage data
 - **Decision log** (`decision_logger`) — one row per avoidance *decision*, for research/debugging: `timestamp, encounter_id, state, chosen_maneuver, reason, obstacle_span_deg, front_distance_m, front_left_m, front_center_m, front_right_m, left_clearance_m, right_clearance_m, rear_clearance_m, required_clearing_m, cumulative_strafe_m, consecutive_avoid_count, recovery_triggered, outcome, maneuver_duration_s`.
 - **Scan trace log** (`scan_trace_logger`) — one row per raw LiDAR scan tick, for diagnosing detection misses that never trigger an avoidance encounter at all (e.g. a thin chair leg outside the LiDAR's scan plane): `scan_number, stamp_sec, stamp_nanosec, angle_min, angle_increment, range_min, range_max, ranges, sectors`. JSON Lines (`.jsonl`), not CSV — `ranges` is a variable-length array that doesn't fit CSV's fixed-column shape. `stamp_sec`/`stamp_nanosec` come from the LaserScan message's own `header.stamp`, not wall-clock time, so this log stays on the same clock as `/odom` and every other ROS message for valid cross-message correlation. A process killed mid-write can only ever corrupt the last line of the file — skip a line that fails to parse rather than treating it as corruption. The node's `front_arc_deg`/`front_subsector_deg`/`side_window_deg`/`rear_window_deg` params default to match `path_tracker`'s current `AvoidanceConfig` values; if those get tuned in `avoidance.py`, update this node's defaults too or the logged `sectors` will stop reflecting what the controller actually saw. See `docs/superpowers/specs/2026-07-24-scan-trace-logger-design.md` for the full design and the post-hoc miss-diagnosis workflow.
 
-All three default to (or should be pointed at) `/home/ubuntu/shared/trials/` inside the container, which is bind-mounted to **`/home/pi/docker/tmp/trials/`** on the Pi — so all three logs appear directly in your local file manager (and survive container restarts) with no `docker` digging. This repo's `trials/` folder also symlinks straight to them (see [Repository structure](#repository-structure)) so they show up in VS Code too.
+All three default to (or should be pointed at) `/home/ubuntu/shared/trials/` inside the container, which is bind-mounted to **`/home/pi/docker/tmp/trials/`** on the Pi — so all three logs appear directly in your local file manager (and survive container restarts) with no `docker` digging. Because it's a bind mount, nothing ever needs copying out of the container. See [Repository structure](#repository-structure) for how `trials/` surfaces them in VS Code.
 
-### Reconciling floor_test_log.csv
+## Reconciling floor_test_log.csv
 
 `floor_test_log.csv` (the hand-maintained Google-Sheet-schema report of PID/safety-distance tuning sessions) is never written by any ROS node — it's a manual transcription of Time and Stop clearance from the real trial CSV, plus the `safety_distance`/`Kp`/`Ki`/`Kd` you ran with (which aren't persisted anywhere else). That transcription step is easy to forget. Run this after a session to auto-fill whatever's derivable from the trial data, on the host (no ROS needed):
 
