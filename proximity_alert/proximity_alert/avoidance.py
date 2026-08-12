@@ -52,23 +52,23 @@ class AvoidanceConfig: # All measurements are in meters or m/s for the speed. Al
     front_arc_deg: float = 180.0           # How wide a cone counts as "in front". Turn it up and it reacts to things off to the side too, not just straight ahead
     front_subsector_deg: float = 60.0      # Width of the left/center/right zones used for logging only -- doesn't change driving behavior
     side_window_deg: float = 70.0          # How wide a slice to each side it checks before strafing that way. Turn it up and it checks more space before trusting a strafe is safe
-    rear_window_deg: float = 70.0         # Same as side_window_deg but behind the robot, used when backing up
+    rear_window_deg: float = 100.0         # Same as side_window_deg but behind the robot, used when backing up
     robot_half_width: float = 0.085        # Half the robot's actual width -- how much room it assumes it needs. Keep this matched to the real chassis; too small risks clipping things, too big blocks strafes that would've fit
-    corridor_margin: float = 0.05          # Extra padding added on top of robot_half_width. Turn it up and the robot demands more elbow room before attempting a strafe, refusing tighter gaps it could've fit through
+    corridor_margin: float = 0.025          # Extra padding added on top of robot_half_width. Turn it up and the robot demands more elbow room before attempting a strafe, refusing tighter gaps it could've fit through
     forward_speed: float = 0.20            # Normal driving speed. Turn it up to drive faster -- but this MUST match what the robot actually delivers (the vendor controller caps real speed at 0.20 m/s), or every distance/timeout number below starts lying to itself
     strafe_speed: float = 0.20             # Sideways speed while dodging. Turn it up and it clears an obstacle quicker but overshoots more before it can double-check
-    strafe_timeout: float = 2            # How long it'll keep sliding sideways before giving up and re-checking the situation
+    strafe_timeout: float = 2.0            # How long it'll keep sliding sideways before giving up and re-checking the situation
     strafe_side_clearance_min: float = 0.20  # How much open space to the side is required before it's allowed to strafe that way. Turn it up and it plays it safer, refusing tight gaps
     max_obstacle_width: float = 0.75      # How wide something can be before the robot gives up trying to slide past it and turns around it instead
     max_cumulative_strafe: float = 1.25     # Total sideways distance it'll allow itself within one dodge before giving up on strafing and trying something else
-    turn_speed: float = 0.75                # How fast it spins while turning. Turn it up and it turns faster, but overshoots past the intended angle more
-    turn_step_deg: float = 30.0            # How many degrees it turns per attempt. Turn it up and it clears wider obstacles in one go, but drifts further off its original heading
-    turn_timeout: float = 1.5              # How long it'll hold a turn before moving on regardless of whether it finished turning
+    turn_speed: float = 0.50                # How fast it spins while turning. Turn it up and it turns faster, but overshoots past the intended angle more
+    turn_step_deg: float = 35.0            # How many degrees it turns per attempt. Turn it up and it clears wider obstacles in one go, but drifts further off its original heading
+    turn_timeout: float = 2.0              # How long it'll hold a turn before moving on regardless of whether it finished turning
     # reverse_trigger_range: float = 0.20    # (Not currently used -- rear_clearance_min governs this instead)
     avoid_reverse_speed: float = 0.10      # Speed of the small backup nudge while turning/recovering, when there's room behind. Turn it up and it backs off faster, but eats into its rear safety margin sooner
-    rear_clearance_min: float = 0.20       # How much room is required behind before it's allowed to back up. Turn it down and it'll reverse with less space behind it
-    turn_radius: float = 0.0               # Shape of the backup-while-turning arc. 0 = a tight near-in-place pivot; turn it up for a wider, longer sweeping arc instead
-    rear_taper_zone: float = 0.0           # Smooths out the backup motion as rear space runs low, instead of cutting it off abruptly. 0 = hard cutoff, which can look like a little stutter; turn it up to fade out smoothly instead
+    rear_clearance_min: float = 0.10       # How much room is required behind before it's allowed to back up. Turn it down and it'll reverse with less space behind it
+    turn_radius: float = 0.15               # Shape of the backup-while-turning arc. 0 = a tight near-in-place pivot; turn it up for a wider, longer sweeping arc instead
+    rear_taper_zone: float = 0.15           # Smooths out the backup motion as rear space runs low, instead of cutting it off abruptly. 0 = hard cutoff, which can look like a little stutter; turn it up to fade out smoothly instead
     pass_clearance: float = 0.35           # Room required on the near side before the robot considers itself past the obstacle
     max_drive_past_distance: float = 0.80  # How far it'll drive past an obstacle before giving up and re-checking. Turn it up to be more patient with wide obstacles, at the cost of drifting further off-line
     heading_kp: float = 5.0               # How hard it steers back toward the target direction. Turn it up and it corrects faster, but too high makes it swing back and forth instead of settling
@@ -80,7 +80,7 @@ class AvoidanceConfig: # All measurements are in meters or m/s for the speed. Al
     cross_track_kp: float = 5.0           # How hard it crabs sideways back onto the line. Turn it up and it snaps back to the line faster, but too high makes it swerve side to side instead of settling. 0 turns this off entirely
     cross_track_max_speed: float = 0.10    # Top sideways speed while re-centering. Turn it up and it re-centers quicker, but it also drives more sideways-on, which can turn the LiDAR away from what's actually ahead
     cross_track_deadband: float = 0.01     # Below this much sideways drift, it won't bother correcting. Turn it up and it tolerates being off-line by more before reacting, so it holds steadier instead of constantly fidgeting
-    cross_track_ramp_time: float = 0.0     # How long it takes to ease into full sideways correction right after a dodge. Turn it up for a gentler, gradual start; 0 means it engages at full strength immediately
+    cross_track_ramp_time: float = 0.01     # How long it takes to ease into full sideways correction right after a dodge. Turn it up for a gentler, gradual start; 0 means it engages at full strength immediately
     cross_track_tolerance: float = 0.05    # How close to the line counts as "centered" once the run's target distance is reached. Turn it up and it accepts a bigger final offset and finishes sooner
     centering_timeout: float = 7.5         # Max time it'll spend trying to center itself at the finish before giving up and stopping anyway
     max_avoid_attempts: int = 3            # How many failed dodge attempts in a row before it tries a bigger recovery maneuver instead
