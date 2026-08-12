@@ -341,8 +341,7 @@ class TrialLogger(Node):
         if avoidance_events:
             self.get_logger().warn(
                 f"Trial {self.trial_num} logged with {avoidance_events} "
-                "avoidance event(s) -- this run is NOT a clean A->B line, "
-                "flag it before pooling with clean-run slippage stats."
+                "avoidance event(s)"
             )
         else:
             self.get_logger().info(f"Trial {self.trial_num} logged to {self.csv_path}")
