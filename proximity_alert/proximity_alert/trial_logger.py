@@ -338,13 +338,7 @@ class TrialLogger(Node):
                     cause,
                 ]
             )
-        if avoidance_events:
-            self.get_logger().warn(
-                f"Trial {self.trial_num} logged with {avoidance_events} "
-                "avoidance event(s)"
-            )
-        else:
-            self.get_logger().info(f"Trial {self.trial_num} logged to {self.csv_path}")
+        self.get_logger().info(f"Trial {self.trial_num} logged to {self.csv_path}")
 
     # ---------- Odometry / state machine ----------
 
@@ -415,8 +409,7 @@ class TrialLogger(Node):
                     )
                     self.state = "idle"
                     avoid_note = (
-                        f" ({self.avoidance_events} avoidance event(s) -- "
-                        "not a clean run)"
+                        f" ({self.avoidance_events} avoidance event(s))"
                         if self.avoidance_events
                         else ""
                     )
@@ -446,7 +439,7 @@ def main(args=None):
                 ) = node.pending_trial
                 node.pending_trial = None
                 avoid_note = (
-                    f", avoidance_events={avoidance_events} (NOT a clean run)"
+                    f", avoidance_events={avoidance_events}"
                     if avoidance_events
                     else ""
                 )
