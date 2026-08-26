@@ -104,6 +104,49 @@ The buzzer is intentionally not wired into the current nodes — it is a separat
 │   └── scan_trace.jsonl        # -> symlink to /home/pi/docker/tmp/trials/scan_trace.jsonl
 └── README.md
 ```
+## ⚠️ Hardware Warnings
+
+- **Do not charge the LanderPi while it is powered on and in use.** Charging under load can cause unstable power delivery to the Raspberry Pi 5 / STM32 and risks corrupting the SD card mid-write (this is also the fastest way to turn a disk-space issue into a corrupted filesystem). Power down, charge fully, then power back on.
+- _[Add additional hazards here — e.g. Mecanum wheel pinch points, LiDAR eye safety, battery handling, buzzer volume, etc.]_
+
+## Troubleshooting: Remote-SSH Won't Connect ("Downloading VS Code Server..." hangs forever)
+
+**Symptom:** VS Code's Remote-SSH extension appears stuck on "Downloading VS Code Server" indefinitely when connecting to the LanderPi (`raspberrypi.local`), with no visible error.
+
+**Root cause:** This is almost always the SD card running out of space, not a network problem. Every time the local `.vscode-server` install gets corrupted or VS Code updates, it redownloads and unpacks a ~220MB server tarball on the Pi. On a card already near capacity (easy to hit with Docker + ROS 2 Humble + build artifacts), the download completes to 100% but unpacking fails with `StorageFull` — VS Code doesn't surface this clearly in the UI, so it just looks "stuck."
+
+**How to confirm:**
+1. Open **View → Output**, select **Remote - SSH** from the dropdown.
+2. Look for a line like:
+   ```
+   Error installing server: ... kind: StorageFull, message: "No space left on device"
+   ```
+
+**How to fix (SSH into the Pi from a plain terminal, not VS Code):**
+```bash
+# 1. Confirm disk usage
+df -h /
+
+# 2. Check what Docker is using
+docker system df
+
+# 3. Safe cleanup — only removes stopped containers, unused networks, and dangling build cache
+docker system prune
+
+# 4. Clear any partial/broken VS Code Server install attempts
+rm -rf /tmp/.tmp* ~/.vscode-server/cli/servers/*.staging
+
+# 5. Confirm the space was freed
+df -h /
+```
+
+**Caution:** Avoid `docker system prune -a --volumes` unless you've checked `docker system df` first — the `--volumes` flag deletes any Docker volume not attached to a running container, which can destroy data if trial recordings or bags are stored there instead of on the host filesystem directly.
+
+**If Docker cleanup doesn't free enough space,** the ROS 2 Humble + Ubuntu 22.04 Docker image plus rosbag/colcon build artifacts can genuinely fill a small SD card. Check the biggest space users with:
+```bash
+du -sh /home/pi/* 2>/dev/null | sort -rh | head -15
+```
+and consider a larger SD card as the longer-term fix.
 
 The two packages are independent: `proximity_alert` is what the A→B trials run on, `poc_fusion` is the depth/LiDAR fusion proof of concept. Neither imports the other.
 
