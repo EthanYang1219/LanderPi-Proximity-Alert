@@ -8,6 +8,7 @@ The system drives a mobile robot from a fixed point A to point B, reactively sto
 
 - [Project overview](#project-overview)
 - [Hardware and software stack](#hardware-and-software-stack)
+- [⚠️Warnings](#warnings)
 - [Repository structure](#repository-structure)
 - [Running it in VS Code (quick start)](#running-it-in-vs-code-quick-start)
 - [Setup](#setup)
@@ -59,6 +60,113 @@ Raw per-trial data is written to CSV so it can be handed off directly for statis
 
 The buzzer is intentionally not wired into the current nodes — it is a separate, later integration step (see [Roadmap](#roadmap)) so it doesn't add risk while the motion-tracking behaviour is still being validated.
 
+## Warnings
+
+- **Do not charge the LanderPi while it is powered on and in use.** Charging under load can cause unstable power delivery to the Raspberry Pi 5 / STM32 and risk corrupting the SD card mid-write (this is also the fastest way to turn a disk-space issue into a corrupted filesystem). Power down, charge fully, then power back on.
+
+## ⚠️ Important: Proper Shutdown Procedure
+
+**Always shut down the robot properly before disconnecting power.** Do not unplug the battery or cut power while the Raspberry Pi is running or mid-boot.
+
+### Why This Matters
+
+Cutting power abruptly (via a dead/low battery or manually disconnecting) can corrupt the SD card's filesystem and leave system services in a broken state. During testing, this caused the robot's WiFi to fail entirely: a stale `dnsmasq` (DHCP) process was left running and blocked NetworkManager from starting a working DHCP server, which in turn caused the robot to fall back to its own self-hosted AP mode instead of connecting to the intended network. This meant the robot could not be reached, and recovery required physical HDMI/keyboard access, manual service intervention via SSH, and direct editing of the robot's WiFi configuration. (**This entire process took over 4 hours**)
+
+### How to Shut Down Correctly
+
+Before disconnecting power, always run:
+
+```bash
+sudo poweroff
+```
+
+Wait until the robot has fully powered off (LED activity stops) before removing the battery or power source. (~5-10s)
+
+### If You Encounter This Issue
+
+If the robot's WiFi stops working after an improper shutdown, check for a conflicting `dnsmasq` process:
+
+```bash
+ps aux | grep dnsmasq
+sudo systemctl stop dnsmasq
+sudo systemctl disable dnsmasq
+sudo systemctl restart NetworkManager
+```
+
+If the robot is stuck broadcasting its own hotspot (`HW-...`) instead of connecting to your network, locate and edit its WiFi config:
+
+```bash
+find / -name "wifi_conf.py" 2>/dev/null
+```
+
+Set the following, then restart the wifi service:
+
+```python
+HW_WIFI_MODE = 2
+HW_WIFI_STA_SSID = "<your network name>"
+HW_WIFI_STA_PASSWORD = "<your network password>"
+```
+
+```bash
+sudo systemctl restart wifi.service
+```
+
+### Prevention
+
+- Charge the battery before starting a session rather than letting it run to empty mid-operation.
+- Never disconnect power while the Pi is actively running.
+- If the battery's low-voltage alarm sounds, stop what you're doing and power down properly by following the steps above rather than letting it force a shutdown on its own.
+
+## Troubleshooting: Remote-SSH Won't Connect ("Downloading VS Code Server..." hangs forever)
+
+**Symptom:** VS Code's Remote-SSH extension appears stuck on "Downloading VS Code Server" indefinitely when connecting to the LanderPi (`raspberrypi.local`), with no visible error.
+
+**Root cause:** This is almost always the SD card running out of space, not a network problem. Every time the local `.vscode-server` installation gets corrupted or VS Code updates, it redownloads and unpacks a ~220 MB server tarball on the Pi. On a card already near capacity (easy to hit with Docker + ROS 2 Humble + build artifacts), the download completes to 100%, but unpacking fails with `StorageFull` — VS Code doesn't surface this clearly in the UI, so it just looks "stuck."
+
+**How to confirm:**
+1. Open **View → Output**, select **Remote - SSH** from the dropdown.
+2. Look for a line like:
+   ```
+   Error installing server: ... kind: StorageFull, message: "No space left on device"
+   ```
+
+**How to fix (SSH into the Pi from a plain terminal, not VS Code):**
+```bash
+# 1. Confirm disk usage
+df -h /
+
+# 2. Check what Docker is using
+docker system df
+
+# 3. Safe cleanup — only removes stopped containers, unused networks, and dangling build cache
+docker system prune
+
+# 4. Clear any partial/broken VS Code Server install attempts
+rm -rf /tmp/.tmp* ~/.vscode-server/cli/servers/*.staging
+
+# 5. Confirm the space was freed
+df -h /
+```
+
+**Caution:** Avoid `docker system prune -a --volumes` unless you've checked `docker system df` first — the `--volumes` flag deletes any Docker volume not attached to a running container, which can destroy data if trial recordings or bags are stored there instead of on the host filesystem directly.
+
+**If Docker cleanup doesn't free enough space,** the ROS 2 Humble + Ubuntu 22.04 Docker image plus rosbag/colcon build artifacts can genuinely fill a small SD card. Check the biggest space users with:
+```bash
+du -sh /home/pi/* 2>/dev/null | sort -rh | head -15
+```
+and consider a larger SD card as the longer-term fix.
+
+The two packages are independent: `proximity_alert` is what the A→B trials run on, `poc_fusion` is the depth/LiDAR fusion proof of concept. Neither imports the other.
+
+`trials/granite.csv`, `trials/decision_log.csv`, and `trials/scan_trace.jsonl` are symlinks into the container's bind-mounted shared folder (see [Three logs](#three-logs-all-on-your-computer) below) — they exist purely so all three logs show up directly in this repo's VS Code Explorer/file tree instead of requiring you to browse to `/home/pi/docker/tmp/trials/` separately. They live-update as the nodes write to them. If you log a new surface (e.g. `hpl.csv` for plastic laminate), symlink it the same way:
+
+```bash
+ln -sf /home/pi/docker/tmp/trials/hpl.csv trials/hpl.csv
+```
+
+`path_tracker.py` and `trial_logger.py` are independent ROS 2 nodes. `trial_logger.py` does not modify or depend on the internals of `path_tracker.py` — it only observes `/odom`, so either node can be developed, tested, or replaced without breaking the other.
+
+
 ## Repository structure
 
 ```
@@ -104,59 +212,6 @@ The buzzer is intentionally not wired into the current nodes — it is a separat
 │   └── scan_trace.jsonl        # -> symlink to /home/pi/docker/tmp/trials/scan_trace.jsonl
 └── README.md
 ```
-## ⚠️ Hardware Warnings
-
-- **Do not charge the LanderPi while it is powered on and in use.** Charging under load can cause unstable power delivery to the Raspberry Pi 5 / STM32 and risks corrupting the SD card mid-write (this is also the fastest way to turn a disk-space issue into a corrupted filesystem). Power down, charge fully, then power back on.
-- _[Add additional hazards here — e.g. Mecanum wheel pinch points, LiDAR eye safety, battery handling, buzzer volume, etc.]_
-
-## Troubleshooting: Remote-SSH Won't Connect ("Downloading VS Code Server..." hangs forever)
-
-**Symptom:** VS Code's Remote-SSH extension appears stuck on "Downloading VS Code Server" indefinitely when connecting to the LanderPi (`raspberrypi.local`), with no visible error.
-
-**Root cause:** This is almost always the SD card running out of space, not a network problem. Every time the local `.vscode-server` install gets corrupted or VS Code updates, it redownloads and unpacks a ~220MB server tarball on the Pi. On a card already near capacity (easy to hit with Docker + ROS 2 Humble + build artifacts), the download completes to 100% but unpacking fails with `StorageFull` — VS Code doesn't surface this clearly in the UI, so it just looks "stuck."
-
-**How to confirm:**
-1. Open **View → Output**, select **Remote - SSH** from the dropdown.
-2. Look for a line like:
-   ```
-   Error installing server: ... kind: StorageFull, message: "No space left on device"
-   ```
-
-**How to fix (SSH into the Pi from a plain terminal, not VS Code):**
-```bash
-# 1. Confirm disk usage
-df -h /
-
-# 2. Check what Docker is using
-docker system df
-
-# 3. Safe cleanup — only removes stopped containers, unused networks, and dangling build cache
-docker system prune
-
-# 4. Clear any partial/broken VS Code Server install attempts
-rm -rf /tmp/.tmp* ~/.vscode-server/cli/servers/*.staging
-
-# 5. Confirm the space was freed
-df -h /
-```
-
-**Caution:** Avoid `docker system prune -a --volumes` unless you've checked `docker system df` first — the `--volumes` flag deletes any Docker volume not attached to a running container, which can destroy data if trial recordings or bags are stored there instead of on the host filesystem directly.
-
-**If Docker cleanup doesn't free enough space,** the ROS 2 Humble + Ubuntu 22.04 Docker image plus rosbag/colcon build artifacts can genuinely fill a small SD card. Check the biggest space users with:
-```bash
-du -sh /home/pi/* 2>/dev/null | sort -rh | head -15
-```
-and consider a larger SD card as the longer-term fix.
-
-The two packages are independent: `proximity_alert` is what the A→B trials run on, `poc_fusion` is the depth/LiDAR fusion proof of concept. Neither imports the other.
-
-`trials/granite.csv`, `trials/decision_log.csv`, and `trials/scan_trace.jsonl` are symlinks into the container's bind-mounted shared folder (see [Three logs](#three-logs-all-on-your-computer) below) — they exist purely so all three logs show up directly in this repo's VS Code Explorer/file tree instead of requiring you to browse to `/home/pi/docker/tmp/trials/` separately. They live-update as the nodes write to them. If you log a new surface (e.g. `hpl.csv` for plastic laminate), symlink it the same way:
-
-```bash
-ln -sf /home/pi/docker/tmp/trials/hpl.csv trials/hpl.csv
-```
-
-`path_tracker.py` and `trial_logger.py` are independent ROS 2 nodes. `trial_logger.py` does not modify or depend on the internals of `path_tracker.py` — it only observes `/odom`, so either node can be developed, tested, or replaced without breaking the other.
 
 ## Running it in VS Code (quick start)
 
