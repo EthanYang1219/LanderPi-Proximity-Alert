@@ -8,7 +8,7 @@ The system drives a mobile robot from a fixed point A to point B, reactively sto
 
 - [Project overview](#project-overview)
 - [Hardware and software stack](#hardware-and-software-stack)
-- [⚠️Warnings](#warnings)
+- [Warnings](#warnings)
 - [Repository structure](#repository-structure)
 - [Running it in VS Code (quick start)](#running-it-in-vs-code-quick-start)
 - [Setup](#setup)
