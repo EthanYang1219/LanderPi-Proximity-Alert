@@ -1,0 +1,4 @@
+Date and Session #,Safety Distance (m),± Safety Distance Uncertainity (m),Forward Speed (m/s), ± Speed Uncertainity (m/s),Time (s),Stop clearance (m),± Stop Clearance Uncertainity (m),Measurement Method,Obstacle Type,Notes,Bugs/Issues,Kp​,Ki​,Kd​
+07/20/2026 - Session 1,0.30,0.001,0.15,0.0006,60,0.20,0.001,Phone/Eyeballed (Low Precision),Box,Robot drove forward detected obstacle at 0.29m per LiDAR stopped single turn-away attempt (direction flipped mid-maneuver -- known quirk see path_tracker.py scan_callback) halted safely. No collision. Not a formal per-surface trial: no surface specified trial_logger not running no odometry distance captured.,Robot did not turn or try to avoid obstacle. Robot stopped in place,1.2,0.05,0.1
+07/21/2026 - Session 1,,,,,,,,Ruler (± 0.05 cm),,,,,,
+07/21/2026 - Session 2,,,,,,,,,,,,,,

@@ -1,0 +1,16 @@
+timestamp,surface,trial_num,transit_time_s,odom_distance_m,ground_truth_distance_m,slippage_error_m,slippage_pct,avoidance_events,lidar_stop_range_m,notes,battery_level
+2026-07-27 19:30:03,wood,1,2.531,0.4954,13.1000,-12.6046,-96.22,0,0.1470,low battery run,
+2026-07-28 15:00:49,wood,2,2.424,0.4793,0.1260,0.3533,280.37,0,0.1570,robot didnt drive super straight,High
+2026-07-28 15:05:48,wood,3,2.422,0.4754,0.1420,0.3334,234.79,0,0.1610,Used wet wipes to clean the wheels and the wood table,High
+2026-07-28 15:08:53,wood,4,2.389,0.4737,0.1450,0.3287,226.69,0,0.1620,,High
+2026-07-28 15:11:23,wood,5,2.499,0.4869,0.1350,0.3519,260.64,0,0.1560,,Medium
+2026-07-28 15:16:15,wood,6,2.332,0.4602,0.1390,0.3212,231.05,0,0.1660,box set up was not perpendicular to the tape measurement,Medium
+2026-07-28 15:20:18,wood,7,2.567,0.5047,0.1220,0.3827,313.71,0,0.1410,alot of variance on this surface material,Medium
+2026-07-28 15:22:44,wood,8,2.495,0.4886,0.1280,0.3606,281.71,0,0.1500,,Medium
+2026-07-28 15:24:25,wood,9,2.398,0.4730,0.1480,0.3250,219.60,0,0.1690,,Medium
+2026-07-28 15:26:56,wood,10,2.399,0.4704,0.1410,0.3294,233.59,0,0.1600,,Medium
+2026-07-28 15:28:23,wood,11,2.499,0.4901,0.1280,0.3621,282.88,0,0.1520,,Medium
+2026-07-28 15:30:08,wood,12,2.292,0.4487,0.1280,0.3207,250.53,0,0.1540,removed one of the starting position tapes,Low
+2026-07-28 15:31:31,wood,13,2.433,0.4806,0.1350,0.3456,255.98,0,0.1560,,Low
+2026-07-28 15:32:34,wood,14,2.432,0.4795,0.1350,0.3445,255.20,0,0.1550,,Low
+2026-07-28 15:35:56,wood,15,2.493,0.4903,0.1320,0.3583,271.44,0,0.1560,low battery runs,Low

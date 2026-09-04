@@ -1,0 +1,12 @@
+timestamp,surface,trial_num,transit_time_s,odom_distance_m,ground_truth_distance_m,slippage_error_m,slippage_pct,avoidance_events,lidar_stop_range_m,notes,battery_level
+2026-07-21 18:41:43,granite,1,10.732,1.0961,0.2250,0.8711,387.14,,,,
+2026-07-21 18:44:48,granite,2,10.698,1.0750,0.2300,0.8450,367.38,,,,
+2026-07-21 18:50:27,granite,3,10.700,1.1168,0.2300,0.8868,385.57,,,,
+2026-07-22 16:54:30,granite,4,5.497,1.0916,23.2000,-22.1084,-95.29,0,0.2560,"PID Tuning, need to adjust starting position to reduce measurement uncertainity",
+2026-07-22 17:12:16,granite,5,34.800,5.7490,22.5000,-16.7510,-74.45,0,0.2620,inaccurate trial as I forgot to renew starting position,
+2026-07-23 19:10:11,granite,6,32.593,2.7355,0.1600,2.5755,1609.67,6,0.1870,got stuck between 2 chair legs,
+2026-07-23 19:21:05,granite,7,49.018,5.8037,0.2400,5.5637,2318.22,6,0.2480,Good run,
+2026-07-24 19:52:50,wood,8,6.400,1.2721,0.1270,1.1451,901.62,0,0.1580,"good run, stopped before the box",
+2026-07-27 14:55:02,other,9,4.499,0.8916,0.1400,0.7516,536.85,0,0.1540,good run on carpet,
+2026-07-27 14:57:11,carpet,10,4.498,0.8881,0.1400,0.7481,534.37,0,0.1550,"good run, same stop distance as previous trial (trial 9)",
+2026-07-28 14:56:51,wood,11,1.930,0.3772,0.2280,0.1492,65.42,0,0.2490,set safety distance to 30cm by accident. Safeety distance should be 20cm. Battery is around 80% which is high,High

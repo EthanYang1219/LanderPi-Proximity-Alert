@@ -10,11 +10,10 @@ __pycache__/
 
 trials/
 
-# organized_data/ mirrors trials/ data as a browsable snapshot -- same reason
-# trials/ itself is excluded (live/bulky data, not source). Keep the READMEs
-# and DATA_INDEX.md tracked so the folder structure/docs survive; ignore the
-# data-file copies inside it.
-organized_data/**/*.csv
+# organized_data/ is the published research dataset: the per-surface trial
+# logs and the decision log are committed so the results are reproducible
+# from this repository alone. Scan traces are NOT -- scan_trace.jsonl is
+# ~1 GB and lives at trials/ / /home/pi/docker/tmp/trials/ instead.
 organized_data/**/*.jsonl
 
 # Claude Code harness state (spawned-task worktrees, etc.), not project content.

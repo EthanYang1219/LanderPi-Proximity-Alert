@@ -1,0 +1,11 @@
+timestamp,surface,trial_num,transit_time_s,odom_distance_m,ground_truth_distance_m,slippage_error_m,slippage_pct,avoidance_events,lidar_stop_range_m,notes
+2026-07-27 15:10:30,carpet,1,4.431,0.8782,0.1470,0.7312,497.40,0,0.1610,brought the measurment tape closer to the robot for easier measurements
+2026-07-27 15:20:03,carpet,2,4.500,0.8890,0.1390,0.7500,539.59,0,0.1450,good run
+2026-07-27 15:23:23,carpet,3,4.600,0.9118,0.1330,0.7788,585.58,0,0.1410,a little closer to the box than previous trials
+2026-07-27 17:01:53,carpet,4,4.400,0.8687,0.1540,0.7147,464.09,0,0.1690,
+2026-07-27 17:14:58,carpet,5,4.467,0.8858,0.1370,0.7488,546.59,0,0.1500,
+2026-07-27 17:17:50,carpet,6,4.500,0.8872,0.1400,0.7472,533.74,0,0.1610,corrected tape measure positioning
+2026-07-27 17:20:18,carpet,7,4.499,0.8912,0.1310,0.7602,580.27,0,0.1510,none
+2026-07-27 17:23:32,carpet,8,4.467,0.8852,0.1310,0.7542,575.71,0,0.1530,none
+2026-07-27 17:25:35,carpet,9,4.500,0.8898,0.1320,0.7578,574.08,0,0.1440,good run
+2026-07-27 17:28:59,carpet,10,4.433,0.8758,0.1450,0.7308,504.00,0,0.1670,could be an outlier trial
