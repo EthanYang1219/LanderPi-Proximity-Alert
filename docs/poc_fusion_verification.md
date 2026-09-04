@@ -5567,7 +5567,7 @@ Evidence: `docs/poc_fusion_data/task9_part2_wall_events_2026-08-11.csv`
 ## Depth-contribution bench test, Phase 0 — **GATE FAILED, test stopped** (2026-08-11 ~05:0x HKT / 2026-08-10 ~21:0x UTC)
 
 Executed per
-[2026-08-11-depth-contribution-bench-test-design.md](../superpowers/specs/2026-08-11-depth-contribution-bench-test-design.md).
+[2026-08-11-depth-contribution-bench-test-design.md](superpowers/specs/2026-08-11-depth-contribution-bench-test-design.md).
 Phase 0's gate failed, so Phases 1–4 did **not** run. The robot did not move at
 any point; the `poc_fusion` stack was never launched, because the gate is decided
 by geometry alone.

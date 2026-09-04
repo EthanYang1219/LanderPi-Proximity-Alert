@@ -1,723 +1,293 @@
 # LanderPi Proximity Alert
 
-A LiDAR-based Advanced Driver Assistance System (ADAS) proximity alert for a mobile robot, developed as part of an undergraduate research project at the University of Prince Edward Island (UPEI) under the supervision of Dr. Bingxian Mu.
+LiDAR-based proximity detection and reactive obstacle avoidance on a mecanum-wheeled
+mobile robot, built to measure **how surface material affects the gap between a robot's
+real-world travel and its own estimate of that travel.**
 
-The system drives a mobile robot from a fixed point A to point B, reactively stopping and turning away from obstacles detected by an onboard LiDAR, while logging transit time and odometry drift across three surface materials: granite, concrete, and wood. 
+Undergraduate robotics research at the University of Prince Edward Island.
 
-## Table of contents
+---
 
-- [Project overview](#project-overview)
-- [Hardware and software stack](#hardware-and-software-stack)
-- [Warnings](#warnings)
-- [Repository structure](#repository-structure)
-- [Running it in VS Code (quick start)](#running-it-in-vs-code-quick-start)
-- [Setup](#setup)
-- [Usage](#usage)
-- [Data collected](#data-collected)
-- [Running the tests](#running-the-tests)
-- [Parameters](#parameters)
-- [Motion watchdog and emergency stop](#motion-watchdog-and-emergency-stop)
-- [Lateral offset trials (`lateral_offset_trials.csv`)](#lateral-offset-trials-lateral_offset_trialscsv)
-- [Obstacle audio alert](#obstacle-audio-alert)
-- [Three logs, all on your computer](#three-logs-all-on-your-computer)
-- [Reconciling floor_test_log.csv](#reconciling-floor_test_logcsv)
-- [Roadmap](#roadmap)
-- [Troubleshooting](#troubleshooting)
-- [Authors](#authors)
+## Overview
 
-## Project overview
+A robot with no wheel encoders only knows how far it has gone by integrating the speed
+it *asked* for. On a surface where the wheels slip, that estimate drifts — and the amount
+it drifts is a property of the surface.
 
-This project measures how surface material affects a mobile robot's real-world driving performance versus its own internal estimate of that performance. Concretely, for each surface, the robot is driven along a fixed marked track from point A to point B, and the following are compared:
+This project measures that drift directly. For each surface material, the robot drives a
+fixed, marked track from point A to point B while three quantities are recorded:
 
 - **Transit time** — how long the run took
-- **Odometry-estimated distance** — the robot's own dead-reckoned estimate of how far it travelled (see the important caveat on what this actually measures, below)
-- **Ground-truth distance** — how far it actually travelled, read by hand off a marked/taped track
+- **Odometry distance** — the robot's own dead-reckoned estimate
+- **Ground-truth distance** — measured by hand off a taped track
 
-The gap between odometry and ground truth quantifies wheel slippage, which is expected to vary by surface (granite and metal are expected to slip more than wood or concrete, for example). A LiDAR-based safety stop is layered on top so the robot avoids collisions with obstacles placed along or at the end of the track, independent of the distance measurement itself.
+The difference between the last two quantifies wheel slippage. A LiDAR safety layer runs
+on top so the robot can share the track with obstacles without colliding — and that safety
+layer grew into the larger half of the codebase.
 
-**Important limitation: this robot has no wheel-encoder feedback.** `/odom` (and the `odom_distance_m` column below) comes from `odom_publisher_node.py` in the vendor driver stack, which dead-reckons position by integrating the *commanded* velocity (`/cmd_vel`) over time — there is no wheel-encoder tick reading anywhere in the drive stack (confirmed by searching the full `driver/` tree). This means `odom_distance_m` measures "how far the commanded motion, integrated open-loop, thinks it went," not "how far the wheels actually turned." Two consequences for interpreting trial data:
+The repository contains two independent systems:
 
-1. On a clean, single-pass, straight-line run (`disable_avoidance:=true`, no obstacle-avoidance turns), `odom_distance_m` should closely track `forward_speed × transit_time_s` regardless of surface — so a gap against `ground_truth_distance_m` is a reasonable (if indirect) proxy for real slippage, since the *commanded* motion is known and constant.
-2. On any run where obstacle-avoidance actually triggered (reverse/turn maneuvers), `odom_distance_m` is unreliable as a slippage signal: heading (`pose_yaw`) is *also* integrated open-loop from commanded `angular_z`, so it inherits error from the known mecanum-rotation quirk (see `path_tracker.py`'s `AVOIDING` state comments) on every turn, compounding across attempts. A large mismatch between `odom_distance_m` and `ground_truth_distance_m` on such a run reflects accumulated dead-reckoning drift through multiple maneuvers, not real-world wheel slip — see `avoidance_events` in [Data collected](#data-collected) below, and exclude any trial where it's non-zero from slippage analysis.
+| Package | What it is | Status |
+|---|---|---|
+| **`proximity_alert`** | LiDAR-only A→B driving with a 7-state reactive avoidance machine, plus the logging pipeline that produced the research dataset. | Field-validated; used to collect the published data |
+| **`poc_fusion`** | A proof of concept fusing an Aurora depth camera with the LiDAR into a single Nav2 costmap, responding with a stop only. | **In progress** — see [status](#poc_fusion-status) |
 
-**Important limitation: the LiDAR has a fixed-height blind spot.** The LD19 scans a single 2D plane at whatever height it's mounted — it cannot see anything above or below that plane. Confirmed on real hardware: a round pedestal desk (narrow base, wide overhanging top) was not detected in time and the robot made low-speed contact with it before the safety stop or avoidance maneuver engaged, because the desk's base/legs were too thin or outside the scan plane at the point of approach, even though the tabletop clearly overhung the robot's path above the LiDAR's height. This is a physical sensor-geometry limitation, not a `path_tracker` bug — **lowering `safety_distance` would not have helped**, since the obstacle was effectively invisible to the sensor until contact, not merely detected late. Avoid pedestal-style, overhanging, or otherwise thin-profile-at-LiDAR-height obstacles when placing point B for a trial; use obstacles with a consistent cross-section at the LiDAR's mounted height (a box, a flat wall) instead.
+They share the robot and the `/scan_raw` topic, and nothing else. `poc_fusion` deliberately
+does not touch `avoidance.py`, so the surface-trial dataset stays comparable across the
+whole collection period.
 
-Raw per-trial data is written to CSV so it can be handed off directly for statistical analysis.
+---
 
-## Hardware and software stack
+## Hardware and software
 
 | Component | Detail |
 |---|---|
-| Chassis | Hiwonder LanderPi, Mecanum wheels |
-| Main compute | Raspberry Pi 5 (ROS 2 controller) |
-| Low-level control | STM32 microcontroller (motor commands) |
-| LiDAR | LD19 (the running driver node identifies as `LD19`/`LDLiDAR_LD19`; worth double-checking against this unit's actual spec sheet if "MS200" is documented elsewhere) |
-| Odometry | Integrated from /cmd_vel |
-| Alert (planned) | Onboard buzzer, I2C |
-| OS | Ubuntu 22.04 LTS |
-| Middleware | ROS 2 Humble, running inside Docker |
+| Chassis | Hiwonder LanderPi, mecanum wheels (wheelbase 0.216 m, track 0.195 m) |
+| Main compute | Raspberry Pi 5 |
+| Low-level control | STM32 (motor commands; holds the last commanded velocity indefinitely) |
+| LiDAR | LD19, single fixed scan plane, ~10 Hz |
+| Depth camera | Aurora, arm-mounted, 640×400 mono16 @ 14.7 Hz (`poc_fusion` only) |
+| Odometry | Integrated open-loop from `/cmd_vel` — **no wheel encoders** |
+| Audible alert | USB speaker via ALSA `aplay`; `poc_fusion` additionally drives an I2C buzzer |
+| OS / middleware | Ubuntu 22.04, ROS 2 Humble in Docker (`MentorPi` container) |
 | Language | Python 3 (`rclpy`) |
 
-The buzzer is intentionally not wired into the current nodes — it is a separate, later integration step (see [Roadmap](#roadmap)) so it doesn't add risk while the motion-tracking behaviour is still being validated.
+---
 
-## Warnings
+## How it works
 
-- **Do not charge the LanderPi while it is powered on and in use.** Charging under load can cause unstable power delivery to the Raspberry Pi 5 / STM32 and risk corrupting the SD card mid-write (this is also the fastest way to turn a disk-space issue into a corrupted filesystem). Power down, charge fully, then power back on.
-
-## ⚠️ Important: Proper Shutdown Procedure
-
-**Always shut down the robot properly before disconnecting power.** Do not unplug the battery or cut power while the Raspberry Pi is running or mid-boot.
-
-### Why This Matters
-
-Cutting power abruptly (via a dead/low battery or manually disconnecting) can corrupt the SD card's filesystem and leave system services in a broken state. During testing, this caused the robot's WiFi to fail entirely: a stale `dnsmasq` (DHCP) process was left running and blocked NetworkManager from starting a working DHCP server, which in turn caused the robot to fall back to its own self-hosted AP mode instead of connecting to the intended network. This meant the robot could not be reached, and recovery required physical HDMI/keyboard access, manual service intervention via SSH, and direct editing of the robot's WiFi configuration. (**This entire process took over 4 hours**)
-
-### How to Shut Down Correctly
-
-Before disconnecting power, always run:
-
-```bash
-sudo poweroff
+```
+LD19 ──▶ scan_utils ──▶ AvoidanceController ──▶ path_tracker ──▶ motion_watchdog ──▶ motors
+         (sectors,       (7-state machine,       (ROS shell)      (stale ⇒ stop)
+          sizing,         pure & ROS-free)
+          gap search)
+/odom ─▶ nav_utils ──────────┘
+         (along-track, cross-track)
 ```
 
-Wait until the robot has fully powered off (LED activity stops) before removing the battery or power source. (~5-10s)
+**Sensing.** Each `LaserScan` is reduced once into validated `(bearing, range)` pairs, then
+into seven named sector clearances: front, front-left/center/right, left, right, rear. The
+obstacle ahead is measured in **metres of lateral width**, not angular span — angular span
+grows as an obstacle approaches, so it cannot answer "can I fit past this?". A best escape
+gap is selected from the full 360° sweep.
 
-### If You Encounter This Issue
+**Deciding.** Those products feed a pure state machine at 20 Hz, governed by one invariant:
+*take the manoeuvre that minimises deviation from the goal heading while maintaining safety.*
+The escalation order falls out of that:
 
-If the robot's WiFi stops working after an improper shutdown, check for a conflicting `dnsmasq` process:
+| State | Behaviour |
+|---|---|
+| `DRIVE` | Forward at `forward_speed`, PID holding the heading captured at A |
+| `ASSESS` | Obstacle confirmed — choose a manoeuvre, trying both sides before giving up on strafing |
+| `STRAFE` | Mecanum sidestep. Preferred: it holds the bearing exactly |
+| `TURN` → `DRIVE_PAST` | Fallback for obstacles too wide to sidestep |
+| `RECOVER` | Once per encounter — back off, rotate to the widest fitting gap, commit |
+| `HALT` | Stop and flag. Recoverable: re-checked every tick |
 
-```bash
-ps aux | grep dnsmasq
-sudo systemctl stop dnsmasq
-sudo systemctl disable dnsmasq
-sudo systemctl restart NetworkManager
-```
+Manoeuvres run to completion so an obstacle's jittering apparent side cannot cause
+oscillation. Arrival is decided *after* the controller runs and only gates whether its
+output is forwarded, so adding the fixed-distance A→B stop did not alter avoidance behaviour.
 
-If the robot is stuck broadcasting its own hotspot (`HW-...`) instead of connecting to your network, locate and edit its WiFi config:
+**Acting.** `path_tracker` publishes `Twist` on `/cmd_vel`, plays a once-per-encounter
+audio alert, and emits a structured JSON record per decision. `motion_watchdog` sits between
+the command source and the motors and forces a stop the moment its input goes stale — the
+STM32 has no watchdog of its own and will otherwise hold the last command forever.
 
-```bash
-find / -name "wifi_conf.py" 2>/dev/null
-```
+### Topics
 
-Set the following, then restart the wifi service:
+| Topic | Type | Direction |
+|---|---|---|
+| `/scan_raw` | `sensor_msgs/LaserScan` | in |
+| `/odom` | `nav_msgs/Odometry` | in |
+| `/cmd_vel` | `geometry_msgs/Twist` | out |
+| `/forward_min_range` | `std_msgs/Float32` | out — live forward-arc range |
+| `/avoidance_decision` | `std_msgs/String` (JSON) | out — one record per decision |
+| `/path_tracker/status` | `std_msgs/String` | out — driving / arrived / fault |
 
-```python
-HW_WIFI_MODE = 2
-HW_WIFI_STA_SSID = "<your network name>"
-HW_WIFI_STA_PASSWORD = "<your network password>"
-```
-
-```bash
-sudo systemctl restart wifi.service
-```
-
-### Prevention
-
-- Charge the battery before starting a session rather than letting it run to empty mid-operation.
-- Never disconnect power while the Pi is actively running.
-- If the battery's low-voltage alarm sounds, stop what you're doing and power down properly by following the steps above rather than letting it force a shutdown on its own.
-
-## Troubleshooting: Remote-SSH Won't Connect ("Downloading VS Code Server..." hangs forever)
-
-**Symptom:** VS Code's Remote-SSH extension appears stuck on "Downloading VS Code Server" indefinitely when connecting to the LanderPi (`raspberrypi.local`), with no visible error.
-
-**Root cause:** This is almost always the SD card running out of space, not a network problem. Every time the local `.vscode-server` installation gets corrupted or VS Code updates, it redownloads and unpacks a ~220 MB server tarball on the Pi. On a card already near capacity (easy to hit with Docker + ROS 2 Humble + build artifacts), the download completes to 100%, but unpacking fails with `StorageFull` — VS Code doesn't surface this clearly in the UI, so it just looks "stuck."
-
-**How to confirm:**
-1. Open **View → Output**, select **Remote - SSH** from the dropdown.
-2. Look for a line like:
-   ```
-   Error installing server: ... kind: StorageFull, message: "No space left on device"
-   ```
-
-**How to fix (SSH into the Pi from a plain terminal, not VS Code):**
-```bash
-# 1. Confirm disk usage
-df -h /
-
-# 2. Check what Docker is using
-docker system df
-
-# 3. Safe cleanup — only removes stopped containers, unused networks, and dangling build cache
-docker system prune
-
-# 4. Clear any partial/broken VS Code Server install attempts
-rm -rf /tmp/.tmp* ~/.vscode-server/cli/servers/*.staging
-
-# 5. Confirm the space was freed
-df -h /
-```
-
-**Caution:** Avoid `docker system prune -a --volumes` unless you've checked `docker system df` first — the `--volumes` flag deletes any Docker volume not attached to a running container, which can destroy data if trial recordings or bags are stored there instead of on the host filesystem directly.
-
-**If Docker cleanup doesn't free enough space,** the ROS 2 Humble + Ubuntu 22.04 Docker image plus rosbag/colcon build artifacts can genuinely fill a small SD card. Check the biggest space users with:
-```bash
-du -sh /home/pi/* 2>/dev/null | sort -rh | head -15
-```
-and consider a larger SD card as the longer-term fix.
-
-The two packages are independent: `proximity_alert` is what the A→B trials run on, `poc_fusion` is the depth/LiDAR fusion proof of concept. Neither imports the other.
-
-`trials/granite.csv`, `trials/decision_log.csv`, and `trials/scan_trace.jsonl` are symlinks into the container's bind-mounted shared folder (see [Three logs](#three-logs-all-on-your-computer) below) — they exist purely so all three logs show up directly in this repo's VS Code Explorer/file tree instead of requiring you to browse to `/home/pi/docker/tmp/trials/` separately. They live-update as the nodes write to them. If you log a new surface (e.g. `hpl.csv` for plastic laminate), symlink it the same way:
-
-```bash
-ln -sf /home/pi/docker/tmp/trials/hpl.csv trials/hpl.csv
-```
-
-`path_tracker.py` and `trial_logger.py` are independent ROS 2 nodes. `trial_logger.py` does not modify or depend on the internals of `path_tracker.py` — it only observes `/odom`, so either node can be developed, tested, or replaced without breaking the other.
-
+---
 
 ## Repository structure
 
 ```
-.
-├── proximity_alert/            # ROS 2 package (ament_python) -- the A->B driving + avoidance stack
-│   ├── package.xml
-│   ├── setup.py / setup.cfg
-│   ├── test/                         # pytest suite (see Running the tests below)
-│   └── proximity_alert/
-│       ├── path_tracker.py           # Drives A -> B, reactive LiDAR obstacle avoidance, and plays the obstacle audio alert (on by default)
-│       ├── avoidance.py              # Pure, ROS-free obstacle-avoidance state machine (AvoidanceConfig lives here)
-│       ├── scan_utils.py             # Pure LiDAR helpers: forward-arc minimum, sector reduction, obstacle sizing, gap selection
-│       ├── nav_utils.py              # Pure navigation geometry helpers (along-track / cross-track)
-│       ├── trial_logger.py           # Logs transit time, odometry distance, ground truth per trial
-│       ├── decision_logger.py        # Logs each avoidance decision to its own CSV
-│       ├── decision_record.py        # Pure record type for one decision-log row
-│       ├── floor_test_reconcile.py   # Fills floor_test_log.csv's Time/Stop-clearance from real trial data
-│       ├── scan_trace_record.py      # Pure JSON-Lines record for one raw scan tick
-│       ├── scan_trace_logger.py      # Logs every raw LiDAR scan continuously, for post-hoc miss diagnosis
-│       ├── audio_trigger.py          # Pure once-per-encounter trigger logic for the obstacle audio alert (used by path_tracker.py)
-│       ├── motion_watchdog.py        # Fail-safe cmd_vel forwarder -- forces a stop the instant its input goes stale
-│       └── motion_watchdog_logic.py  # Pure decision logic for motion_watchdog (used by motion_watchdog.py)
-├── poc_fusion/                 # ROS 2 package (ament_python) -- the LiDAR + depth-camera costmap fusion POC
-│   ├── config/                       # YAML params for each node below
-│   ├── launch/poc_fusion.launch.py
-│   ├── test/                         # pytest suite (see Running the tests below)
-│   ├── tools/measure_stopping_distance.py
-│   └── poc_fusion/
-│       ├── depth_preprocess_node.py      # Cleans/downsamples the depth stream before it reaches the costmap
-│       ├── costmap_stop_monitor_node.py  # Watches the fused costmap and decides when to stop
-│       ├── stop_action_node.py           # Executes the stop
-│       ├── latency_recorder_node.py      # Records end-to-end detection latency
-│       └── lib/                          # Pure, ROS-free logic backing each node (unit-tested without ROS)
-├── scripts/deploy_poc_fusion.sh  # Host -> container deploy helper
-├── docs/                       # Design specs, verification logs, trial layouts
-├── organized_data/             # Browsable snapshot of trials/ (data files gitignored, READMEs tracked)
-├── trials/                     # CSVs, gitignored (not committed) -- see below
-│   ├── floor_test_log.csv      # Hand-maintained PID/safety-distance tuning session report
-│   ├── lateral_offset_trials.csv  # Hand-maintained return-to-line (cross-track) trial report
-│   ├── avoidance_trials.csv    # -> symlink to /home/pi/docker/tmp/trials/avoidance_trials.csv
-│   ├── granite.csv             # -> symlink (same pattern; also carpet.csv, wood.csv per surface)
-│   ├── decision_log.csv        # -> symlink to /home/pi/docker/tmp/trials/decision_log.csv
-│   └── scan_trace.jsonl        # -> symlink to /home/pi/docker/tmp/trials/scan_trace.jsonl
-└── README.md
+proximity_alert/            ROS 2 package — A→B driving, avoidance, research logging
+  proximity_alert/
+    path_tracker.py         Main node: ROS shell around the controller
+    avoidance.py            Pure 7-state machine + AvoidanceConfig (all tunables)
+    scan_utils.py           Pure LiDAR reduction: beams → sectors, sizing, gap search
+    nav_utils.py            Pure along-track / cross-track geometry
+    motion_watchdog.py      Fail-safe cmd_vel forwarder  (+ _logic.py, pure)
+    trial_logger.py         Per-trial transit time, odometry, ground truth
+    decision_logger.py      Per-decision CSV        (+ decision_record.py, pure)
+    scan_trace_logger.py    Raw per-scan JSONL trace (+ scan_trace_record.py, pure)
+    floor_test_reconcile.py Fills the hand-kept tuning log from real trial data
+    audio_trigger.py        Pure once-per-encounter alert logic
+  test/                     pytest suite
+
+poc_fusion/                 ROS 2 package — depth + LiDAR costmap fusion POC
+  poc_fusion/               Four nodes; lib/ holds their pure, ROS-free logic
+  config/                   YAML parameters per node
+  launch/                   Full pipeline bring-up
+  tools/                    Stopping-distance measurement
+  test/                     pytest suite
+
+organized_data/             The published research dataset (CSVs + column docs)
+docs/                       Design specs, verification log, trial layouts, operations
+scripts/                    Host → container deploy helper
 ```
 
-## Running it in VS Code (quick start)
+The clearest reading order is `avoidance.py` (the decisions), then `scan_utils.py` (what it
+decides on), then `path_tracker.py` (how it reaches the robot).
 
-The robot's ROS 2 stack already runs in a Docker container named `MentorPi` on the Pi — you don't need to install ROS yourself. Do this from a VS Code integrated terminal (open the repo folder via the Remote-SSH extension if you're connecting from another machine, or directly if VS Code is running on the Pi itself):
+---
 
-1. **Copy the package into the container.** `docker cp` nests the source inside the destination if the destination already exists, silently leaving a stale duplicate that colcon keeps building instead of your edits — this bit us mid-session (see [Troubleshooting](#troubleshooting)). Always clear the destination first:
+## Setup and running
 
-   ```bash
-   docker exec -u ubuntu MentorPi rm -rf /home/ubuntu/ros2_ws/src/proximity_alert/proximity_alert
-   docker cp proximity_alert/proximity_alert MentorPi:/home/ubuntu/ros2_ws/src/proximity_alert/proximity_alert
-   ```
+The ROS 2 stack runs inside the `MentorPi` Docker container on the robot's Pi. Bring-up
+commands, the deploy step, and the shutdown procedure are in
+**[docs/OPERATIONS.md](docs/OPERATIONS.md)** — read the shutdown section before running
+anything that moves.
 
-2. **Build it** as the `ubuntu` user via `zsh` (not `bash` + `/opt/ros/humble/setup.bash` — that fails in this container; `~/.zshrc` is what actually sets up the workspace environment correctly):
+A minimal run, each node in its own terminal:
 
-   ```bash
-   docker exec -u ubuntu MentorPi zsh -lc "source ~/.zshrc && cd ~/ros2_ws && colcon build --packages-select proximity_alert"
-   ```
+```bash
+ros2 run proximity_alert path_tracker --ros-args -p target_distance:=2.0
+ros2 run proximity_alert motion_watchdog
+ros2 run proximity_alert trial_logger
+```
 
-   If a previous build was ever run as `root` (e.g. via plain `docker exec` without `-u ubuntu`), leftover root-owned files under `build/proximity_alert` or `install/proximity_alert` will make this fail with `Permission denied`. Fix with:
+`trial_logger` detects the start of a trial from motion and the end from a held stop, then
+prompts for the surface name and the tape-measured distance.
 
-   ```bash
-   docker exec -u root MentorPi bash -c "chown -R ubuntu:ubuntu /home/ubuntu/ros2_ws/build/proximity_alert /home/ubuntu/ros2_ws/install/proximity_alert"
-   ```
+---
 
-3. **Run each node in its own terminal**, as the `ubuntu` user via `zsh` (this loads `need_compile` and other env vars some of the robot's own launch files expect):
+## Testing
 
-   ```bash
-   # Terminal A — drive the robot
-   docker exec -it -u ubuntu MentorPi zsh -lc "source ~/.zshrc && source ~/ros2_ws/install/setup.bash && ros2 run proximity_alert path_tracker --ros-args -p safety_distance:=0.20 -p target_distance:=2.0 -r scan:=/scan_raw -r /cmd_vel:=/cmd_vel_unsafe"
-   ```
+Both packages carry a pytest suite, and most of it runs off-robot. **There is no working
+top-level test command** — each package's imports resolve only from inside its own directory.
 
-   `target_distance` is declared as a double parameter -- pass the decimal
-   form (`2.0`, not `2`), or `--ros-args` raises
-   `InvalidParameterTypeException` and the node never starts.
+```bash
+cd poc_fusion     && python3 -m pytest test/ -q
+cd proximity_alert && python3 -m pytest test/ -q --continue-on-collection-errors
+```
 
-   **Tuning obstacle spacing?** The encounter-close reset is distance-based, not
-   time-based — override it the same way, e.g.
-   `-p clear_drive_distance:=0.4 -p encounter_close_confirm_scans:=2`. See
-   [Distance-based encounter close](#distance-based-encounter-close) for what
-   each of the three related parameters does and why the defaults need
-   on-hardware validation before you trust them against your actual obstacle
-   spacing.
+| Suite | Requires | Expected |
+|---|---|---|
+| `poc_fusion` | numpy, scipy, pyyaml | 162 passed, 2 skipped |
+| `proximity_alert`, pure modules | stdlib only | 139 passed |
+| `proximity_alert`, 6 ROS modules | `rclpy` | 6 collection errors off-robot — run inside the container |
 
-   Note the `-r /cmd_vel:=/cmd_vel_unsafe` remap — `path_tracker` no longer publishes directly to the motor-facing topic. **Terminal A' (motion watchdog) below is not optional** — without it, nothing is publishing on `/cmd_vel` at all and the robot won't move; see [Motion watchdog and emergency stop](#motion-watchdog-and-emergency-stop) for why this exists.
+`--continue-on-collection-errors` is required off-robot: without it the `rclpy` import
+failures abort the whole run and **zero** tests execute. The six errors are the host
+environment, not a regression.
 
-   ```bash
-   # Terminal A — motion watchdog (start this BEFORE or alongside Terminal A)
-   docker exec -it -u ubuntu MentorPi zsh -lc "source ~/.zshrc && source ~/ros2_ws/install/setup.bash && ros2 run proximity_alert motion_watchdog"
-   ```
+Everything above is software validation. Behaviour on the physical robot is verified
+separately and recorded in [docs/poc_fusion_verification.md](docs/poc_fusion_verification.md).
 
-   ```bash
-   # Terminal B — log the trial
-   docker exec -it -u ubuntu MentorPi zsh -lc "source ~/.zshrc && source ~/ros2_ws/install/setup.bash && ros2 run proximity_alert trial_logger --ros-args -p csv_path:=/home/ubuntu/shared/trials/granite.csv"
-   ```
+---
 
-   **Running obstacle-avoidance trials instead of a clean surface run?** Point Terminal B at `avoidance_trials.csv` with `track_obstacle_outcome:=true` — this additionally prompts for `obstacle_count`, `layout_id`, `outcome` (success/failure), and `cause` once the trial stops (see [Data collected](#data-collected)):
+## Configuration
 
-   ```bash
-   # Terminal B (avoidance-trial variant)
-   docker exec -it -u ubuntu MentorPi zsh -lc "source ~/.zshrc && source ~/ros2_ws/install/setup.bash && ros2 run proximity_alert trial_logger --ros-args -p csv_path:=/home/ubuntu/shared/trials/avoidance_trials.csv -p track_obstacle_outcome:=true"
-   ```
+Every tunable for the avoidance system lives in one place: the `AvoidanceConfig` dataclass
+in [`avoidance.py`](proximity_alert/proximity_alert/avoidance.py). Each field carries an
+inline comment explaining what raising or lowering it actually does. Every field is
+automatically declared as a ROS parameter, so anything can be overridden per run without
+editing shared defaults:
 
-   ```bash
-   # Terminal C — log the avoidance decisions (separate CSV)
-   docker exec -it -u ubuntu MentorPi zsh -lc "source ~/.zshrc && source ~/ros2_ws/install/setup.bash && ros2 run proximity_alert decision_logger --ros-args -p csv_path:=/home/ubuntu/shared/trials/decision_log.csv"
-   ```
+```bash
+ros2 run proximity_alert path_tracker --ros-args -p safety_distance:=0.25 -p heading_kd:=0.2
+```
 
-   ```bash
-   # Terminal D — log every raw LiDAR scan (for diagnosing total detection misses)
-   docker exec -it -u ubuntu MentorPi zsh -lc "source ~/.zshrc && source ~/ros2_ws/install/setup.bash && ros2 run proximity_alert scan_trace_logger --ros-args -p csv_path:=/home/ubuntu/shared/trials/scan_trace.jsonl"
-   ```
+The ones that matter most:
 
-   Pointing `csv_path` at `/home/ubuntu/shared/...` writes the file into the container's shared folder, which is bind-mounted to `~/docker/tmp` (i.e. `/home/pi/docker/tmp/trials/`) on the Pi — so all three logs appear in your local file manager and survive container restarts.
+| Parameter | Default | Effect |
+|---|---|---|
+| `safety_distance` | 0.20 m | How close something ahead gets before the robot reacts |
+| `forward_speed` | 0.20 m/s | Drive speed. Must match what the vendor controller actually delivers, or every distance and timeout below it starts lying |
+| `max_obstacle_width` | 0.75 m | Above this, turn around it instead of sidestepping |
+| `target_distance` | 0.0 | A→B run length; `0.0` disables the fixed-distance stop entirely |
+| `disable_avoidance` | `false` | Halt on any obstacle, no manoeuvre — used for clean straight-line distance runs |
+| `heading_kp/ki/kd` | 5.0 / 0.05 / 0.2 | Heading-hold PID |
 
-   Terminal A also plays the obstacle audio alert by default (no separate terminal needed — see [Obstacle audio alert](#obstacle-audio-alert)); pass `-p audio_alert_enabled:=false` there to disable it.
+`poc_fusion` is configured through YAML in [`poc_fusion/config/`](poc_fusion/config/) instead.
 
-   **Running with `target_distance` set to test the return-to-line correction?** No node logs the lateral (cross-track) offset automatically — measure it against your taped A→B line once the robot stops, and record it by hand in [`trials/lateral_offset_trials.csv`](trials/lateral_offset_trials.csv) (see [Lateral offset trials](#lateral-offset-trials-lateral_offset_trialscsv) below).
+---
 
-   **Just want the robot to drive, no watchdog/logging setup?** Skip Terminals A'/B/C/D and publish straight to the real `/cmd_vel` in one terminal:
+## Data
 
-   ```bash
-   docker exec -it -u ubuntu MentorPi zsh -lc "source ~/.zshrc && source ~/ros2_ws/install/setup.bash && ros2 run proximity_alert path_tracker --ros-args -p safety_distance:=0.20 -p target_distance:=1.5"
-   ```
+The published dataset is in [`organized_data/`](organized_data/), indexed by
+[`DATA_INDEX.md`](organized_data/DATA_INDEX.md): per-surface trial logs (carpet, granite,
+wood), the decision log, and the hand-maintained tuning logs. Every column is documented in
+the README beside the data, including known integrity flags on specific rows.
 
-   Without `motion_watchdog` running there's no auto-stop if this process dies uncleanly (see [Motion watchdog and emergency stop](#motion-watchdog-and-emergency-stop)), so know the emergency stop command before you run it:
+Raw scan traces are **not** committed — `scan_trace.jsonl` runs to about 1 GB per session.
 
-   ```bash
-   docker exec -u ubuntu MentorPi bash -c "source /opt/ros/humble/setup.bash && ros2 topic pub -r 20 /cmd_vel geometry_msgs/msg/Twist '{linear: {x: 0.0, y: 0.0, z: 0.0}, angular: {x: 0.0, y: 0.0, z: 0.0}}'"
-   ```
+---
 
-After step 2, repeat only step 3 for future runs — you only need to rebuild when you change `path_tracker.py`/`trial_logger.py`/`decision_logger.py`/`scan_trace_logger.py`/`scan_trace_record.py`/`audio_trigger.py`/`motion_watchdog.py`/`motion_watchdog_logic.py` (repeat steps 1–2 each time).
+## Limitations
 
-## Setup
+These are real, confirmed on hardware, and they bound what the data can support.
 
-1. **Docker + ROS 2 Humble.** The project's Docker container (`MentorPi`, image `ros:humble`) is already running on the robot's Pi — confirm it can see the LanderPi's ROS 2 stack with `docker exec -u ubuntu MentorPi zsh -lc "source ~/.zshrc && ros2 topic list"` (`/scan_raw`, `/odom`, `/cmd_vel` should be visible). Always include `-u ubuntu` — running as `root` silently breaks FastRTPS's shared-memory transport between nodes (discovery still matches over UDP, but zero data ever delivers), which cost an entire debugging session before it was traced to this.
-2. **Copy the package in** and **build** it — see [Running it in VS Code](#running-it-in-vs-code-quick-start) above for the exact commands.
+**No wheel encoders.** `/odom` integrates *commanded* velocity, so `odom_distance_m` measures
+"how far the commanded motion thinks it went", not how far the wheels turned. Two
+consequences:
 
-## Usage
+1. On a clean straight-line run (`disable_avoidance:=true`), the gap against ground truth is
+   a reasonable indirect proxy for slippage, because the commanded motion is known and constant.
+2. On any run where avoidance triggered, it is **not**. Heading is also integrated open-loop,
+   so it accumulates error through every turn. Filter on `avoidance_events == 0` before using
+   a trial for slippage analysis.
 
-Run each node in its own terminal (or SSH session) — see [Running it in VS Code](#running-it-in-vs-code-quick-start) for the exact commands.
+**The LiDAR has a fixed-height blind spot.** The LD19 scans one plane and cannot see above or
+below it. A round pedestal desk — narrow base, wide overhanging top — was not detected, and the
+robot made low-speed contact with it. Lowering `safety_distance` would not have helped: the
+obstacle was effectively invisible until contact, not merely detected late. Use obstacles with
+a consistent cross-section at the LiDAR's mounted height.
 
-Then, for each trial:
+**Cross-track correction only undoes commanded displacement.** The return-to-line crab closes
+offset measured in the same open-loop odometry described above, so it cannot see wheel slip or
+dead-reckoning drift. True path following needs an external position source.
 
-1. Place the robot at point A on the marked track for the current surface.
-2. Place an obstacle (or rely on the track's natural endpoint) at point B.
-3. Let the robot drive. `trial_logger` detects the start automatically when the robot begins moving, and the end automatically once `path_tracker`'s obstacle stop has held for one second.
-4. When prompted in Terminal 2, read the robot's actual stop position off your tape-measure marks and enter the surface name (granite/concrete/wood/metal/hpl) and ground-truth distance.
-5. Repeat for each trial and surface, pointing `csv_path` at a different file (or the same file — `trial_num` increments automatically) per surface.
+**Debouncing counts control ticks, not scans.** The control loop runs at 20 Hz and the LD19
+publishes at ~10 Hz, so two consecutive ticks may be the same scan counted twice. This affects
+every debounce in the controller.
 
-## Data collected
+### `poc_fusion` status
 
-Each row appended to the CSV represents one trial:
+An in-progress proof of concept, not a finished subsystem. End-to-end integration of the
+depth + LiDAR chain **was** verified on the robot (2026-08-10: sensor ingress, costmap
+representation, clear→CLEAR, obstacle→stop, and recovery, all with recorded sample counts).
+Still open:
 
-| Column | Meaning |
+- Depth-only detection of an overhang was never live-verified.
+- A bench test on 2026-08-11 **failed its gate**: at this camera's mounting geometry, depth
+  cannot contribute for floor-standing obstacles. This is the main open question over the
+  whole approach.
+- Validation/tuning, compute budget, graceful degradation and the fusion-benefit A/B
+  measurement were not carried out — several parameters remain deliberate placeholders.
+
+`stop_action_node` is off by default in the launch file. It is a **series gate** on `cmd_vel`;
+read its `REQUIRED TOPOLOGY` section before enabling it.
+
+---
+
+## Documentation
+
+| Where | What |
 |---|---|
-| `timestamp` | Wall-clock time the trial was logged |
-| `surface` | Surface material entered at the prompt |
-| `trial_num` | Auto-incrementing trial counter for that CSV file |
-| `transit_time_s` | Seconds from start-of-motion to confirmed stop |
-| `odom_distance_m` | Straight-line distance from start to stop, per the robot's dead-reckoned `/odom` estimate. **Not real wheel-encoder feedback** — see the caveat in [Project overview](#project-overview); only trust this as a slippage signal on `avoidance_events == 0` trials |
-| `ground_truth_distance_m` | Straight-line distance from start to stop, per tape measure |
-| `slippage_error_m` | `odom_distance_m - ground_truth_distance_m` |
-| `slippage_pct` | Slippage error as a percentage of ground-truth distance |
-| `avoidance_events` | Count of distinct obstacle-avoidance encounters `path_tracker` committed to during the trial, counted from `/avoidance_decision` (not `/cmd_vel` — a `STRAFE` commands `linear_x = 0.0`, so a reverse-command heuristic misses strafe-only encounters, the most common kind). **Non-zero means this was not a clean A→B run** and should be filtered out or analyzed separately from clean-run slippage stats. |
-| `lidar_stop_range_m` | The actual LiDAR range to the closest obstacle in the forward arc at the moment the trial finalized (i.e. the real stop clearance), captured from `path_tracker`'s `/forward_min_range` topic. Useful for checking proximity-trigger accuracy against the `safety_distance` parameter and whether it varies by surface. Blank if nothing valid was in the arc at stop. **Measure `ground_truth_distance_m`/stop clearance from the LiDAR unit itself** (the rotating sensor housing), not the chassis front edge — `safety_distance` and this column are both computed against the LiDAR's own raw range, so that's the only measurement point directly comparable to them. Expect the real stop clearance to consistently undershoot the configured `safety_distance` by a few centimeters (at the defaults, `obstacle_confirm_scans=2` debounce scans at the LD19's ~10Hz rate, times `forward_speed`, accounts for ~5cm of it) — that's expected stop latency, not a measurement or code error. If your tape measurement doesn't match this logged value, that's the discrepancy worth investigating; a gap against `safety_distance` alone is not. |
-| `notes` | Freeform text entered at logging time for anything unusual observed (e.g. "motors fought each other on the turn", "oscillated near desk", "false stop") |
-| `battery_level` | Rough `High`/`Medium`/`Low` estimate captured from `/ros_robot_controller/battery` (raw millivolts) at the moment the trial finalized, assuming a 2S Li-ion pack (6.0V empty - 8.4V full). Not a precise state-of-charge reading -- just enough to flag "was the pack getting low during this session." Blank if no reading had arrived yet. |
-| `obstacle_count` | Number of obstacles present for this trial, entered at the prompt. **Blank unless `track_obstacle_outcome:=true`** — a plain surface trial (granite.csv etc.) never asks for this. |
-| `layout_id` | Short label you assign per obstacle arrangement (e.g. `layout_A`), entered at the prompt. The actual obstacle geometry for that ID lives in your own separate layout sheet, not in this CSV. Blank unless `track_obstacle_outcome:=true`. |
-| `outcome` | `success` or `failure`, entered at the prompt (validated — no other value is accepted). Blank unless `track_obstacle_outcome:=true`. |
-| `cause` | Freeform text describing why the trial succeeded or failed, entered at the prompt. Blank unless `track_obstacle_outcome:=true`. |
-
-## Refined obstacle avoidance
-
-`path_tracker` runs a deterministic 7-state machine (`AvoidanceController`, a pure module unit-tested off-hardware) governed by one invariant: **always take the maneuver that minimizes deviation from the goal heading while maintaining safety.** That ordering falls out of it — strafe (holds the bearing) → turn-and-drive (bounded deviation) → one bounded recovery → halt:
-
-- **DRIVE** — forward at `forward_speed`, PID holds the goal heading captured at A.
-- **ASSESS** — on a confirmed obstacle, a strafe-first ladder: sidestep if a bounded strafe toward a *confirmed-clear* side clears the (narrow) obstacle; else turn toward the more-open side and drive past; else escalate.
-- **STRAFE / TURN / DRIVE_PAST** — the maneuvers, each committed (run to completion) so an obstacle's jittering apparent side can't cause oscillation.
-- **RECOVER** — after repeated failures, one bounded routine: back off, pick the widest fitting gap from the current 360° scan, rotate to face it, commit once.
-- **HALT** — stop and flag; re-check each tick.
-
-The LiDAR is reduced each scan into FRONT (+ front sub-sectors), LEFT, RIGHT, and REAR clearances. Every decision is published as a JSON record on `/avoidance_decision` and logged by `decision_logger` (see [Data collected](#data-collected)). Set `disable_avoidance:=true` to halt on any obstacle with no turn/strafe (used for the clean go-and-stop distance runs).
-
-## Running the tests
-
-Both packages carry a pytest suite. **There is no working top-level test command** — running `pytest` from the repo root fails collection on every module, because each package's imports resolve only from inside that package's own directory. Run each suite from its package root:
-
-```bash
-cd /home/pi/Desktop/LanderPi-Proximity-Alert/poc_fusion && python3 -m pytest test/ -q
-```
-
-`poc_fusion` is ROS-free throughout and runs clean on the host.
-
-**`proximity_alert` needs one extra flag on the host.** Six of its test modules import `rclpy`, which exists only inside the `MentorPi` container. A collection error aborts the *entire* pytest run by default — so the plain command runs **zero** tests on the host rather than skipping those six. Add `--continue-on-collection-errors` so the rest still run:
-
-```bash
-cd /home/pi/Desktop/LanderPi-Proximity-Alert/proximity_alert && python3 -m pytest test/ -q --continue-on-collection-errors
-```
-
-Expect `6 errors` from the `rclpy` modules — that is the host environment, not a regression. The pure-logic modules (`avoidance`, `scan_utils`, `nav_utils`, `audio_trigger`, `motion_watchdog_logic`, the record types) are ROS-free by design and do run here. **This is not a full pass:** to actually exercise the six ROS modules, run the same command inside the container (`docker exec -u ubuntu MentorPi ...`, see [Setup](#setup)).
-
-## Parameters
-
-**`path_tracker`** (every field is a ROS parameter; only the commonly-tuned ones are shown — see `AvoidanceConfig` in `proximity_alert/avoidance.py` for the full list). This includes `heading_kp`/`heading_ki`/`heading_kd` (the heading-hold PID, [Data collected](#data-collected)'s `Kp`/`Ki`/`Kd` columns) — override per run/per surface with e.g. `--ros-args -p heading_kd:=0.2` without touching the shared defaults.
-
-| Parameter | Default | Description |
-|---|---|---|
-| `safety_distance` | `0.20` | FRONT stop threshold, meters |
-| `forward_speed` | `0.20` | Constant forward speed, m/s. Set to match what `/cmd_vel` actually delivers (see "Speed clamp" below), not an aspirational value — every distance-based timeout in this table (`max_drive_past_distance`, `recover_commit_distance`, `max_cumulative_strafe`) is `speed × elapsed_time`, so a mismatch here makes those give up before covering their configured real distance |
-| `obstacle_confirm_scans` | `2` | Consecutive close scans required before a maneuver decision (debounce) |
-| `strafe_speed` / `strafe_timeout` | `0.20` / `2` | Lateral speed and per-strafe time cap (m/s, s). `strafe_speed` is subject to the same `/cmd_vel` clamp as `forward_speed` |
-| `strafe_side_clearance_min` | `0.20` | Side clearance required to strafe into it, meters |
-| `max_obstacle_width` | `0.75` | Above this *physical* lateral width (meters), the obstacle is "wide" (a wall) → turn, not strafe. Keyed on physical width, not angular span: at trigger range any real object subtends a large angle, so an angular-span gate would block strafing entirely. |
-| `max_cumulative_strafe` | `1.25` | Hard per-encounter lateral cap (long-wall guard), meters |
-| `turn_speed` / `turn_step_deg` / `turn_timeout` | `0.75` / `30.0` / `1.5` | Turn rate, per-turn increment, time cap (rad/s, deg, s) |
-| `turn_radius` | `0.0` | Reverse-arc radius during TURN/RECOVER, meters. Those states already command reverse + rotation together, so they trace an arc of radius `reverse_speed / turn_speed` — at legacy defaults a tight ~0.13m. Set > 0 to control that geometry directly (reverse speed becomes `turn_radius × turn_speed`): bigger = a wider, longer sweep instead of an almost-in-place pivot. `0` keeps the legacy fixed `avoid_reverse_speed` |
-| `rear_taper_zone` | `0.0` | Distance above `rear_clearance_min` over which the reverse component fades out linearly rather than snapping to zero, meters. The hard cutoff makes a turn lurch from arc to pure pivot the moment clearance runs low; a taper degrades smoothly. `0` keeps the legacy hard cutoff |
-| `max_avoid_attempts` | `3` | Failed cycles before escalating to recovery |
-| `clear_drive_distance` | `0.3` | Confirmed-clear straight-line displacement that closes an encounter and resets its counters (`cumulative_strafe`, attempt count), meters. Measured from odometry — see [Distance-based encounter close](#distance-based-encounter-close) |
-| `encounter_close_confirm_scans` | `3` | Consecutive clear scans required before `clear_drive_distance` even starts accumulating. Mirrors `obstacle_confirm_scans` on the exit side, so one noisy clear reading can't start (or falsely advance) the measurement |
-| `odom_jump_threshold` | `0.15` | Per-tick position delta above which motion is treated as a discontinuous odometry jump (e.g. a localization reset) rather than real travel, meters. The in-progress measurement is abandoned and restarts after the next confirmed-clear streak |
-| `min_gap_clearance` / `min_gap_width_deg` | `0.50` / `40.0` | What counts as a usable recovery gap (robot must fit) |
-| `disable_avoidance` | `false` | Halt on any obstacle, no turn/strafe (clean go-and-stop runs) |
-| `target_distance` | `0.0` | Distance **along the A→B line** (the projection, not straight-line displacement) after which the robot stops and reports `arrived_target_distance`. `0.0` disables — no stop condition and no odom watchdog, exactly as before this parameter existed (distance tracking itself still runs internally either way; nothing consumes it when disabled). Arrival is deferred until the avoidance state machine is back in `DRIVE`, so a strafe or turn finishes before the stop — this can cost real overshoot, up to roughly a metre if a full maneuver ladder (strafe, then turn, then drive-past) runs before DRIVE is reached again |
-| `cross_track_kp` | `0.6` | Gain from cross-track error (m) to crab velocity (m/s) for the return-to-line correction. Derived from the *distance* you want re-centering to take, not a time: `ė = -kp·e` settles 95% in 3 time constants, so **`kp = 3v/D`** — at the delivered `v = 0.20` m/s and `D = 1.0` m, `kp = 0.6`. **Rescale if `forward_speed` changes**, or re-centering stretches over a proportionally longer distance. `0.0` disables the correction entirely |
-| `cross_track_max_speed` | `0.10` | Crab velocity clamp, m/s. Derived from the largest acceptable crab angle: `v_lat = tan(angle) × forward_speed`; past ~27° the LiDAR's forward arc stops covering the direction the robot is actually travelling. Higher = re-centers sooner but drives increasingly sideways-on |
-| `cross_track_deadband` | `0.03` | Offset below which the correction is exactly zero, meters. Set from the smallest offset you can actually measure on the floor (~1 cm ruler-tip) times a small factor — correcting below your own measurement resolution just chatters |
-| `cross_track_ramp_time` | `0.3` | Seconds to fade the crab in after a maneuver hands back to `DRIVE`. Derived from the chassis acceleration limit in the platform's own `ekf.yaml` (1.3 m/s²): reaching 0.10 m/s needs ≥ 0.077 s, rounded up for margin. `0` = full strength immediately |
-| `cross_track_tolerance` | `0.05` | How close to the line counts as "on it" for the arrival centering phase, meters. After covering `target_distance` the robot stops driving forward and keeps crabbing until within this band, then reports `arrived_target_distance`. `0.0` disables centering, so arrival latches the instant the distance is covered |
-| `centering_timeout` | `5.0` | Max seconds spent centering before declaring arrival regardless of remaining offset. Guarantees termination when the correction is gated off or a flank is blocked; the leftover offset is then measured on the floor rather than asserted by the robot |
-| `odom_timeout_sec` | `1.0` | Odometry watchdog, seconds. If `target_distance` is set and no `/odom` message arrives within this window, the robot stops and reports `stopped_odom_fault` rather than driving on a stale distance estimate. Ignored entirely when `target_distance` is `0.0` |
-| `audio_alert_enabled` | `true` | Plays `wav_path` through the USB speaker once per obstacle encounter — see [Obstacle audio alert](#obstacle-audio-alert). Set `false` to disable |
-| `wav_path` | `/home/ubuntu/shared/audio/obstacle_alert.wav` | WAV file to play (host path — see below) |
-| `alsa_device` | `plughw:2,0` | ALSA device string for the robot's USB speaker (confirmed via `aplay -l` inside the container) |
-
-Derived (computed, not configured): `max_strafe_distance = strafe_speed × strafe_timeout`; `corridor_half = robot_half_width + corridor_margin`; `clear_threshold = safety_distance + clear_margin`.
-
-**`motion_watchdog`** — see [Motion watchdog and emergency stop](#motion-watchdog-and-emergency-stop) for why this node exists and how to run it.
-
-| Parameter | Default | Description |
-|---|---|---|
-| `input_topic` | `/cmd_vel_unsafe` | Topic the real command source (e.g. `path_tracker`, remapped) publishes to |
-| `output_topic` | `/cmd_vel` | Topic that actually reaches the motors. Forwarded from `input_topic` while fresh, forced to zero otherwise |
-| `timeout_sec` | `0.5` | Max age of the last received `input_topic` message before this node starts publishing zero itself |
-| `check_rate_hz` | `20.0` | How often to check staleness and republish — decouples `output_topic`'s rate from whatever `input_topic`'s actual publisher rate happens to be |
-
-### Distance-based encounter close
-
-An *encounter* is one obstacle, from the first confirmed detection until the
-robot has clearly driven past it. While an encounter is open, the attempt count
-and `cumulative_strafe` budget keep accruing; when it closes, they reset.
-
-That close used to be a *time* value (`clear_drive_duration`, 3.0 s). The
-problem: three seconds is not a place. Whether it corresponds to 10 cm or a
-full metre depends entirely on `forward_speed`, so tuning it against real
-obstacle spacing meant doing the arithmetic in your head every time — and two
-obstacles spaced closer together than that interval were merged into a single
-encounter, the second one inheriting the first's leftover attempt count and
-strafe budget and escalating to RECOVER or HALT far sooner than it should have.
-
-It is now a distance: `clear_drive_distance` (0.3 m) of confirmed-clear
-straight-line displacement, taken from odometry. You set it directly in the
-same units you measure the floor in.
-
-Three details worth knowing:
-
-- **`encounter_close_confirm_scans` (3) gates the start.** The measurement only
-  begins after that many consecutive clear scans, mirroring what
-  `obstacle_confirm_scans` does on the entry side, so a single noisy clear
-  reading can't start or falsely advance it. A re-block before the threshold is
-  reached discards the partial measurement outright — interrupted clear
-  stretches never sum.
-- **It is straight-line displacement, not integrated path length.** A robot
-  that strafes and curves around an obstacle covers more ground than its net
-  displacement, so this under-reports. That is deliberate: it errs toward
-  keeping an encounter open, never toward closing one early.
-- **`odom_jump_threshold` (0.15 m) rejects discontinuities.** A per-tick jump
-  larger than this is a localization reset, not travel, so the in-progress
-  measurement is abandoned rather than credited with a bogus few metres. Note
-  it is *not* scaled by elapsed `dt`: at the confirmed 0.20 m/s clamp even a
-  sluggish 5 Hz loop only covers ~0.04 m per tick, so 0.15 m is roughly 4×
-  margin. A stalled control loop that legitimately covers more ground in one
-  delayed tick could trip it — a known, accepted simplification, not a hidden
-  gap. If long scheduling stalls ever become real, the fix is a Δt-aware
-  version (`expected = forward_speed × dt`, jump if `actual > expected + margin`).
-
-**These three defaults are starting points, not measured constants**, and need
-on-hardware validation against real obstacle spacing and real odometry noise.
-
-**Known limitation:** obstacles spaced closer together than roughly
-`clear_drive_distance` plus the confirm-scan debounce distance are still
-treated as one encounter. Distance alone cannot resolve that; telling "same
-obstacle" from "new obstacle" would need a different signal entirely, which is
-out of scope here.
-
-### Speed clamp — why `forward_speed`/`strafe_speed` default to 0.20, not 0.50
-
-`path_tracker` publishes to `/cmd_vel`. On this platform that topic is read by
-the vendor's phone-app control node (`odom_publisher_node.py`), which clamps
-`linear.x`/`linear.y` to **±0.20 m/s** before the command reaches either the
-motors or `/odom` — a sensible limit for manual driving, but it applies to
-every publisher on that topic, `path_tracker` included. Every other
-autonomous node on this robot (`lidar_app`, `line_following`,
-`object_tracking`, etc.) avoids it by publishing to `/controller/cmd_vel`
-instead.
-
-Confirmed on hardware, not just read from the driver source: a `target_distance:=1.0`
-run's own log —
-
-```
-[INFO] path_tracker started: forward_speed=0.5m/s ... target_distance=1.0
-[WARN] No fresh scan within scan_timeout; holding.   (x3, ~1s apart, ~2.16s of startup)
-[INFO] Target distance 1.00 m reached (along-track 1.01 m, final offset +0.011 m) -- stopping.
-```
-
-— took 7.57 s end to end. Subtracting the ~2.16 s scan warm-up leaves ≤5.41 s
-to cover 1.01 m: **≥0.187 m/s actual**, against an expected 2.00 s if the
-configured 0.50 m/s were really reaching the motors — a 3.4 second gap,
-independently corroborated by a tape-and-stopwatch trial (~100 cm in 5.7 s,
-0.175 m/s).
-
-**Fixed by aligning the config to reality (`forward_speed`/`strafe_speed` set to
-`0.20`), not by switching topics.** Every distance-based counter in the
-controller — `_drive_past_dist` vs. `max_drive_past_distance`, `_commit_dist`
-vs. `recover_commit_distance`, `cumulative_strafe` vs. `max_cumulative_strafe`
-— is `configured_speed × elapsed_time`. With the old `0.50` default those all
-overestimated real distance travelled by ~2.5×, so e.g. `DRIVE_PAST` was
-giving up after ~32 cm of *real* travel while believing it had driven 80 cm —
-often not enough to actually clear an obstacle. Switching to
-`/controller/cmd_vel` instead would fix the clamp but make the robot 2.5×
-faster with no watchdog on the platform, invalidate every trial logged so
-far, and need a fresh re-tune; that's left as a deliberate, separate future
-change if higher speed is ever wanted.
-
-### Arrival status (`/path_tracker/status`)
-
-`path_tracker` publishes a `std_msgs/String` on `/path_tracker/status` every
-control tick, reporting what is currently governing the robot:
-
-| Value | Meaning |
-|---|---|
-| `driving` | Driving forward, or mid-avoidance-maneuver |
-| `centering` | Along-track distance is covered, but the robot is still further than `cross_track_tolerance` off the A→B line. Forward motion has stopped; it is crabbing sideways onto the line. Ends in `arrived_target_distance` either on reaching the line or at `centering_timeout` |
-| `arrived_target_distance` | `target_distance` reached while in `DRIVE` (and centering finished); stopped and latched |
-| `arrived_obstacle` | The avoidance state machine reached `HALT` — it ran out of options. Note this is recoverable: if the obstacle is removed and the path stays clear, it returns to `driving` |
-| `stopped_odom_fault` | `/odom` went stale while `target_distance` was set; stopped as a precaution |
-| `stopped_scan_fault` | The scan-side counterpart to `stopped_odom_fault`: no fresh LiDAR scan within `scan_timeout`, so the node holds rather than driving blind. Never reported while an arrival is already latched — `arrived_target_distance` takes priority, so a LiDAR dropout after arrival still reports arrived |
-
-### Return-to-line correction — and what it cannot do
-
-Holding the goal *heading* was never enough to stay on the A→B line. A strafe
-leaves the robot pointing the right way but bodily offset, so before this
-correction existed it would clear an obstacle and then drive on **parallel to
-the original line, permanently offset**. The fix crabs it back: a `linear.y`
-command proportional to cross-track error, applied only in `DRIVE`.
-
-Crab, not steer, because the chassis is mecanum. Stanley, Pure Pursuit and
-line-of-sight guidance all exist to solve this on car-like bases that *cannot*
-move sideways; their machinery (lookahead, `atan(k·e/v)`, curvature limits) is
-there to turn lateral error into a steering angle without oscillating. This
-robot can move sideways directly — and lateral strafe is the one motion the
-platform does cleanly, since pure rotation hits the documented vendor
-kinematics quirk. Crabbing also keeps the LiDAR pointed down the path, so the
-forward-arc sectors keep meaning what the avoidance machine was tuned for.
-The closed loop is a plain first-order lag (`ė = -kp·e`): exponential decay,
-no overshoot for any `kp > 0`, and saturation only slows it.
-
-**The correction never closes on the obstacle it just avoided.** A strafe
-commands `linear_x = 0`, so it makes *no* forward progress — it ends with the
-robot level with the obstacle, offset by the bare minimum that uncovered its
-front arc. Crabbing straight back would drive into its flank, and worse, form
-a stable limit cycle (strafe out → front clears → crab back → front blocks →
-strafe out) that hangs the run. So the gate is asymmetric: moving *away* from
-the avoided side is never blocked, while moving *toward* it requires that
-side's live LiDAR clearance to exceed `pass_clearance`. Gating on measured
-clearance rather than "drive forward N metres first" makes it self-timing —
-it waits as long as the obstacle actually needs, which differs for a wall
-versus a cone.
-
-> **Scope limit — this corrects commanded displacement, not slip.**
-> `/odom`'s x/y on this platform is an **open-loop integral of commanded
-> velocity**: there are no wheel encoders, and the EKF's only configured
-> exteroceptive x/y source (`odom1: odom_rf2o`, laser odometry) is **not
-> running** — 0 publishers, so `odom0` contributes velocities only. The
-> correction therefore undoes lateral displacement the robot *commanded* —
-> which is exactly what a strafe-based avoidance maneuver produces, and the
-> bug this was written for — but it **cannot see wheel slip or dead-reckoning
-> drift**. If a strafe slips, odom still reports a perfect strafe and the
-> robot will happily "re-center" onto a line that has itself drifted. Yaw is
-> genuinely EKF-fused with the IMU and is trustworthy; position is not.
-> Accuracy degrades with distance and with the number of maneuvers.
-> **True path following requires an external position source** — starting the
-> rf2o laser-odometry node, or equivalent. Measure the final offset on the
-> floor (`centering` reports what the robot *believes*); don't take the
-> robot's own number as ground truth.
-
-**One `path_tracker` process per trial.** Arrival latches permanently — once
-`arrived_target_distance` is reached the node stays stopped and will not
-drive again. Ctrl-C and relaunch between runs. This is deliberate: an
-auto-reset could be tripped by nudging the robot between trials.
-
-**Launch order matters.** `path_tracker` latches its start position (`start_pos`)
-on the first `/odom` message it receives after the node starts, not at any
-later "trial start" moment. Place the robot at point A **first**, then launch
-`path_tracker` — launching first and moving the robot to A afterward measures
-`target_distance` from the wrong origin.
-
-**`trial_logger`**
-
-| Parameter | Default | Description |
-|---|---|---|
-| `csv_path` | `trial_log.csv` | Output CSV file path (point at `/home/ubuntu/shared/trials/<surface>.csv` to land on the host — see below) |
-| `surface` | `""` | Surface material logged per trial. Empty (default) infers it from `csv_path`'s filename — e.g. `.../granite.csv` → `granite` — no terminal prompt needed; set explicitly to override (e.g. a shared/misc log whose filename doesn't match the surface) |
-| `move_velocity_threshold` | `0.03` | Speed above which the robot is considered moving, m/s |
-| `stop_velocity_threshold` | `0.02` | Speed below which the robot is considered stopped, m/s |
-| `stop_confirm_duration` | `1.0` | Seconds of continuous stopped-ness before a trial is finalized |
-
-**`decision_logger`**
-
-| Parameter | Default | Description |
-|---|---|---|
-| `csv_path` | `/home/ubuntu/shared/trials/decision_log.csv` | Output CSV for the avoidance decision log (host path — see below) |
-
-## Motion watchdog and emergency stop
-
-**The STM32 holds the last commanded velocity forever — there is no motion watchdog anywhere else on this platform.** `path_tracker` publishing a final zero `Twist` as it exits (`publish_stop()`) is not enough on its own: it only runs if the process gets a clean shutdown. If it's orphaned, SIGKILLed, or its last message is simply dropped, nothing ever corrects the latched command and the robot keeps moving indefinitely on whatever it was last told to do. This happened twice on hardware — once for ~8 minutes, once mid-avoidance doing a backwards turning arc after Ctrl+C had already returned the terminal to a prompt.
-
-**`motion_watchdog`** is the fix. It sits between the real command source and `/cmd_vel`: `path_tracker` is remapped to publish to `/cmd_vel_unsafe` instead (see Terminal A/A' in [quick start](#running-it-in-vs-code-quick-start)), and `motion_watchdog` forwards those commands to the real `/cmd_vel` only as long as they keep arriving on schedule. The moment its input goes stale for longer than `timeout_sec` — for *any* reason, cleanly-exited or not — it starts publishing zero itself, every tick, until fresh input resumes. **Run it every time you run `path_tracker`; without it nothing publishes to `/cmd_vel` at all.**
-
-This closes the specific failure mode both incidents shared (the *source* of commands dying or being cut off from the terminal), but it isn't a complete safety net — `motion_watchdog` is itself a process that could theoretically die too, in which case whatever it last forwarded stays latched, same as today. It's deliberately built as small and simple as possible (no state machine, no sensor processing, one pure decision function) specifically to minimize that residual risk, but a true fix would live in the firmware/driver layer, outside this package's reach.
-
-**Emergency stop**, if the robot is moving and you need it to stop *right now*, regardless of what any terminal appears to show (per the incidents above, a terminal returning to a prompt is not proof the robot stopped):
-
-```bash
-docker exec -u ubuntu MentorPi bash -c "pkill -INT -f 'proximity_alert.path_tracker|proximity_alert.motion_watchdog'"
-```
-
-`-INT`, not `-9` — this runs *inside* the container, targeting the real process directly rather than depending on a terminal's Ctrl+C reaching it, and `-INT` (not `SIGKILL`) still lets each node's own `publish_stop()` run before it exits. If that doesn't work, or `motion_watchdog` isn't running, force zero directly:
-
-```bash
-docker exec -u ubuntu MentorPi bash -c "source /opt/ros/humble/setup.bash && ros2 topic pub -r 20 /cmd_vel geometry_msgs/msg/Twist '{linear: {x: 0.0, y: 0.0, z: 0.0}, angular: {x: 0.0, y: 0.0, z: 0.0}}'"
-```
-
-Leave this running (Ctrl+C to stop *it*, once the robot is confirmed stopped) — a single `--once` publish can be beaten by a stale process still actively publishing nonzero commands in a race; a sustained `-r 20` republish wins that race instead of hoping to.
-
-## Lateral offset trials (`lateral_offset_trials.csv`)
-
-No node measures ground-truth cross-track offset — it can only ever be read off a tape measure on the floor, so [`trials/lateral_offset_trials.csv`](trials/lateral_offset_trials.csv) is a hand-maintained sheet, same pattern as `floor_test_log.csv` (header row, one row per session, blank cells you fill in after each run — not written by any ROS node).
-
-The sheet is built around one comparison: **what you measured on the floor vs. what the robot itself believed.** `path_tracker` prints its own along-track/cross-track estimate the moment it arrives —
-
-```
-[INFO] [path_tracker]: Target distance 1.00 m reached (along-track 1.01 m, final offset +0.011 m) -- stopping.
-```
-
-— and those two numbers (`along-track`, `final offset`) are exactly `Robot Along-Track` / `Robot Lateral Offset` below. Since (per the [scope limit](#return-to-line-correction--and-what-it-cannot-do)) that estimate is dead-reckoned from commanded velocity, not measured — this sheet is what tells you how far it's actually drifted from the truth.
-
-| Column | Fill in with |
-|---|---|
-| `Date and Session #` | Same convention as the other sheets |
-| `Target Distance (m)` | The `target_distance` you ran with — the one input that defines the trial |
-| `Ground Truth Lateral Offset (m)` / `± Ground Truth Uncertainity (m)` | **Measure this on the floor with a tape**, against your taped A→B line, once the robot stops. Pick a left/right sign convention and note it consistently |
-| `Robot Along-Track (m)` / `Robot Lateral Offset (m)` | Copied straight from `path_tracker`'s own arrival log line (`along-track` / `final offset`, shown above) — the robot's *belief*, not a second measurement |
-| `Lateral Offset Error (m)` | `Robot Lateral Offset − Ground Truth Lateral Offset`. This is the number that answers "how much can we trust the robot's own read-out" — large or growing error here is the dead-reckoning drift the scope limit warns about, not a bug in the correction itself |
-| `Obstacle Side (Left/Right)` | Which side you placed the obstacle / which way it dodged — lets you check later whether the correction converges the same from both directions |
-| `Obstacle Lateral Offset from Line (m)` | **Measure this on the floor with a tape**, before the run: how far the obstacle sits from the taped A→B line. Distinct from `Ground Truth Lateral Offset (m)` (the robot's post-run offset) — this one's the trial setup, not the outcome |
-| `Measurement Method`, `Surface Type` | Same as the other sheets |
-| `Obstacle 1 Type` / `Obstacle 2 Type` / `Obstacle 3 Type` | What the robot encountered, in the order it hit them (first, second, third) — one of `Box`, `Waterbottle` (round object), `Chair` (an object with an opening in the middle), or `Other`. Leave later columns blank for trials with fewer than three obstacles; if a run has more than three, extend the header with an `Obstacle 4 Type` column the same way |
-| `Centering Outcome` | `Completed`, `Timed Out`, or `Not Triggered` — reflects the `driving` → `centering` → `arrived_target_distance` sequence on `/path_tracker/status` (see [Arrival status](#arrival-status-path_trackerstatus)) |
-| `Notes`, `Bugs/Issues`, `Battery level` | Same as the other sheets |
-
-## Obstacle audio alert
-
-`path_tracker` plays `wav_path` through the USB speaker (`aplay`, non-blocking) the first time an obstacle encounter enters a non-`DRIVE` state — once per `encounter_id`, not on every escalation step (strafe → turn → recover → halt) within it, and never during ordinary clear-path driving. It's on by default (`audio_alert_enabled:=true`); set `-p audio_alert_enabled:=false` to turn it off. This uses the same trigger logic (`audio_trigger.py`) as the original standalone `obstacle_audio` prototype node, now folded directly into `path_tracker` so it runs with no extra terminal — a non-blocking `aplay` call can never stall the control loop.
-
-**A WAV file must exist or nothing plays.** `aplay` is spawned non-blocking with its stderr discarded, so a missing file used to produce no visible error — the robot just silently never beeped. `path_tracker` now logs an `ERROR` at startup if `wav_path` doesn't exist. To generate a quick test beep (no dependencies, run on the Pi):
-
-```bash
-mkdir -p /home/pi/docker/tmp/audio
-python3 -c "
-import math, struct, wave
-r, d, f = 44100, 0.35, 880.0
-n = int(r*d)
-fr = b''.join(struct.pack('<h', int(32767*0.5*min(1,min(i,n-i)/(0.02*r))*math.sin(2*math.pi*f*i/r))) for i in range(n))
-w = wave.open('/home/pi/docker/tmp/audio/obstacle_alert.wav','w'); w.setnchannels(1); w.setsampwidth(2); w.setframerate(r); w.writeframes(fr); w.close()"
-```
-
-Verify it plays with the exact command the node uses:
-
-```bash
-docker exec -u ubuntu MentorPi aplay -D plughw:2,0 /home/ubuntu/shared/audio/obstacle_alert.wav
-```
-
-**To use your own dialogue clip:** drop a WAV file at `/home/pi/docker/tmp/audio/obstacle_alert.wav` on the Pi (create the `audio/` folder if it doesn't exist yet) — that's the host side of the same bind mount the CSV/JSONL logs already use, so it lands at `/home/ubuntu/shared/audio/obstacle_alert.wav` inside the container automatically, with no container restart needed. See `docs/superpowers/specs/2026-07-24-obstacle-audio-alert-design.md` for the original design (the trigger logic it describes is unchanged; only which node calls it moved).
-
-## Three logs, all on your computer
-
-The logs are deliberately kept in **separate files** so the motion/slippage data, the avoidance-decision data, and the raw scan data stay clean and independently analyzable:
-
-- **Trial motion log** (`trial_logger`) — one row per A→B trial: transit time, odometry vs. ground-truth distance, slippage, `avoidance_events`, `lidar_stop_range_m`.
-- **Decision log** (`decision_logger`) — one row per avoidance *decision*, for research/debugging: `timestamp, encounter_id, state, chosen_maneuver, reason, obstacle_span_deg, front_distance_m, front_left_m, front_center_m, front_right_m, left_clearance_m, right_clearance_m, rear_clearance_m, required_clearing_m, cumulative_strafe_m, consecutive_avoid_count, recovery_triggered, outcome, maneuver_duration_s`.
-- **Scan trace log** (`scan_trace_logger`) — one row per raw LiDAR scan tick, for diagnosing detection misses that never trigger an avoidance encounter at all (e.g. a thin chair leg outside the LiDAR's scan plane): `scan_number, stamp_sec, stamp_nanosec, angle_min, angle_increment, range_min, range_max, ranges, sectors`. JSON Lines (`.jsonl`), not CSV — `ranges` is a variable-length array that doesn't fit CSV's fixed-column shape. `stamp_sec`/`stamp_nanosec` come from the LaserScan message's own `header.stamp`, not wall-clock time, so this log stays on the same clock as `/odom` and every other ROS message for valid cross-message correlation. A process killed mid-write can only ever corrupt the last line of the file — skip a line that fails to parse rather than treating it as corruption. The node's `front_arc_deg`/`front_subsector_deg`/`side_window_deg`/`rear_window_deg` params default to match `path_tracker`'s current `AvoidanceConfig` values; if those get tuned in `avoidance.py`, update this node's defaults too, or the logged `sectors` will stop reflecting what the controller actually saw. See `docs/superpowers/specs/2026-07-24-scan-trace-logger-design.md` for the full design and the post-hoc misdiagnosis workflow. **Warning**, the scan trace log will occupy a considerable amount of space. (~3 GBS for all of our tests, so ensure you have enough storage on your machine and clear temporary disk space on the Raspberry Pi)
-
-All three default to (or should be pointed at) `/home/ubuntu/shared/trials/` inside the container, which is bind-mounted to **`/home/pi/docker/tmp/trials/`** on the Pi — so all three logs appear directly in your local file manager (and survive container restarts) with no `docker` digging. Because it's a bind mount, nothing ever needs to be copied out of the container. See [Repository structure](#repository-structure) for how `trials/` surfaces them in VS Code.
-
-## Reconciling floor_test_log.csv
-
-`floor_test_log.csv` (the hand-maintained Google-Sheet-schema report of PID/safety-distance tuning sessions) is never written by any ROS node — it's a manual transcription of Time and Stop clearance from the real trial CSV, plus the `safety_distance`/`Kp`/`Ki`/`Kd` you ran with (which aren't persisted anywhere else). That transcription step is easy to forget. Run this after a session to auto-fill whatever's derivable from the trial data, on the host (no ROS needed):
-
-```bash
-python3 -m proximity_alert.floor_test_reconcile --floor-log trials/floor_test_log.csv --trial-csv trials/granite.csv
-```
-
-It only fills Time/Stop-clearance, never fabricates Safety Distance/Speed/Kp/Ki/Kd, and refuses to guess when two session rows share the same date (nothing to disambiguate which trials belong to which row) — it reports both cases so you can fill them by hand instead of silently leaving (or corrupting) a blank.
-
-## Roadmap
-
-- [x] Reactive obstacle-avoidance driver (`path_tracker.py`)
-- [x] Per-trial transit time / odometry / ground-truth logging (`trial_logger.py`)
-- [x] Re-integrate the I2C buzzer so it fires simultaneously with the obstacle-avoidance stop
-- [x] Collect full trial sets across all five surfaces
-- [x] Statistical analysis of slippage by surface (Haotian)
-- [ ] Methodology and Results sections, IEEE conference format
-
-## Troubleshooting
-
-- **`trial_logger` never detects a trial end.** Check that `path_tracker`'s obstacle stop is actually driving `linear.x` to zero (watch `ros2 topic echo /cmd_vel`) and that `/odom` twist values are reasonably close to zero when stationary — noisy odometry may need a higher `stop_velocity_threshold`.
-- **Robot doesn't stop in time / stops too early.** Adjust `safety_distance` on `path_tracker`; the LiDAR's `range_min`/`range_max` limits also bound how close/far it can reliably see.
-- **Robot makes contact with an obstacle that has a thin or overhanging profile (e.g. a pedestal desk, chair legs).** This is very likely the LiDAR's fixed-height blind spot, not a `safety_distance` or code issue — see the limitation note in [Project overview](#project-overview). Reposition the obstacle so it has a consistent cross-section at the LiDAR's mounted height, don't just lower `safety_distance`.
-- **No `/scan_raw` or `/odom` data.** Confirm the LanderPi's sensor drivers are running inside the `MentorPi` container (`docker exec MentorPi bash -lc "source /opt/ros/humble/setup.bash && ros2 node list"` should show `LD19`, `ekf_filter_node`, etc.) before starting either node. If the list comes back empty, the driver stack itself has died and needs restarting — **run this from a terminal on the Pi** (not the host's own shell — the Pi host has no `ros2` on `PATH` and does not have the container's workspace mounted in, so the driver stack can only be launched from inside the container):
-
-  ```bash
-  docker exec -it -u ubuntu MentorPi zsh -lc "source ~/.zshrc && source ~/ros2_ws/install/setup.bash && ros2 launch bringup bringup.launch.py"
-  ```
-
-  This is the exact command the stack is normally started with (confirmed against the live process inside the container — `ros2 launch bringup bringup.launch.py`, no supervisor watching it, so a hang or crash needs a manual relaunch). It brings up everything in one shot — `LD19`, `ekf_filter_node`, `arm_controller`, cameras, etc. — not just the LiDAR, so expect a brief interruption to those too. It does **not** need `-it`/foreground if you'd rather background it, but running it foreground the first time lets you see it actually come up before you move on.
-
-  A host-side copy of this launch step exists at `~/robot_pi/tool/bringup.sh` on the Pi, but as of this writing it isn't wired to reach the container (it calls `ros2` directly, which isn't installed on the host, and `robot_pi/` isn't bind-mounted in) — use the `docker exec` form above instead.
-
-- **`path_tracker` holds still and logs "No fresh scan within scan_timeout," repeatedly, and doesn't recover within a couple seconds.** This is the scan-freshness watchdog working as intended — the LiDAR isn't currently publishing. **Don't just keep restarting `path_tracker`** — restarting it does nothing if the problem is upstream. Check `ros2 topic hz /scan_raw` first: if it's flatlined, this LD19 has been observed to intermittently stop publishing mid-session, and the fix is restarting the driver stack (previous bullet), not `path_tracker` or `motion_watchdog`. A couple of these warnings right at startup (before the first scan/odom message has arrived) is normal DDS discovery delay, not this bug — only sustained warnings that don't clear are the real signal.
-- **Edits to a `.py` file don't seem to take effect after rebuilding.** `docker cp` nests the source inside the destination directory if the destination already exists, rather than overwriting it — running the copy step twice without clearing the destination first silently produces a stale duplicate package tree that colcon keeps building from instead of your latest edit. This happened mid-session and cost real time to trace. Always `rm -rf` the destination package dir before `docker cp` (see [Running it in VS Code](#running-it-in-vs-code-quick-start)), and if in doubt, `find ~/ros2_ws/src/proximity_alert -name '<file>.py'` inside the container to check for more than one copy.
-- **Rebuild fails with `Permission denied` on files under `build/` or `install/`.** A previous build ran as `root` (e.g. a bare `docker exec` without `-u ubuntu`) and left root-owned artifacts that the `ubuntu` user can't overwrite. `chown -R ubuntu:ubuntu` those two directories (command in [Running it in VS Code](#running-it-in-vs-code-quick-start)) and rebuild.
+| [docs/OPERATIONS.md](docs/OPERATIONS.md) | Running the robot: bring-up, shutdown, recovery from known failures |
+| [docs/README.md](docs/README.md) | Index of the design and evidence record, and the `poc_fusion` task-number key |
+| [docs/poc_fusion_verification.md](docs/poc_fusion_verification.md) | Dated on-robot verification log |
+| [organized_data/DATA_INDEX.md](organized_data/DATA_INDEX.md) | Every data file and what produced it |
+
+---
 
 ## Authors
 
-- Ethan — programming, physical data collection
-- Haotian — statistical analysis, lead author
-- Supervised by Dr. Bingxian Mu, University of Prince Edward Island
+- **Ethan Yang** — programming, physical data collection
+- **Haotian** — statistical analysis, lead author
+- Supervised by **Dr. Bingxian Mu**, University of Prince Edward Island
+
+## License
+
+Not yet declared. Both `package.xml` files and both `setup.py` files currently carry a
+placeholder pending confirmation of the appropriate licence for this work.
