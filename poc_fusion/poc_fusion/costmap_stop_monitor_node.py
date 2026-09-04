@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Costmap stop monitor node (Task 7).
+"""Costmap stop monitor: is the safety window ahead of the robot clear?
 
 Watches the fused local costmap and reports whether the body-aligned safety
 window ahead of the robot is clear. It does NOT publish velocity and never

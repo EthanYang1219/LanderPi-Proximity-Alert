@@ -1,4 +1,4 @@
-"""Task 12 Step 1: records sensor-to-stop latency for the fusion pipeline.
+"""Records sensor-to-stop latency for the fusion pipeline.
 
 On each False->True transition of `/costmap_app/obstacle_detected`, records
 

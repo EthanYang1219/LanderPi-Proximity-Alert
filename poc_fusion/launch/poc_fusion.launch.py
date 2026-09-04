@@ -1,22 +1,43 @@
-"""POC fusion launch file.
+"""POC fusion launch file: depth + LiDAR into one Nav2 local costmap.
 
-Current contents (Tasks 4, 5 and 6 -- Task 8's stop monitor is NOT here yet):
+Brings up, in order:
 
-  Depth pipeline (Tasks 4/5):
-    depth_preprocess_node (Task 4)
-      -> /poc_fusion/depth_cleaned
-    image_proc::RectifyNode (nearest-neighbour interpolation -- see the
-      `interpolation` parameter override below; NOT the linear default, which
-      synthesizes "flying pixel" artifacts across depth discontinuities)
-      -> /poc_fusion/depth_rect
-    depth_image_proc::PointCloudXyzNode
-      -> /poc_fusion/points
+  Depth pipeline
+    depth_preprocess_node          -> /poc_fusion/depth_cleaned
+    image_proc::RectifyNode        -> /poc_fusion/depth_rect
+      (nearest-neighbour interpolation -- see the `interpolation` override
+      below; NOT the linear default, which synthesizes "flying pixel"
+      artifacts across depth discontinuities)
+    depth_image_proc::PointCloudXyzNode -> /poc_fusion/points
 
-  Costmap (Task 6):
+  Costmap
     nav2_costmap_2d (standalone Costmap2DROS lifecycle node) fusing
       /scan_raw (LiDAR) + /poc_fusion/points (depth) into one obstacle layer
       -> /costmap/costmap, /costmap/costmap_updates
     nav2_lifecycle_manager (autostart) bringing that node to `active`
+
+  Detection
+    costmap_stop_monitor_node, consuming /costmap/costmap_raw and publishing
+      a tri-state clear/blocked/unknown signal
+
+  Response (OPT-IN, off by default)
+    stop_action_node, enabled with `stop_action:=true`. It is a SERIES GATE
+    on cmd_vel -- read its REQUIRED TOPOLOGY section before enabling it.
+
+STATUS: an in-progress proof of concept, not a finished subsystem.
+
+End-to-end integration of this chain WAS verified live on 2026-08-10 (sensor
+ingress, costmap representation, active-costmap validation, clear -> CLEAR,
+lethal obstacle -> safety response, and recovery all confirmed with sample
+counts; see the Task 8 section of docs/poc_fusion_verification.md). Two
+things are not done: depth-only detection of an overhang was never
+live-verified, and a bench test on 2026-08-11 failed its gate -- depth cannot
+contribute for floor-standing obstacles at this camera's mounting geometry,
+which is the main open question hanging over the approach.
+
+Validation/tuning, compute budget, graceful degradation and the fusion
+benefit A/B measurement were not carried out. docs/README.md maps the task
+numbering used throughout these files to stages and their status.
 
 The two depth composable nodes are loaded into a single `poc_fusion_container`
 (rclcpp_components) rather than run as separate processes. nav2_costmap_2d
@@ -24,15 +45,10 @@ ships no composable-node plugin in Humble, so the costmap and the lifecycle
 manager run as their own processes alongside the container (see the comment
 inside the container's node list).
 
-Task 7 added `costmap_stop_monitor_node` (tri-state costmap monitor, consuming
-`/costmap/costmap_raw`) just above the insertion marker. Task 8 still owns
-INTEGRATION VERIFICATION of the whole chain -- Task 7 verified only its own
-node, live and standalone.
-
 `depth_preprocess_node` is a plain (non-composable) Python node -- rclpy
-composable-node support is immature relative to rclcpp's, and Task 4 already
-shipped it as a standalone `Node` action, so it stays that way here rather
-than being force-fit into the container.
+composable-node support is immature relative to rclcpp's, and it already
+shipped as a standalone `Node` action, so it stays that way here rather than
+being force-fit into the container.
 """
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription

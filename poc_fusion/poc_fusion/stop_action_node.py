@@ -1,4 +1,4 @@
-"""Task 9 stop action: a series gate on cmd_vel, plus a buzzer on detection.
+"""Stop action: a series gate on cmd_vel, plus a buzzer on detection.
 
 Consumes the stop monitor's derived `std_msgs/Bool` and turns it into the
 POC's only response to a detection: a full stop plus an audible alert. There

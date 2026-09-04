@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Depth preprocessing node (Task 4).
+"""Depth preprocessing: clean the Aurora depth stream for projection.
 
 Subscribes to the raw depth image from the Aurora depth camera driver
 (`mono16`, 640x400, 14.7 Hz), cleans it, and republishes on
