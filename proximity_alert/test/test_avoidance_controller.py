@@ -383,11 +383,35 @@ def test_distance_helper_straight_line():
 
 
 def test_config_has_distance_based_encounter_fields():
+    """The encounter-close mechanism is distance-based, and its fields are
+    physically coherent.
+
+    Deliberately asserts INVARIANTS, not the tuned magnitudes. These three
+    values are tuned against real obstacle spacing on the robot, so pinning
+    them to literals makes every field-tuning session break the suite for a
+    reason unrelated to correctness -- which is exactly what happened when
+    clear_drive_distance was retuned 0.3 -> 0.2 and this test went red for
+    three weeks without indicating any real defect.
+    """
     cfg = AvoidanceConfig()
-    assert cfg.clear_drive_distance == 0.3
-    assert cfg.encounter_close_confirm_scans == 3
-    assert cfg.odom_jump_threshold == 0.15
+
+    # The time-based predecessor is gone, not merely unused.
     assert not hasattr(cfg, "clear_drive_duration")
+
+    # An encounter closes on measured displacement, confirmed over several
+    # scans, with a jump guard -- all three must exist and be positive.
+    assert cfg.clear_drive_distance > 0.0
+    assert cfg.encounter_close_confirm_scans >= 1
+    assert cfg.odom_jump_threshold > 0.0
+
+    # The close distance has to be worth measuring: at least one control
+    # tick of forward travel, or displacement could satisfy it before the
+    # robot has meaningfully moved past anything.
+    assert cfg.clear_drive_distance >= cfg.forward_speed / cfg.control_rate_hz
+
+    # A single odom tick of normal driving must not look like a jump, or
+    # clear-tracking would reset itself continuously while driving straight.
+    assert cfg.odom_jump_threshold > cfg.forward_speed / cfg.control_rate_hz
 
 
 def _enter_encounter(c, obst=None):

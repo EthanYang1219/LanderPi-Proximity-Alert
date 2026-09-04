@@ -53,6 +53,10 @@ class AvoidanceConfig: # All measurements are in meters or m/s for the speed. Al
     front_subsector_deg: float = 60.0      # Width of the left/center/right zones used for logging only -- doesn't change driving behavior
     side_window_deg: float = 70.0          # How wide a slice to each side it checks before strafing that way. Turn it up and it checks more space before trusting a strafe is safe
     rear_window_deg: float = 100.0         # Same as side_window_deg but behind the robot, used when backing up
+    # Vendor chassis geometry (Hiwonder LanderPi, from the stock mecanum
+    # kinematics): wheelbase 0.216 m, track width 0.195 m, wheel diameter
+    # 0.097 m. robot_half_width below is the BODY half-width the controller
+    # plans clearances against, which is deliberately not track_width / 2.
     robot_half_width: float = 0.085        # Half the robot's actual width -- how much room it assumes it needs. Keep this matched to the real chassis; too small risks clipping things, too big blocks strafes that would've fit
     corridor_margin: float = 0.020          # Extra padding added on top of robot_half_width. Turn it up and the robot demands more elbow room before attempting a strafe, refusing tighter gaps it could've fit through
     forward_speed: float = 0.20            # Normal driving speed. Turn it up to drive faster -- but this MUST match what the robot actually delivers (the vendor controller caps real speed at 0.20 m/s), or every distance/timeout number below starts lying to itself
@@ -64,7 +68,6 @@ class AvoidanceConfig: # All measurements are in meters or m/s for the speed. Al
     turn_speed: float = 0.50                # How fast it spins while turning. Turn it up and it turns faster, but overshoots past the intended angle more
     turn_step_deg: float = 35.0            # How many degrees it turns per attempt. Turn it up and it clears wider obstacles in one go, but drifts further off its original heading
     turn_timeout: float = 1.5              # How long it'll hold a turn before moving on regardless of whether it finished turning
-    # reverse_trigger_range: float = 0.20    # (Not currently used -- rear_clearance_min governs this instead)
     avoid_reverse_speed: float = 0.20      # Speed of the small backup nudge while turning/recovering, when there's room behind. Turn it up and it backs off faster, but eats into its rear safety margin sooner
     rear_clearance_min: float = 0.25       # How much room is required behind before it's allowed to back up. Turn it down and it'll reverse with less space behind it
     turn_radius: float = 0.0               # Shape of the backup-while-turning arc. 0 = a tight near-in-place pivot; turn it up for a wider, longer sweeping arc instead
@@ -87,7 +90,6 @@ class AvoidanceConfig: # All measurements are in meters or m/s for the speed. Al
     clear_drive_distance: float = 0.20        # How far it has to drive with a confirmed-clear path before it considers an obstacle fully behind it and resets its dodge counters
     encounter_close_confirm_scans: int = 3   # How many clear readings in a row before it starts counting toward clear_drive_distance, so one noisy clear reading can't fake it out
     odom_jump_threshold: float = 0.15        # If the robot's tracked position jumps more than this in a single tick, it's treated as bad position data (not real motion) and ignored
-    # recover_backup_clearance: float = 0.50 # (Not currently used -- rear_clearance_min governs this instead)
     recover_commit_distance: float = 0.50  # How far it'll drive during a recovery attempt before giving up. Turn it up to be more patient trying to power through a gap
     min_gap_clearance: float = 0.50        # How much open space a gap needs to have before recovery considers it usable. Turn it up to only trust more clearly open gaps
     min_gap_width_deg: float = 40.0        # How wide (in degrees) a gap needs to be before recovery considers it usable. Turn it up to only accept wider gaps

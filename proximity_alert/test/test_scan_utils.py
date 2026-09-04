@@ -1,7 +1,16 @@
+"""Tests for `valid_beams`, the single place that decides what counts as a
+usable LiDAR reading and how its angle is wrapped.
+
+These previously targeted `min_range_in_forward_arc`, which was superseded by
+`reduce_to_sectors`'s "front" value and has been removed. The behaviour worth
+protecting is the same, and it now sits one level lower: every sector
+reduction, obstacle measurement and gap search in this package is built on
+`valid_beams`, so a regression here is a regression everywhere.
+"""
 import math
 from types import SimpleNamespace
 
-from proximity_alert.scan_utils import min_range_in_forward_arc
+from proximity_alert.scan_utils import valid_beams
 
 
 def _make_scan(ranges, angle_min, angle_increment, range_min=0.05, range_max=5.0):
@@ -16,52 +25,59 @@ def _make_scan(ranges, angle_min, angle_increment, range_min=0.05, range_max=5.0
     )
 
 
-def test_returns_closest_reading_within_arc():
-    # angles: -90, 0, 90, 180 deg; 180 deg arc keeps only the first three.
-    scan = _make_scan([1.0, 0.5, 2.0, 3.0], angle_min=-math.pi / 2, angle_increment=math.pi / 2)
-    closest, _ = min_range_in_forward_arc(scan, scan_arc_deg=180.0)
-    assert closest == 0.5
-
-
-def test_wraps_ld19_0_to_2pi_angles():
-    # The real LD19 reports angles 0..2pi, so a front-left beam sits near 2pi,
-    # not at a negative angle. angles (45 deg steps): 0,45,90,135,180,225,270,
-    # 315 -> wrapped: 0,45,90,135,180,-135,-90,-45. With a 180 deg arc, index 7
-    # (315 deg == -45 deg, front-left) MUST be included -- it holds the closest
-    # reading (0.5). A non-wrapping implementation filters on the raw 315 deg,
-    # misses it, and wrongly returns 1.0 -- the bug this test guards against.
-    # (-45 deg is chosen well inside the arc, not on the +/-90 deg boundary
-    # where floating-point rounding of the wrap makes inclusion ambiguous.)
+def test_wraps_ld19_0_to_2pi_angles_into_plus_minus_pi():
+    # The real LD19 reports angles 0..2pi, so a front-left beam sits near 2pi
+    # rather than at a negative angle. angles (45 deg steps): 0,45,90,135,180,
+    # 225,270,315 -> wrapped: 0,45,90,135,180,-135,-90,-45.
+    #
+    # This is the bug the whole convention exists to prevent: without the
+    # wrap, a forward-arc test filters on the raw 315 deg, decides it is
+    # outside +/-90 deg, and the front-left obstacle is never seen at all.
     ranges = [1.0, 2.0, 1.5, 3.0, 0.3, 3.0, 2.5, 0.5]
     scan = _make_scan(ranges, angle_min=0.0, angle_increment=math.pi / 4)
-    closest, closest_angle = min_range_in_forward_arc(scan, scan_arc_deg=180.0)
-    assert closest == 0.5
-    # front-left -> wrapped angle is negative, so callers turn/drift right.
-    assert closest_angle < 0.0
+
+    bearings = [b for b, _ in valid_beams(scan)]
+
+    assert all(-math.pi <= b <= math.pi for b in bearings)
+    # index 7 (raw 315 deg) must land at -45 deg -- front-LEFT, inside a
+    # 180 deg forward arc, not behind the robot.
+    assert math.isclose(bearings[7], -math.pi / 4, abs_tol=1e-9)
+    # and it must still carry its own range.
+    assert valid_beams(scan)[7][1] == 0.5
 
 
-def test_index_at_180deg_is_excluded_from_forward_arc():
-    # 180 deg (directly behind) must never count as a forward obstacle even
-    # though it is the numerically closest reading.
-    scan = _make_scan([1.0, 0.2], angle_min=0.0, angle_increment=math.pi)
-    closest, _ = min_range_in_forward_arc(scan, scan_arc_deg=180.0)
-    assert closest == 1.0
+def test_pairs_each_bearing_with_its_own_range_in_scan_order():
+    scan = _make_scan([1.0, 2.0, 3.0], angle_min=0.0, angle_increment=math.pi / 4)
+    beams = valid_beams(scan)
+    assert [r for _, r in beams] == [1.0, 2.0, 3.0]
+    assert math.isclose(beams[1][0], math.pi / 4, abs_tol=1e-9)
 
 
-def test_ignores_readings_outside_range_min_max():
-    scan = _make_scan([0.5], angle_min=0.0, angle_increment=0.1, range_min=0.6)
-    closest, _ = min_range_in_forward_arc(scan, scan_arc_deg=180.0)
-    assert closest is None
+def test_angles_are_index_derived_so_error_does_not_accumulate():
+    # Derived as angle_min + i * angle_increment rather than accumulated, so a
+    # full-length scan's last beam is exact rather than drifting.
+    n = 450
+    inc = 2 * math.pi / n
+    scan = _make_scan([1.0] * n, angle_min=0.0, angle_increment=inc)
+    beams = valid_beams(scan)
+    last_raw = (n - 1) * inc
+    expected = math.atan2(math.sin(last_raw), math.cos(last_raw))
+    assert math.isclose(beams[-1][0], expected, abs_tol=1e-12)
 
 
-def test_ignores_nan_and_inf_readings():
+def test_drops_readings_outside_the_sensors_range_limits():
+    scan = _make_scan([0.5, 1.0], angle_min=0.0, angle_increment=0.1, range_min=0.6)
+    assert [r for _, r in valid_beams(scan)] == [1.0]
+
+    scan = _make_scan([1.0, 9.0], angle_min=0.0, angle_increment=0.1, range_max=5.0)
+    assert [r for _, r in valid_beams(scan)] == [1.0]
+
+
+def test_drops_nan_and_inf_readings():
     scan = _make_scan([float("nan"), float("inf"), 1.2], angle_min=0.0, angle_increment=0.1)
-    closest, _ = min_range_in_forward_arc(scan, scan_arc_deg=180.0)
-    assert closest == 1.2
+    assert [r for _, r in valid_beams(scan)] == [1.2]
 
 
-def test_returns_none_and_zero_angle_when_no_valid_readings():
+def test_returns_empty_when_nothing_is_valid():
     scan = _make_scan([float("nan"), float("nan")], angle_min=0.0, angle_increment=0.1)
-    closest, closest_angle = min_range_in_forward_arc(scan, scan_arc_deg=180.0)
-    assert closest is None
-    assert closest_angle == 0.0
+    assert valid_beams(scan) == []

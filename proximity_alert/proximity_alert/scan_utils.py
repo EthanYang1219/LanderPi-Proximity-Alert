@@ -2,42 +2,42 @@
 
 Deliberately imports nothing from rclpy/sensor_msgs so the forward-arc logic
 can be unit-tested on a plain machine with a lightweight duck-typed scan.
+
+Every function here starts from `valid_beams`, which owns the two conventions
+that used to be restated in each of them: what counts as a usable reading, and
+how a beam's angle is wrapped into [-pi, pi].
 """
 import math
 
 
-def min_range_in_forward_arc(msg, scan_arc_deg):
-    """Closest valid range in the forward arc, and the angle it was seen at.
+def valid_beams(msg):
+    """Every usable beam in the scan as ``(bearing, range)``, in scan order.
 
-    Returns ``(closest_range, closest_angle)``:
-      * ``closest_range`` -- nearest valid reading (m) within
-        +/- ``scan_arc_deg`` / 2 of straight-ahead, or ``None`` if there are
-        no valid readings.
-      * ``closest_angle`` -- that reading's beam angle wrapped into
-        ``[-pi, pi]`` (``0.0`` when there is no valid reading), so callers can
-        tell which side the obstacle is on.
+    ``bearing`` is the beam's angle wrapped into ``[-pi, pi]`` via
+    ``atan2(sin, cos)``. The wrap is not optional bookkeeping: this LiDAR
+    (LD19) reports angles as ``0..2pi``, so "forward" (0 rad) sits at BOTH
+    ends of the sweep. Comparing raw angles against a forward arc would
+    measure only the front-right half of it and miss front-left obstacles
+    entirely.
 
-    This LiDAR (LD19) reports angles as 0..2pi, so "forward" (0 rad) sits at
-    both ends of the sweep; each beam is wrapped via ``atan2(sin, cos)`` before
-    the arc test, otherwise only the 0..+half_arc (front-right) side would be
-    measured and front-left obstacles would be missed.
+    A reading is usable when it is finite and inside the sensor's own
+    ``[range_min, range_max]``. NaN and inf fail that comparison anyway; the
+    explicit ``isfinite`` check is kept so the intent is readable rather than
+    incidental.
+
+    Returned as a list, not a generator: all three callers below need more
+    than one pass over it, and one of them sorts it.
+
+    The beam angle is derived by index (`angle_min + i * angle_increment`)
+    rather than accumulated across the sweep, so no float error builds up
+    along a 450-beam scan.
     """
-    half_arc = math.radians(scan_arc_deg) / 2.0
-
-    closest = None
-    closest_angle = 0.0
-    angle = msg.angle_min
-    for r in msg.ranges:
-        rel = math.atan2(math.sin(angle), math.cos(angle))
-        if -half_arc <= rel <= half_arc:
-            # NaN/inf fail this comparison, so they're excluded here too.
-            if msg.range_min <= r <= msg.range_max:
-                if closest is None or r < closest:
-                    closest = r
-                    closest_angle = rel
-        angle += msg.angle_increment
-
-    return closest, closest_angle
+    beams = []
+    for i, r in enumerate(msg.ranges):
+        if msg.range_min <= r <= msg.range_max and math.isfinite(r):
+            angle = msg.angle_min + i * msg.angle_increment
+            beams.append((math.atan2(math.sin(angle), math.cos(angle)), r))
+    return beams
 
 
 def _in_window(rel, center, half_width):
@@ -49,6 +49,7 @@ def _in_window(rel, center, half_width):
 
 def reduce_to_sectors(msg, front_arc_deg, front_subsector_deg,
                       side_window_deg, rear_window_deg):
+    """Nearest range in each named sector, or inf where the sector is empty."""
     half_front = math.radians(front_arc_deg) / 2.0
     half_sub = math.radians(front_subsector_deg) / 2.0
     half_side = math.radians(side_window_deg) / 2.0
@@ -60,45 +61,46 @@ def reduce_to_sectors(msg, front_arc_deg, front_subsector_deg,
            ("front", "front_left", "front_center", "front_right",
             "left", "right", "rear")}
 
-    for i, r in enumerate(msg.ranges):
-        if msg.range_min <= r <= msg.range_max and math.isfinite(r):
-            angle = msg.angle_min + i * msg.angle_increment
-            rel = math.atan2(math.sin(angle), math.cos(angle))
-            if -half_front <= rel <= half_front:
-                out["front"] = min(out["front"], r)
-                if _in_window(rel, half_sub * 2, half_sub):      # front-left bin
-                    out["front_left"] = min(out["front_left"], r)
-                elif _in_window(rel, 0.0, half_sub):             # front-center bin
-                    out["front_center"] = min(out["front_center"], r)
-                elif _in_window(rel, -half_sub * 2, half_sub):   # front-right bin
-                    out["front_right"] = min(out["front_right"], r)
-            if _in_window(rel, left_c, half_side):
-                out["left"] = min(out["left"], r)
-            if _in_window(rel, right_c, half_side):
-                out["right"] = min(out["right"], r)
-            if _in_window(rel, math.pi, half_rear):
-                out["rear"] = min(out["rear"], r)
+    for rel, r in valid_beams(msg):
+        if -half_front <= rel <= half_front:
+            out["front"] = min(out["front"], r)
+            if _in_window(rel, half_sub * 2, half_sub):      # front-left bin
+                out["front_left"] = min(out["front_left"], r)
+            elif _in_window(rel, 0.0, half_sub):             # front-center bin
+                out["front_center"] = min(out["front_center"], r)
+            elif _in_window(rel, -half_sub * 2, half_sub):   # front-right bin
+                out["front_right"] = min(out["front_right"], r)
+        if _in_window(rel, left_c, half_side):
+            out["left"] = min(out["left"], r)
+        if _in_window(rel, right_c, half_side):
+            out["right"] = min(out["right"], r)
+        if _in_window(rel, math.pi, half_rear):
+            out["rear"] = min(out["rear"], r)
     return out
 
 
 def size_obstacle(msg, front_arc_deg, obstacle_detect_range):
+    """Measure the near obstacle in the forward arc, or None if there isn't one.
+
+    Reports lateral extent in METRES (`y_lo`/`y_hi`), not angular span, because
+    angular span grows as an obstacle nears and so cannot answer "can I strafe
+    past this". `preferred_side` is chosen purely from far-field openness --
+    which side has more room BEYOND the obstacle.
+    """
     half_front = math.radians(front_arc_deg) / 2.0
     near = []  # (rel, r)
     left_open = 0.0
     right_open = 0.0
     left_n = right_n = 0
-    for i, r in enumerate(msg.ranges):
-        if msg.range_min <= r <= msg.range_max and math.isfinite(r):
-            angle = msg.angle_min + i * msg.angle_increment
-            rel = math.atan2(math.sin(angle), math.cos(angle))
-            if -half_front <= rel <= half_front:
-                if r <= obstacle_detect_range:
-                    near.append((rel, r))
-                else:
-                    if rel > 0:
-                        left_open += r; left_n += 1
-                    elif rel < 0:
-                        right_open += r; right_n += 1
+    for rel, r in valid_beams(msg):
+        if -half_front <= rel <= half_front:
+            if r <= obstacle_detect_range:
+                near.append((rel, r))
+            else:
+                if rel > 0:
+                    left_open += r; left_n += 1
+                elif rel < 0:
+                    right_open += r; right_n += 1
     if not near:
         return None
     rels = [a for a, _ in near]
@@ -112,12 +114,12 @@ def size_obstacle(msg, front_arc_deg, obstacle_detect_range):
 
 
 def select_gap(msg, min_gap_clearance, min_gap_width_deg, goal_heading):
-    beams = []  # (rel, r)
-    for i, r in enumerate(msg.ranges):
-        if msg.range_min <= r <= msg.range_max and math.isfinite(r):
-            angle = msg.angle_min + i * msg.angle_increment
-            rel = math.atan2(math.sin(angle), math.cos(angle))
-            beams.append((rel, r))
+    """Bearing of the widest usable opening, tie-broken toward `goal_heading`.
+
+    Returns None when no contiguous clear run is at least `min_gap_width_deg`
+    wide.
+    """
+    beams = valid_beams(msg)
     if not beams:
         return None
     beams.sort(key=lambda b: b[0])
