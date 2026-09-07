@@ -30,11 +30,11 @@ The repository contains two independent systems:
 | Package | What it is | Status |
 |---|---|---|
 | **`proximity_alert`** | LiDAR-only A→B driving with a 7-state reactive avoidance machine, plus the logging pipeline that produced the research dataset. | Field-validated; used to collect the published data |
-| **`poc_fusion`** | A proof of concept fusing an Aurora depth camera with the LiDAR into a single Nav2 costmap, responding with a stop only. | **In progress** — see [status](#poc_fusion-status) |
+| **`poc_fusion`** | A proof of concept fusing an Aurora depth camera with the LiDAR into a single Nav2 costmap, responding with a stop. | **In progress only** — see [status](#poc_fusion-status) |
 
 They share the robot and the `/scan_raw` topic, and nothing else. `poc_fusion` deliberately
 does not touch `avoidance.py`, so the surface-trial dataset stays comparable across the
-whole collection period.
+whole collection period. 
 
 ---
 
