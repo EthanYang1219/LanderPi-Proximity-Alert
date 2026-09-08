@@ -45,7 +45,7 @@ whole collection period.
 | Chassis | Hiwonder LanderPi, mecanum wheels (wheelbase 0.216 m, track 0.195 m) |
 | Main compute | Raspberry Pi 5 |
 | Low-level control | STM32 (motor commands; holds the last commanded velocity indefinitely) |
-| LiDAR | LD19, single fixed scan plane, ~10 Hz |
+| LiDAR | MS200, single fixed scan plane, ~10 Hz |
 | Depth camera | Aurora, arm-mounted, 640×400 mono16 @ 14.7 Hz (`poc_fusion` only) |
 | Odometry | Integrated open-loop from `/cmd_vel` — **no wheel encoders** |
 | Audible alert | USB speaker via ALSA `aplay`; `poc_fusion` additionally drives an I2C buzzer |
@@ -57,7 +57,7 @@ whole collection period.
 ## How it works
 
 ```
-LD19 ──▶ scan_utils ──▶ AvoidanceController ──▶ path_tracker ──▶ motion_watchdog ──▶ motors
+MS200 ──▶ scan_utils ──▶ AvoidanceController ──▶ path_tracker ──▶ motion_watchdog ──▶ motors
          (sectors,       (7-state machine,       (ROS shell)      (stale ⇒ stop)
           sizing,         pure & ROS-free)
           gap search)
@@ -237,7 +237,7 @@ consequences:
    so it accumulates error through every turn. Filter on `avoidance_events == 0` before using
    a trial for slippage analysis.
 
-**The LiDAR has a fixed-height blind spot.** The LD19 scans one plane and cannot see above or
+**The LiDAR has a fixed-height blind spot.** The MS200 scans one plane and cannot see above or
 below it. A round pedestal desk — narrow base, wide overhanging top — was not detected, and the
 robot made low-speed contact with it. Lowering `safety_distance` would not have helped: the
 obstacle was effectively invisible until contact, not merely detected late. Use obstacles with
@@ -247,7 +247,7 @@ a consistent cross-section at the LiDAR's mounted height.
 offset measured in the same open-loop odometry described above, so it cannot see wheel slip or
 dead-reckoning drift. True path following needs an external position source.
 
-**Debouncing counts control ticks, not scans.** The control loop runs at 20 Hz and the LD19
+**Debouncing counts control ticks, not scans.** The control loop runs at 20 Hz and the MS200
 publishes at ~10 Hz, so two consecutive ticks may be the same scan counted twice. This affects
 every debounce in the controller.
 
